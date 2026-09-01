@@ -22,12 +22,17 @@ use sentinel_core::protocol::{
 use sentinel_core::spool::{SegmentRow, Spool, SpoolStats};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use transport::{Incoming, Transport, TransportError};
+pub use transport::{Incoming, Transport, TransportError};
+
+/// How long a replayed call holds its media waiting for the gateway's `resume`
+/// before giving up and restarting from our own ack watermark. A gateway that does
+/// not answer must not be able to stall the upload indefinitely.
+const RESUME_TIMEOUT_MS: u64 = 5_000;
 
 /// How long `pump` waits for a message before returning to its caller. Short enough
 /// that the heartbeat and the capture pipeline are not starved; long enough that the
 /// loop is not a spin.
-const RECV_SLICE: Duration = Duration::from_millis(50);
+pub const RECV_SLICE: Duration = Duration::from_millis(50);
 
 /// Segments read out of the spool per `pump` pass. One WebSocket message carries
 /// `SEGMENTS_PER_MESSAGE`; four messages a pass keeps a reconnect draining a backlog
@@ -75,8 +80,32 @@ pub struct Uplink {
     known_calls: BTreeSet<String>,
     /// Per-call resume point, from the server's `resume` frame combined with ours.
     resume_points: BTreeMap<String, resume::ResumePoint>,
+    /// Highest sequence handed to the socket on the **current** connection, per
+    /// `(call_id, channel)`.
+    ///
+    /// Without this the uplink re-sends every unacked segment on every pass: acks
+    /// arrive a beat later than the send, so the spool still holds them next time
+    /// round. Ingest is idempotent so nothing breaks, but a 200-agent floor would
+    /// spend its uplink re-sending the same seconds tens of times. Cleared on
+    /// reconnect, which is exactly when a re-send *is* wanted.
+    sent_through: BTreeMap<(String, Channel), u32>,
+    /// Calls whose `call.start` was a *replay* on this connection and whose `resume`
+    /// has not arrived yet.
+    ///
+    /// wire.md section 6 is explicit about the order: send `call.start`, wait for
+    /// `resume`, replay from `acked + 1`. Sending media before the reply means
+    /// re-sending seconds the server already has — harmless, because ingest is
+    /// idempotent, but it is the whole backlog of a long outage going over the wire
+    /// twice on a link that just came back. The value is the clock reading at which
+    /// waiting stops, so a server that never answers cannot stall the upload.
+    awaiting_resume: BTreeMap<String, u64>,
     events: Vec<ClientEvent>,
     policy_version: i64,
+    /// How long each `pump` blocks waiting for a message. Only the integration tests
+    /// change it: they drive thousands of passes over a loopback socket, where the
+    /// production 50 ms slice would spend all its time waiting for a server that
+    /// already answered.
+    recv_slice: Duration,
 }
 
 impl Uplink {
@@ -92,9 +121,18 @@ impl Uplink {
             ended_this_connection: BTreeSet::new(),
             known_calls,
             resume_points: BTreeMap::new(),
+            sent_through: BTreeMap::new(),
+            awaiting_resume: BTreeMap::new(),
             events: Vec::new(),
             policy_version: 0,
+            recv_slice: RECV_SLICE,
         }
+    }
+
+    /// Override the per-pass receive timeout. See [`Uplink::recv_slice`].
+    pub fn with_recv_slice(mut self, slice: Duration) -> Self {
+        self.recv_slice = slice;
+        self
     }
 
     pub fn is_connected(&self) -> bool {
@@ -163,6 +201,8 @@ impl Uplink {
                     self.started_this_connection.clear();
                     self.ended_this_connection.clear();
                     self.resume_points.clear();
+                    self.sent_through.clear();
+                    self.awaiting_resume.clear();
                 }
                 Err(e) => {
                     let delay = self.backoff.next_delay();
@@ -174,7 +214,7 @@ impl Uplink {
         }
         outcome.connected = true;
 
-        if let Err(e) = self.send_pending(&mut outcome) {
+        if let Err(e) = self.send_pending(now_ms, &mut outcome) {
             self.drop_connection(now_ms, &e.to_string());
             outcome.connected = false;
             return outcome;
@@ -187,7 +227,7 @@ impl Uplink {
     }
 
     /// Send `call.start`, then media, then `call.end`, for every call the spool holds.
-    fn send_pending(&mut self, outcome: &mut PumpOutcome) -> Result<(), TransportError> {
+    fn send_pending(&mut self, now_ms: u64, outcome: &mut PumpOutcome) -> Result<(), TransportError> {
         // Refresh from the spool so a call whose segments were all acked drops out and
         // one that was recovered from disk at startup appears.
         for c in self.spool.pending_calls().unwrap_or_default() {
@@ -208,7 +248,29 @@ impl Uplink {
                 if let Ok(Some(json)) = self.spool.call_start_json(&call_id) {
                     self.transport_mut()?.send_text(&json)?;
                     self.started_this_connection.insert(call_id.clone());
+                    // A call that already had segments on disk when this connection
+                    // opened is a replay, and the server owes us a `resume`. A call
+                    // that began after we connected is new and gets no reply.
+                    let is_replay = self
+                        .spool
+                        .acked_through(&call_id)
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false)
+                        || self.sent_through.keys().any(|(c, _)| c == &call_id);
+                    if is_replay {
+                        self.awaiting_resume
+                            .insert(call_id.clone(), now_ms.saturating_add(RESUME_TIMEOUT_MS));
+                    }
                 }
+            }
+
+            // Hold media until the server has told us where to restart from.
+            if let Some(&deadline) = self.awaiting_resume.get(&call_id) {
+                if now_ms < deadline {
+                    continue;
+                }
+                tracing::warn!("no resume from the gateway; restarting from our own ack mark");
+                self.awaiting_resume.remove(&call_id);
             }
 
             let point = self.resume_point_for(&call_id);
@@ -223,6 +285,10 @@ impl Uplink {
                 if !resume::should_send(&point, row.channel, row.seq) {
                     continue;
                 }
+                let key = (call_id.clone(), row.channel);
+                if self.sent_through.get(&key).is_some_and(|&hi| row.seq <= hi) {
+                    continue;
+                }
                 let record = row.to_record(call_id_bytes(&call_id));
                 if record.encode_into(&mut batch).is_err() {
                     // A segment too large for the u16 length field cannot exist at
@@ -231,6 +297,7 @@ impl Uplink {
                     tracing::error!(seq = row.seq, "segment too large to encode; skipped");
                     continue;
                 }
+                self.sent_through.insert(key, row.seq);
                 in_batch += 1;
                 outcome.sent += 1;
                 if in_batch == SEGMENTS_PER_MESSAGE {
@@ -257,7 +324,8 @@ impl Uplink {
 
     fn read_incoming(&mut self, now_ms: u64, outcome: &mut PumpOutcome) -> Result<(), TransportError> {
         loop {
-            let msg = self.transport_mut()?.recv(RECV_SLICE)?;
+            let slice = self.recv_slice;
+            let msg = self.transport_mut()?.recv(slice)?;
             let Some(msg) = msg else { return Ok(()) };
             match msg {
                 Incoming::Text(text) => self.handle_control(&text, now_ms, outcome),
@@ -308,6 +376,7 @@ impl Uplink {
                 }
             }
             ControlMessage::Resume { call_id, acked } => {
+                self.awaiting_resume.remove(&call_id);
                 let local = self.spool.acked_through(&call_id).unwrap_or_default();
                 let point = resume::plan(&local, &acked);
                 tracing::info!(
@@ -377,7 +446,7 @@ impl Uplink {
                 return 0;
             }
             let outcome = self.pump(clock);
-            clock = clock.saturating_add(RECV_SLICE.as_millis() as u64);
+            clock = clock.saturating_add(self.recv_slice.as_millis() as u64);
             if !outcome.connected && outcome.sent == 0 && outcome.acked == 0 {
                 // Not connected and not due to reconnect. Spinning would burn the
                 // deadline without making progress.
@@ -643,26 +712,66 @@ mod tests {
         assert!(!out.connected);
         assert!(!r.uplink.is_connected());
 
-        // Reconnect, and the server reports it actually has one more than we recorded.
+        // Reconnect. The server reports it actually holds one more than we recorded —
+        // our ack write was lost when the link went — so the resume point is its
+        // number, not ours.
         r.wire.0.lock().unwrap().sent_text.clear();
         r.wire.0.lock().unwrap().sent_binary.clear();
         r.wire.0.lock().unwrap().inbox.push_back(Incoming::Text(
             serde_json::json!({"t":"resume","call_id":CALL,"acked":{"0":2}}).to_string(),
         ));
-        r.uplink.pump(200_000);
+        let out = r.uplink.pump(200_000);
+        assert!(out.connected);
 
         let texts = r.wire.0.lock().unwrap().sent_text.clone();
         assert!(
             texts.iter().any(|t| t.contains("\"t\":\"call.start\"") && t.contains(CALL)),
             "the original call.start is re-sent verbatim so the server replies with resume"
         );
+        assert!(
+            sent_records(&r.wire).is_empty(),
+            "media waits for the resume reply rather than replaying the whole backlog"
+        );
 
-        // The `resume` arrives during this pass, so the pass that follows it is the
-        // one that honours it.
-        r.wire.0.lock().unwrap().sent_binary.clear();
+        // The resume arrived during that pass; the next one honours it.
         r.uplink.pump(200_100);
         let seqs: Vec<u32> = sent_records(&r.wire).iter().map(|x| x.seq).collect();
         assert_eq!(seqs, vec![3, 4, 5], "resume from acked + 1, using the server's higher mark");
+
+        // And a further pass re-sends nothing: an unacked segment is not a reason to
+        // put the same seconds on the wire again on every tick.
+        r.wire.0.lock().unwrap().sent_binary.clear();
+        r.uplink.pump(200_200);
+        assert!(sent_records(&r.wire).is_empty(), "no duplicate sends within a connection");
+    }
+
+    #[test]
+    fn a_gateway_that_never_answers_with_resume_does_not_stall_the_upload_forever() {
+        let mut r = rig();
+        r.uplink.begin_call(CALL, &call_start(), 0).unwrap();
+        for seq in 0..3 {
+            r.uplink.push_segment(&segment(Channel::Far, seq)).unwrap();
+        }
+        r.uplink.pump(0);
+        r.wire.0.lock().unwrap().inbox.push_back(Incoming::Text(
+            serde_json::json!({"t":"ack","call_id":CALL,"channel":0,"through_seq":0}).to_string(),
+        ));
+        r.uplink.pump(10);
+        r.wire
+            .0
+            .lock()
+            .unwrap()
+            .inbox
+            .push_back(Incoming::Closed { code: Some(1011) });
+        r.uplink.pump(20);
+
+        // Reconnect with a silent gateway.
+        r.wire.0.lock().unwrap().sent_binary.clear();
+        r.uplink.pump(200_000);
+        assert!(sent_records(&r.wire).is_empty(), "held, waiting for resume");
+        r.uplink.pump(200_000 + RESUME_TIMEOUT_MS);
+        let seqs: Vec<u32> = sent_records(&r.wire).iter().map(|x| x.seq).collect();
+        assert_eq!(seqs, vec![1, 2], "past the timeout, restart from our own ack mark");
     }
 
     #[test]

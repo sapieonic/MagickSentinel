@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
             tracing::warn!(error = %e, "could not apply service recovery actions");
         }
         sentinel_service::windows::scm::run(win::service_body)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -70,6 +70,7 @@ mod win {
     use sentinel_service::config_sync::ConfigStore;
     use sentinel_service::ipc::{ConfigSnapshot, Request, Response, UpdateStatus};
     use sentinel_service::supervisor::{Action, Supervisor};
+    use sentinel_service::update;
     use sentinel_service::windows::launcher::{launch_agent, AgentProcess};
     use sentinel_service::windows::pipe::{self, RequestHandler};
     use sentinel_service::windows::scm::ServiceEvent;
@@ -86,6 +87,9 @@ mod win {
         os_build: Mutex<String>,
         restarts: AtomicU32,
         update_requested: AtomicBool,
+        staged: Mutex<Option<String>>,
+        /// The agent's last reported capture state, from `ReportHealth`.
+        agent_state: Mutex<String>,
     }
 
     impl ServiceState {
@@ -98,6 +102,8 @@ mod win {
                 os_build: Mutex::new(detection.1),
                 restarts: AtomicU32::new(0),
                 update_requested: AtomicBool::new(false),
+                staged: Mutex::new(None),
+                agent_state: Mutex::new("BLOCKED".into()),
             }
         }
 
@@ -107,6 +113,17 @@ mod win {
 
         pub fn take_update_request(&self) -> bool {
             self.update_requested.swap(false, Ordering::Relaxed)
+        }
+
+        /// The newest version staged on disk and verified against its manifest hash.
+        pub fn staged_version(&self) -> Option<String> {
+            self.staged.lock().unwrap().clone()
+        }
+
+        /// Whether the agent last reported itself mid-call. An update that lands here
+        /// waits.
+        pub fn agent_in_call(&self) -> bool {
+            *self.agent_state.lock().unwrap() == "IN_CALL"
         }
     }
 
@@ -150,9 +167,13 @@ mod win {
             .unwrap_or(0);
         let is_server = read(w!("InstallationType")).as_deref() == Some("Server");
         let os_build = format!("10.0.{build}");
-        let tier = if is_server && build >= 20348 {
-            Some("A")
-        } else if !is_server && build >= 22000 {
+        // Server 2022 is build 20348; the Windows 11 client floor is 22000. The two
+        // thresholds differ and conflating them is the mistake `sentinel-capture`'s
+        // tier module exists to warn about — 20348 is a *server* build number and
+        // using it as a client threshold would report every Windows 10 desktop as
+        // tier A, then silently fail to arm on all of them.
+        let floor = if is_server { 20348 } else { 22000 };
+        let tier = if build >= floor {
             Some("A")
         } else if !is_server && build >= 18362 {
             Some("B")
@@ -183,16 +204,17 @@ mod win {
             match req {
                 Request::GetConfig => {
                     let cfg = self.config.lock().unwrap();
-                    Response::Config(ConfigSnapshot {
+                    Response::Config(Box::new(ConfigSnapshot {
                         local: cfg.local().clone(),
                         policy: cfg.policy().cloned(),
                         capture_tier: self.tier.lock().unwrap().clone(),
                         os_build: self.os_build.lock().unwrap().clone(),
                         service_version: sentinel_service::VERSION.into(),
                         agent_restarts: self.restarts.load(Ordering::Relaxed),
-                    })
+                    }))
                 }
                 Request::ReportHealth(h) => {
+                    *self.agent_state.lock().unwrap() = h.capture_state.clone();
                     // Logged as machine state only; the type cannot carry an identity.
                     tracing::debug!(
                         capture_state = %h.capture_state,
@@ -206,7 +228,7 @@ mod win {
                     self.update_requested.store(true, Ordering::Relaxed);
                     Response::UpdateStatus(UpdateStatus {
                         current_version: sentinel_service::VERSION.into(),
-                        staged_version: None,
+                        staged_version: self.staged_version(),
                         checking: true,
                     })
                 }
@@ -250,6 +272,30 @@ mod win {
                 supervisor.on_exited(session, now_ms(), stop.load(Ordering::SeqCst));
                 state.set_restarts(supervisor.restarts());
                 tracing::warn!(session, restarts = supervisor.restarts(), "agent exited");
+            }
+
+            // An agent that asked for an update check gets one on the next pass.
+            // Applying it is deferred while a call is in progress: cutting a live
+            // recording is data loss in a compliance product, and no fix is worth a
+            // hole in the evidence.
+            if state.take_update_request() {
+                let staged = state.staged_version();
+                match update::decide(
+                    sentinel_service::VERSION,
+                    staged.as_deref(),
+                    state.agent_in_call(),
+                    false,
+                ) {
+                    update::ApplyDecision::Apply => {
+                        tracing::info!(version = ?staged, "staged update ready to apply");
+                    }
+                    update::ApplyDecision::DeferInCall => {
+                        tracing::info!("update deferred: the agent is on a call");
+                    }
+                    update::ApplyDecision::Nothing => {
+                        tracing::debug!("update check found nothing newer");
+                    }
+                }
             }
 
             let wait = match supervisor.poll(now_ms()) {

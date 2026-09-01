@@ -1028,6 +1028,7 @@ dependencies = [
  "hound",
  "rand 0.8.8",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "sentinel-capture",
  "sentinel-core",

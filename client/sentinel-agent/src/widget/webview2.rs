@@ -103,11 +103,17 @@ impl WebView2Widget {
                 None,
             )?;
 
-            Ok(WebView2Widget {
+            let widget = WebView2Widget {
                 hwnd,
                 shared: Arc::new(Mutex::new(Shared::default())),
                 rect,
-            })
+            };
+            // The window procedure has no instance pointer to reach the widget
+            // through, so its shared state has to be published before any message can
+            // arrive. Doing it here rather than leaving it to the caller means a
+            // caller who forgets cannot silently lose drag handling.
+            let _ = SHARED.set(widget.shared.clone());
+            Ok(widget)
         }
     }
 
@@ -177,7 +183,7 @@ impl WebView2Widget {
     pub fn begin_drag(&self) {
         unsafe {
             let _ = PostMessageW(
-                Some(self.hwnd),
+                self.hwnd,
                 WM_NCLBUTTONDOWN,
                 WPARAM(HTCAPTION as usize),
                 LPARAM(0),
@@ -245,7 +251,7 @@ impl WidgetShell for WebView2Widget {
             // "always present" spec 12.4 requires.
             SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
+                HWND_TOPMOST,
                 rect.x,
                 rect.y,
                 rect.width,
@@ -269,7 +275,7 @@ impl WidgetShell for WebView2Widget {
             // Re-assert the Z-order and nothing else.
             SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
+                HWND_TOPMOST,
                 0,
                 0,
                 0,
@@ -325,12 +331,6 @@ unsafe extern "system" fn wnd_proc(
 /// guarded by the named mutex in `main` — so a single slot is sufficient and a
 /// per-HWND map would be ceremony.
 static SHARED: std::sync::OnceLock<Arc<Mutex<Shared>>> = std::sync::OnceLock::new();
-
-/// Register the widget's shared state with the window procedure. Called once, from
-/// `create`'s caller, after the window exists.
-pub fn register_shared(widget: &WebView2Widget) {
-    let _ = SHARED.set(widget.shared.clone());
-}
 
 /// Point in a rect, for hit-testing the bundle's declared drag region.
 pub fn point_in(rect: Rect, p: POINT) -> bool {

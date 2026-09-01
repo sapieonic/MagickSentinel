@@ -9,7 +9,7 @@
 //! authorization code to.
 
 use super::pkce::{parse_callback, Callback, CallbackError};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -86,9 +86,11 @@ impl LoopbackListener {
     fn serve_one(mut stream: TcpStream) -> Result<Callback, LoopbackError> {
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         let mut line = String::new();
-        BufReader::new(stream.try_clone()?)
-            .take(MAX_REQUEST_LINE)
-            .read_line(&mut line)?;
+        // Bounded: an authorization code plus state is a few hundred bytes, and an
+        // unbounded `read_line` on a socket anything local can connect to is a way to
+        // make the agent allocate until it dies.
+        let mut reader = BufReader::new(stream.try_clone()?).take(MAX_REQUEST_LINE);
+        reader.read_line(&mut line)?;
 
         let target = request_target(&line).ok_or(CallbackError::Malformed)?;
         let result = parse_callback(target);
@@ -142,7 +144,7 @@ const FAILURE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Sign-in fa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+
 
     #[test]
     fn request_targets_are_parsed_and_non_get_is_refused() {

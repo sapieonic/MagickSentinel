@@ -77,7 +77,7 @@ mod win {
         CRED_TYPE_GENERIC,
     };
     use windows::Win32::Security::Cryptography::{
-        CryptProtectData, CryptUnprotectData, CRYPTOAPI_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
 
     /// The real store: DPAPI-wrapped, held in Credential Manager.
@@ -102,7 +102,7 @@ mod win {
     }
 
     /// Owns a buffer DPAPI allocated with `LocalAlloc`.
-    struct DpapiBlob(CRYPTOAPI_BLOB);
+    struct DpapiBlob(CRYPT_INTEGER_BLOB);
 
     impl DpapiBlob {
         fn as_slice(&self) -> &[u8] {
@@ -127,11 +127,11 @@ mod win {
     }
 
     fn protect(plain: &[u8]) -> Result<DpapiBlob, StoreError> {
-        let mut input = CRYPTOAPI_BLOB {
+        let input = CRYPT_INTEGER_BLOB {
             cbData: plain.len() as u32,
             pbData: plain.as_ptr() as *mut u8,
         };
-        let mut out = CRYPTOAPI_BLOB::default();
+        let mut out = CRYPT_INTEGER_BLOB::default();
         unsafe {
             // No CRYPTPROTECT_LOCAL_MACHINE flag: its absence is what selects **user**
             // scope. Adding it would let every account on a shared desktop decrypt
@@ -141,7 +141,7 @@ mod win {
             // shell is up; a DPAPI prompt on a session-0-adjacent desktop would hang
             // with no visible window.
             CryptProtectData(
-                &mut input,
+                &input,
                 None,
                 None,
                 None,
@@ -155,14 +155,14 @@ mod win {
     }
 
     fn unprotect(wrapped: &[u8]) -> Result<DpapiBlob, StoreError> {
-        let mut input = CRYPTOAPI_BLOB {
+        let input = CRYPT_INTEGER_BLOB {
             cbData: wrapped.len() as u32,
             pbData: wrapped.as_ptr() as *mut u8,
         };
-        let mut out = CRYPTOAPI_BLOB::default();
+        let mut out = CRYPT_INTEGER_BLOB::default();
         unsafe {
             CryptUnprotectData(
-                &mut input,
+                &input,
                 None,
                 None,
                 None,
@@ -210,7 +210,7 @@ mod win {
                 CredReadW(
                     windows::core::PCWSTR(self.target.as_ptr()),
                     CRED_TYPE_GENERIC,
-                    None,
+                    0,
                     &mut ptr,
                 )
             };
@@ -248,7 +248,7 @@ mod win {
                 CredDeleteW(
                     windows::core::PCWSTR(self.target.as_ptr()),
                     CRED_TYPE_GENERIC,
-                    None,
+                    0,
                 )
             };
             // Deleting a credential that is not there is the desired end state.

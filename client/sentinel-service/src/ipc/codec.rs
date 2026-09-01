@@ -81,7 +81,10 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Response {
-    Config(ConfigSnapshot),
+    // Boxed: the config snapshot carries a whole `Policy` and dwarfs every other
+    // variant, so an unboxed enum would make even an `Ok` reply several hundred bytes
+    // on the stack. Serde treats `Box<T>` as `T`, so the wire format is unchanged.
+    Config(Box<ConfigSnapshot>),
     /// Acknowledgement for requests with no payload.
     Ok,
     UpdateStatus(UpdateStatus),
@@ -229,14 +232,14 @@ mod tests {
 
     fn all_responses() -> Vec<Response> {
         vec![
-            Response::Config(ConfigSnapshot {
+            Response::Config(Box::new(ConfigSnapshot {
                 local: LocalConfig::default(),
                 policy: Some(Policy::default()),
                 capture_tier: Some("B".into()),
                 os_build: "10.0.19045".into(),
                 service_version: "0.1.0".into(),
                 agent_restarts: 3,
-            }),
+            })),
             Response::Ok,
             Response::UpdateStatus(UpdateStatus {
                 current_version: "0.1.0".into(),

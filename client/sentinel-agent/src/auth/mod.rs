@@ -10,7 +10,7 @@ use loopback::LoopbackListener;
 use pkce::{AuthAttempt, OidcConfig, OsEntropy};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use store::TokenStore;
+pub use store::TokenStore;
 
 /// ID tokens live an hour; refresh at fifty minutes (spec 7.3 step 8). The ten-minute
 /// margin absorbs a slow network and clock skew between the endpoint and the IdP, and

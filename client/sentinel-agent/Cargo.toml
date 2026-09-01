@@ -37,6 +37,7 @@ base64.workspace = true
 tungstenite.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+rustls-native-certs = "0.8"
 ureq.workspace = true
 audiopus.workspace = true
 
@@ -64,4 +65,5 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+ulid.workspace = true
 hound.workspace = true

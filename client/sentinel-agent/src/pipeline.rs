@@ -25,6 +25,10 @@ use sentinel_core::spool::SegmentRow;
 use sentinel_core::state::{BlockReason, CallState, Detector, DetectorInput, Transition};
 use std::collections::BTreeMap;
 
+/// Segments of pre-roll kept per channel while `ARMED`, matching the 60 s RAM ring
+/// buffer the spec calls for. One segment is one second.
+pub const PREROLL_MAX_SEGMENTS: usize = 60;
+
 /// Samples read from a source in one go. 20 ms at 16 kHz is one Opus frame; asking
 /// for a whole segment's worth at a time would add up to a second of latency to the
 /// VAD, and the detector's 300 ms confirmation threshold would then be meaningless.
@@ -39,10 +43,27 @@ struct ChannelPipe {
     /// Samples consumed on this channel, the basis for its own gap accounting.
     samples_seen: u64,
     buffer: Vec<i16>,
+    /// Segments the encoder has finished but that have not been spooled yet.
+    ///
+    /// While `ARMED` this is the pre-roll: the seconds before the far-channel VAD
+    /// confirmed a human. Keeping it is what stops every call losing its opening
+    /// words — the borrower's "hello" is the 300 ms that confirmed the call.
+    /// `ArmDiscarded` throws it away; `CallStarted` spools it.
+    ready: Vec<crate::encode::Segment>,
+}
+
+impl ChannelPipe {
+    /// Start a fresh sequence space. Sequence numbers are per `(call_id, channel)` and
+    /// start at 0, so the encoder is rebuilt whenever a new call's audio begins.
+    fn restart(&mut self) -> anyhow::Result<()> {
+        self.encoder = SegmentEncoder::new(self.channel)?;
+        self.ready.clear();
+        Ok(())
+    }
 }
 
 /// What one `step` produced, for the caller to act on.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct StepResult {
     pub transition: Option<Transition>,
     pub segments_spooled: usize,
@@ -157,6 +178,7 @@ impl Pipeline {
             encoder: SegmentEncoder::new(Channel::Far)?,
             samples_seen: 0,
             buffer: vec![0i16; READ_SAMPLES],
+            ready: Vec::new(),
         });
         self.near = Some(ChannelPipe {
             channel: Channel::Near,
@@ -165,6 +187,7 @@ impl Pipeline {
             encoder: SegmentEncoder::new(Channel::Near)?,
             samples_seen: 0,
             buffer: vec![0i16; READ_SAMPLES],
+            ready: Vec::new(),
         });
         self.detector.feed(self.clock_ms, DetectorInput::Unblock);
         Ok(())
@@ -254,11 +277,32 @@ impl Pipeline {
             result.segments_spooled += self.drain_encoders(uplink)?;
         }
 
+        self.bound_preroll();
+
         if transition != Transition::None {
             result.transition = Some(transition);
         }
         result.call_id = self.current_call.as_ref().map(|c| c.call_id.clone());
         Ok(result)
+    }
+
+    /// Keep the pre-roll bounded (spec 6.5: a 60 s RAM ring buffer per channel).
+    ///
+    /// Outside a call and outside `ARMED` there is nothing to keep at all; inside
+    /// `ARMED` the arm times out after 20 s, so the cap is only ever reached if the
+    /// detector is wedged. Either way an unbounded buffer on a process that runs for
+    /// a whole shift is a leak, not a design.
+    fn bound_preroll(&mut self) {
+        let armed = self.detector.state() == CallState::Armed;
+        let in_call = self.current_call.is_some();
+        for pipe in [self.far.as_mut(), self.near.as_mut()].into_iter().flatten() {
+            if !armed && !in_call {
+                pipe.ready.clear();
+            } else if pipe.ready.len() > PREROLL_MAX_SEGMENTS {
+                let excess = pipe.ready.len() - PREROLL_MAX_SEGMENTS;
+                pipe.ready.drain(..excess);
+            }
+        }
     }
 
     /// Handle a device that went away mid-call, per spec 6.3.
@@ -302,7 +346,12 @@ impl Pipeline {
                 pipe.vad.push_frame(frame);
             }
         }
-        pipe.encoder.push_samples(&samples)?;
+        // Whatever the encoder finished on this push is held on the pipe until the
+        // detector says whether it belongs to a call. Discarding it here — the easy
+        // mistake — silently loses every segment, because the encoder only ever emits
+        // from `push_samples`.
+        let finished = pipe.encoder.push_samples(&samples)?;
+        pipe.ready.extend(finished);
         Ok(n)
     }
 
@@ -313,6 +362,14 @@ impl Pipeline {
         result: &mut StepResult,
     ) -> anyhow::Result<()> {
         match transition {
+            Transition::Armed => {
+                // Begin the pre-roll. The sequence space restarts here so that if this
+                // arm becomes a call, its first segment is seq 0 as the wire contract
+                // requires.
+                for pipe in [self.far.as_mut(), self.near.as_mut()].into_iter().flatten() {
+                    pipe.restart()?;
+                }
+            }
             Transition::CallStarted => {
                 let call_id = ulid::Ulid::new().to_string();
                 let started_at = crate::heartbeat::rfc3339_millis(time::OffsetDateTime::now_utc());
@@ -339,9 +396,14 @@ impl Pipeline {
                 self.finish_call(*reason, uplink, result)?;
             }
             Transition::ArmDiscarded => {
-                // No call happened. Nothing was spooled, so there is nothing to undo;
-                // the encoders keep running because their sequence numbers only
-                // matter inside a call.
+                // Ringback or hold music for the whole window: no human, no call. The
+                // buffered pre-roll is discarded rather than spooled, because audio
+                // with no `call_id` is unattributable and recording an agent who is
+                // not on a call is the surveillance complaint this product cannot
+                // afford.
+                for pipe in [self.far.as_mut(), self.near.as_mut()].into_iter().flatten() {
+                    pipe.restart()?;
+                }
             }
             _ => {}
         }
@@ -357,11 +419,15 @@ impl Pipeline {
     ) -> anyhow::Result<()> {
         let Some(call) = self.current_call.take() else { return Ok(()) };
 
-        // Flush partial segments *before* call.end: last_seq must name the highest
-        // sequence the client actually produced, and the server holds finalization
-        // open until everything below it arrives.
+        // Flush whole and partial segments *before* call.end: last_seq must name the
+        // highest sequence the client actually produced, and the server holds
+        // finalization open until everything below it arrives.
         for pipe in [self.far.as_mut(), self.near.as_mut()].into_iter().flatten() {
+            let mut tail: Vec<crate::encode::Segment> = std::mem::take(&mut pipe.ready);
             if let Some(seg) = pipe.encoder.flush()? {
+                tail.push(seg);
+            }
+            for seg in tail {
                 let row = to_row(&call.call_id, &seg, self.clock_ms);
                 uplink.push_segment(&row)?;
                 result.segments_spooled += 1;
@@ -391,10 +457,10 @@ impl Pipeline {
         let clock = self.clock_ms;
         let mut spooled = 0;
 
-        // The encoders emit on `push_samples`; anything they produced this step is
-        // already in hand, so this only moves finished segments into the spool.
+        // Move everything the encoders have finished — including the pre-roll buffered
+        // while ARMED — into the spool.
         for pipe in [self.far.as_mut(), self.near.as_mut()].into_iter().flatten() {
-            for seg in pipe.encoder.push_samples(&[])? {
+            for seg in std::mem::take(&mut pipe.ready) {
                 let row = to_row(&call_id, &seg, clock);
                 uplink.push_segment(&row)?;
                 self.last_seq.insert(pipe.channel, seg.seq);
@@ -439,25 +505,11 @@ mod tests {
     use sentinel_core::config::{PinnedDevice, SpoolLimits};
     use sentinel_core::spool::Spool;
     use crate::uplink::{Transport, TransportError, TransportFactory};
-    use crate::uplink::transport::Incoming;
     use std::f32::consts::TAU;
 
-    struct NullTransport;
-    impl Transport for NullTransport {
-        fn send_text(&mut self, _s: &str) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn send_binary(&mut self, _b: &[u8]) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn recv(&mut self, _t: std::time::Duration) -> Result<Option<Incoming>, TransportError> {
-            Ok(None)
-        }
-        fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
-        }
-    }
-
+    /// The pipeline tests are about audio, not the socket, so the uplink is given a
+    /// factory that never connects: everything stays in the spool where it can be
+    /// inspected. The socket path has its own tests.
     struct NeverConnects;
     impl TransportFactory for NeverConnects {
         fn connect(&mut self) -> Result<Box<dyn Transport>, TransportError> {

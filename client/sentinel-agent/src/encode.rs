@@ -96,6 +96,17 @@ impl SegmentEncoder {
         self.channel
     }
 
+    /// The bitrate libopus actually accepted, read back from the encoder.
+    ///
+    /// Read back rather than remembered: `set_bitrate` can clamp, and the fleet
+    /// bandwidth estimate depends on the value in force, not the one requested.
+    pub fn configured_bitrate(&self) -> Option<i32> {
+        match self.encoder.bitrate() {
+            Ok(audiopus::Bitrate::BitsPerSecond(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Sequence number the next completed segment will carry.
     pub fn next_seq(&self) -> u32 {
         self.next_seq
@@ -264,15 +275,34 @@ mod tests {
     }
 
     #[test]
-    fn the_bitrate_lands_near_the_specified_24_kbps() {
-        // ≈60 bytes per 20 ms frame; the packing overhead is 2 bytes per frame.
+    fn the_encoder_is_configured_at_24_kbps_and_never_exceeds_it_by_much() {
+        // The spec sizes the fleet at 24 kbps per channel — ≈6 KB/s for both, ≈1.2 MB/s
+        // for 200 agents. Opus is VBR, so a given signal encodes *below* the target
+        // (a pure tone costs almost nothing); what matters for the sizing is that the
+        // configured ceiling is right and that the encoder does not run away above it.
         let mut e = SegmentEncoder::new(Channel::Far).unwrap();
-        let segs = e.push_samples(&tone(5000)).unwrap();
+        assert_eq!(
+            e.configured_bitrate(),
+            Some(BITRATE_BPS),
+            "the bitrate must actually reach libopus, not just be passed to a setter"
+        );
+
+        // Broadband noise is the worst case: nothing for the codec to predict.
+        let mut x: u32 = 12345;
+        let noise: Vec<i16> = (0..5 * SAMPLE_RATE as usize)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((x >> 16) as i16) / 4
+            })
+            .collect();
+        let segs = e.push_samples(&noise).unwrap();
         let payload_bytes: usize = segs.iter().map(|s| s.payload.len()).sum();
-        let bits_per_second = (payload_bytes as f64 * 8.0) / 5.0;
+        // Two bytes of length prefix per frame are framing, not codec output.
+        let codec_bytes = payload_bytes - segs.len() * FRAMES_PER_SEGMENT * 2;
+        let bits_per_second = (codec_bytes as f64 * 8.0) / segs.len() as f64;
         assert!(
-            (15_000.0..40_000.0).contains(&bits_per_second),
-            "expected roughly 24 kbps, got {bits_per_second:.0} bps"
+            bits_per_second <= BITRATE_BPS as f64 * 1.25,
+            "worst-case signal produced {bits_per_second:.0} bps against a 24 kbps target"
         );
     }
 
@@ -318,7 +348,7 @@ mod tests {
         let frames = unpack_segment(&seg.payload).unwrap();
         assert_eq!(frames.len(), FRAMES_PER_SEGMENT);
         assert!(seg.flags.silence_inserted, "the padding is declared, not hidden");
-        assert!(frames[0].len() > 0, "the real audio survives");
+        assert!(!frames[0].is_empty(), "the real audio survives");
         assert!(frames[FRAMES_PER_SEGMENT - 1].is_empty(), "the tail is dropped-frame padding");
     }
 
