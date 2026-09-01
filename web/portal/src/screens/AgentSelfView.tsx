@@ -294,7 +294,16 @@ function MyPerformance() {
           <Comparison label="Flags per 1000 calls" you={mine.data.flags_per_1000} median={median.data?.flags_per_1000} format={(v) => v.toFixed(1)} />
         </tbody>
       </table>
-      {!teamId ? <p className="pt-notice">You are not assigned to a team, so there is no median to compare against.</p> : null}
+      {!teamId ? (
+        <p className="pt-notice">You are not assigned to a team, so there is no median to compare against.</p>
+      ) : median.error instanceof ApiError && median.error.isForbidden ? (
+        // The median lives on a supervisor-scoped endpoint, so an agent — the very
+        // role this comparison is for — cannot fetch it. Saying so beats an empty
+        // column that reads as "your team has no data".
+        <p className="pt-notice">
+          The team median comes from a supervisor-scoped report your role may not read, so no comparison is shown.
+        </p>
+      ) : null}
     </>
   );
 }

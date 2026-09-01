@@ -5,7 +5,9 @@ import { CallDetailScreen, CallExplorer } from './screens/CallExplorer.js';
 import { ComplianceQueue } from './screens/ComplianceQueue.js';
 import { AgentSelfView } from './screens/AgentSelfView.js';
 import { FleetAdmin } from './screens/FleetAdmin.js';
-import { BankClientView, LiveFloor, RuleEditor, TeamScorecards } from './screens/Stubs.js';
+import { BankClientView } from './screens/BankClientView.js';
+import { LiveFloor } from './screens/LiveFloor.js';
+import { RuleEditor, TeamScorecards } from './screens/Stubs.js';
 import { defaultRoute, navFor } from './navigation.js';
 import { useSession } from './session.js';
 
@@ -41,8 +43,10 @@ export function App() {
           <Route path="/" element={<Navigate to={defaultRoute(role)} replace />} />
           <Route path="/me" element={<Guard capability="own_calls">{<AgentSelfView />}</Guard>} />
           <Route path="/calls" element={<Guard capability="team_calls">{<CallExplorer />}</Guard>} />
-          {/* Detail is reachable by anyone who can see their own calls: the endpoint
-              behind it is /v1/me/calls/{id}, which is self-scoped server-side. */}
+          {/* Detail is reachable by anyone who can see a call at all. Which calls
+              those are is the server's decision, and a call outside the caller's
+              scope answers 404 — so there is nothing for a stricter gate here to
+              protect. */}
           <Route path="/calls/:callId" element={<Guard capability="own_calls">{<CallDetailScreen />}</Guard>} />
           <Route path="/compliance" element={<Guard capability="resolve_flags">{<ComplianceQueue />}</Guard>} />
           <Route path="/fleet" element={<Guard capability="manage_devices_users">{<FleetAdmin />}</Guard>} />

@@ -51,6 +51,7 @@
 .pt-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 10px; }
 .pt-filters label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--sx-text-dim); }
 .pt-filters__grow { flex: 1; min-width: 180px; }
+.pt-filters--inline { margin-bottom: 0; }
 .pt-filters__grow input { width: 100%; }
 
 .pt-actions { display: flex; gap: 6px; flex-wrap: wrap; }

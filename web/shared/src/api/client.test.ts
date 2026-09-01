@@ -201,9 +201,99 @@ describe('ApiClient request shapes', () => {
     expect(spy.mock.calls[0]![0]).toBe('https://api.example/v1/me/calls/a%2Fb%3Fc');
   });
 
-  it('builds the live stream URL without subscribing', () => {
-    expect(client(vi.fn() as unknown as typeof fetch).teamLiveUrl('team-1')).toBe(
-      'https://api.example/v1/teams/team-1/live',
-    );
+  it('builds the live stream URL with the ticket and no token', () => {
+    const url = client(vi.fn() as unknown as typeof fetch).teamLiveUrl('team-1', 'tick et/1');
+    expect(url).toBe('https://api.example/v1/teams/team-1/live?ticket=tick%20et%2F1');
+    // The whole point of the ticket exchange: the bearer token never reaches a
+    // query string, where it would outlive the request in logs and caches.
+    expect(url).not.toContain('tok');
+  });
+});
+
+describe('ApiClient scope-derived call listing', () => {
+  let seen: string[];
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    seen = [];
+    fetchMock = vi.fn(async (url: string | URL | Request) => {
+      seen.push(String(url));
+      return jsonResponse(200, { items: [] });
+    });
+  });
+
+  it('sends only the filters that were set', async () => {
+    await client(fetchMock as unknown as typeof fetch).listCalls({
+      from: '2026-09-01T00:00:00Z',
+      team_id: 'team-7',
+      limit: 200,
+    });
+    expect(seen[0]).toBe('https://api.example/v1/calls?from=2026-09-01T00%3A00%3A00Z&team_id=team-7&limit=200');
+  });
+
+  it('keeps has_flags=false, which is a filter and not an absent one', async () => {
+    // 'no flags' and 'any' are different questions; dropping false would silently
+    // turn one into the other.
+    await client(fetchMock as unknown as typeof fetch).listCalls({ has_flags: false });
+    expect(seen[0]).toBe('https://api.example/v1/calls?has_flags=false');
+    await client(fetchMock as unknown as typeof fetch).listCalls({ has_flags: true });
+    expect(seen[1]).toBe('https://api.example/v1/calls?has_flags=true');
+  });
+
+  it('reports a call outside the caller\u2019s scope as not found, never as forbidden', async () => {
+    const missing = vi.fn(async () => jsonResponse(404, { code: 'not_found', message: 'no such call' }));
+    const error = (await client(missing as unknown as typeof fetch)
+      .getCall('c-1')
+      .catch((e: unknown) => e)) as ApiError;
+    expect(error.isNotFound).toBe(true);
+    expect(error.isForbidden).toBe(false);
+  });
+
+  it('percent-encodes a call id into the detail path', async () => {
+    await client(fetchMock as unknown as typeof fetch).getCall('a/b');
+    expect(seen[0]).toBe('https://api.example/v1/calls/a%2Fb');
+  });
+
+  it('surfaces a failed team listing rather than pretending there are no teams', async () => {
+    const failing = vi.fn(async () => jsonResponse(500, { code: 'internal', message: 'boom' }));
+    const error = (await client(failing as unknown as typeof fetch)
+      .listTeams()
+      .catch((e: unknown) => e)) as ApiError;
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(500);
+    expect(error.code).toBe('internal');
+  });
+});
+
+describe('ApiClient live ticket', () => {
+  it('POSTs to the team ticket route and returns the ticket', async () => {
+    let method = '';
+    const minting = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      method = String(init?.method);
+      expect(String(url)).toBe('https://api.example/v1/teams/team-1/live/ticket');
+      return jsonResponse(201, { ticket: 'abc', expires_at: '2026-09-01T00:01:00Z' });
+    });
+    const ticket = await client(minting as unknown as typeof fetch).createLiveTicket('team-1');
+    expect(method).toBe('POST');
+    expect(ticket).toEqual({ ticket: 'abc', expires_at: '2026-09-01T00:01:00Z' });
+  });
+
+  it('reports a refused mint as forbidden so the caller can stop retrying', async () => {
+    const refused = vi.fn(async () => jsonResponse(403, { code: 'forbidden', message: 'role not permitted' }));
+    const error = (await client(refused as unknown as typeof fetch)
+      .createLiveTicket('team-1')
+      .catch((e: unknown) => e)) as ApiError;
+    expect(error.isForbidden).toBe(true);
+  });
+
+  it('reports an unreachable gateway as transport, which is worth retrying', async () => {
+    const offline = vi.fn(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    const error = (await client(offline as unknown as typeof fetch)
+      .createLiveTicket('team-1')
+      .catch((e: unknown) => e)) as ApiError;
+    expect(error.isTransport).toBe(true);
+    expect(error.isForbidden).toBe(false);
   });
 });

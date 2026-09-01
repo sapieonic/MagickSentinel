@@ -150,11 +150,14 @@ function Devices() {
 }
 
 function Users() {
-  const { api } = useSession();
+  const { api, teams } = useSession();
   const users = useAsync(async (signal) => api.listUsers(signal), [api]);
   const [busy, setBusy] = useState<string | null>(null);
 
-  const change = async (user: User, patch: { role?: Role; status?: 'active' | 'suspended' }) => {
+  const change = async (
+    user: User,
+    patch: { role?: Role; team_id?: string | null; status?: 'active' | 'suspended' },
+  ) => {
     setBusy(user.firebase_uid);
     try {
       await api.updateUser(user.firebase_uid, patch);
@@ -201,7 +204,28 @@ function Users() {
                     ))}
                   </select>
                 </td>
-                <td className="sx-mono">{user.team_id ?? '—'}</td>
+                <td>
+                  {/* A team id is a UUID; the name is what an admin recognises. The
+                      listing is the only place the two are connected, since the
+                      token carries an id and nothing else. */}
+                  <select
+                    value={user.team_id ?? ''}
+                    disabled={busy === user.firebase_uid || teams.length === 0}
+                    onChange={(event) => void change(user, { team_id: event.target.value || null })}
+                  >
+                    <option value="">No team</option>
+                    {/* A team the listing does not contain still has to be shown as
+                        itself; falling through to "No team" would misreport it. */}
+                    {user.team_id && !teams.some((team) => team.id === user.team_id) ? (
+                      <option value={user.team_id}>{user.team_id}</option>
+                    ) : null}
+                    {teams.map((team) => (
+                      <option key={team.id} value={team.id}>
+                        {team.name}
+                      </option>
+                    ))}
+                  </select>
+                </td>
                 <td>
                   <button
                     disabled={busy === user.firebase_uid}

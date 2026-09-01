@@ -1,12 +1,10 @@
 /**
  * Deliberate stubs.
  *
- * Spec 13.3 numbers its screens in build order and marks 5–7 as later phases; the
- * milestones in section 16 put the live floor view in phase 5. A half-built
- * scorecard or a floor view that silently shows nothing is worse than an empty
- * screen that says what is missing, because QA cannot tell the difference between
- * "not built" and "no data" — so these say so, and each names the contract
- * operation it will be built on.
+ * Both screens here are blocked on a product decision, not on plumbing: each names
+ * what would settle it and the operation it would be built on. A half-built
+ * scorecard is worse than an empty screen that says what is missing, because a
+ * reviewer cannot tell "not built" from "no data".
  */
 import { Panel } from '../components/Async.js';
 
@@ -30,28 +28,6 @@ export function TeamScorecards() {
       phase="spec 13.3 screen 5"
       endpoint="GET /v1/teams/{id}/scorecards"
       why="Supervisor view with trend over time. The endpoint returns a point-in-time median plus per-agent rows; trend needs either repeated windowed calls or a contract change, which is a decision this build does not make on its own."
-    />
-  );
-}
-
-export function LiveFloor() {
-  return (
-    <Stub
-      title="Live floor view"
-      phase="spec 13.3 screen 6, milestone phase 5"
-      endpoint="GET /v1/teams/{id}/live (SSE)"
-      why="Active calls with live sentiment and escalation alerts. Blocked on how the stream is authenticated: EventSource cannot send an Authorization header and the contract does not define an alternative, so subscribing here would mean inventing one."
-    />
-  );
-}
-
-export function BankClientView() {
-  return (
-    <Stub
-      title="Bank client view"
-      phase="spec 13.3 screen 7"
-      endpoint="GET /v1/compliance/flags"
-      why="Read-only aggregate compliance posture, drilling into flagged calls only. The flag queue endpoint exists, but the role matrix restricts this role to flagged calls and there is no flag-scoped call detail endpoint to drill into."
     />
   );
 }

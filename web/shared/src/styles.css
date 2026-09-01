@@ -57,6 +57,7 @@ body {
 }
 
 .sx-chip--muted { color: var(--sx-text-dim); }
+.sx-chip--live { color: var(--sx-ok); border-color: var(--sx-ok); }
 
 .sx-sev { font-weight: 600; }
 .sx-sev--low { color: var(--sx-text-dim); }

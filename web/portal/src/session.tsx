@@ -29,6 +29,8 @@ interface SessionContextValue {
   canPlayAudio: boolean;
   /** Empty until the listing resolves, and for roles that never name a team. */
   teams: readonly Team[];
+  /** False only while the listing is in flight, so "none" is never shown too early. */
+  teamsResolved: boolean;
   /** A team's name, or the raw id when it is not in the listing. */
   teamName: (id: string | null | undefined) => string;
 }
@@ -55,6 +57,7 @@ export function SessionProvider({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [teams, setTeams] = useState<readonly Team[]>([]);
+  const [teamsResolved, setTeamsResolved] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -79,6 +82,7 @@ export function SessionProvider({
   useEffect(() => {
     if (!wantsTeams) {
       setTeams([]);
+      setTeamsResolved(true);
       return;
     }
     const controller = new AbortController();
@@ -87,7 +91,10 @@ export function SessionProvider({
       .then((found) => setTeams(found))
       // A failed team listing degrades a label to a raw id; it must not take the
       // screen down, so nothing is surfaced here.
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => {
+        if (!controller.signal.aborted) setTeamsResolved(true);
+      });
     return () => controller.abort();
   }, [api, wantsTeams]);
 
@@ -102,9 +109,10 @@ export function SessionProvider({
       can: (capability: Capability) => can(role, capability),
       canPlayAudio: canPlayAudio(role, session?.policy.allow_agent_audio_playback ?? false),
       teams,
+      teamsResolved,
       teamName: (id) => (id ? (byId.get(id) ?? id) : '—'),
     };
-  }, [api, session, loading, error, role, teams]);
+  }, [api, session, loading, error, role, teams, teamsResolved]);
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }

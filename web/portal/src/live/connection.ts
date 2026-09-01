@@ -99,8 +99,10 @@ export class LiveConnection {
     return this.#state;
   }
 
+  /** Idempotent: a second call while a stream, a mint or a retry is pending is a no-op. */
   start(): void {
-    if (this.#stopped || this.#source !== null || this.#mint !== null) return;
+    if (this.#stopped || this.#state.status === 'refused') return;
+    if (this.#source !== null || this.#mint !== null || this.#retryTimer !== null) return;
     this.#sweepTimer ??= setInterval(() => this.#sweep(), this.#options.sweepEveryMs);
     this.#patch({ status: 'connecting' });
     void this.#connect();

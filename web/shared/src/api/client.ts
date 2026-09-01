@@ -390,8 +390,13 @@ export class ApiClient {
   }
 }
 
-/** Query surface of GET /v1/calls. Every field narrows; none can widen. */
-export interface CallQuery {
+/**
+ * Query surface of GET /v1/calls. Every field narrows; none can widen.
+ *
+ * A type alias rather than an interface on purpose: only an alias picks up the
+ * implicit index signature that lets it be passed as a query bag.
+ */
+export type CallQuery = {
   from?: string | undefined;
   to?: string | undefined;
   user_uid?: string | undefined;
@@ -401,7 +406,7 @@ export interface CallQuery {
   q?: string | undefined;
   limit?: number | undefined;
   cursor?: string | undefined;
-}
+};
 
 /* --------------------------------------------------------------- internals */
 
