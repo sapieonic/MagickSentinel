@@ -71,10 +71,11 @@ bash db/test/rls_test.sh
 
 Row-level security acceptance tests. Boots a throwaway PostgreSQL 16 cluster, applies
 every migration, and asserts the isolation properties directly against the database as
-`sentinel_app` — the NOBYPASSRLS role the gateway actually connects as. Fourteen checks,
-covering cross-tenant reads, agent-to-agent isolation, supervisor team scoping, the
-client role's flagged-calls-only view, and the missing-context case (which must return
-zero rows, not all of them). Run this after any change to `db/migrations/`.
+`sentinel_app` — the NOBYPASSRLS role the gateway actually connects as. Fourteen checks
+at the time of writing, covering cross-tenant reads, agent-to-agent isolation, supervisor
+team scoping, the client role's flagged-calls-only view, and the missing-context case,
+which must return zero rows rather than all of them. Run this after any change to
+`db/migrations/`.
 
 `db/test/pgtest.sh` is the harness the two database scripts share. It re-executes the
 calling script as an unprivileged user when run as root, because `initdb` refuses to run
