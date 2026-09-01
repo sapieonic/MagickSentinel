@@ -23,3 +23,4 @@ venv/
 .env.local
 *.log
 spool.db
+client/target/
