@@ -12,11 +12,5 @@ export default defineConfig({
       { find: /^@sentinel\/shared\//, replacement: fileURLToPath(new URL('../shared/src/', import.meta.url)) },
     ],
   },
-  build: {
-    // The MSI ships this bundle to disk and WebView2 loads it over file:// or a
-    // virtual host mapping, so asset URLs must be relative, not root-absolute.
-    assetsDir: 'assets',
-    sourcemap: true,
-  },
-  base: './',
+  build: { sourcemap: true },
 });

@@ -6,9 +6,12 @@ import { fileURLToPath } from 'node:url';
 // keeps the suite fast and dependency-free.
 export default defineConfig({
   resolve: {
-    alias: {
-      '@sentinel/shared': fileURLToPath(new URL('./shared/src/index.ts', import.meta.url)),
-    },
+    // Exact-match first: a bare prefix alias would rewrite
+    // '@sentinel/shared/styles.css' into a path inside index.ts.
+    alias: [
+      { find: /^@sentinel\/shared$/, replacement: fileURLToPath(new URL('./shared/src/index.ts', import.meta.url)) },
+      { find: /^@sentinel\/shared\//, replacement: fileURLToPath(new URL('./shared/src/', import.meta.url)) },
+    ],
   },
   test: {
     environment: 'node',

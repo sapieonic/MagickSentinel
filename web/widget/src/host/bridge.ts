@@ -14,7 +14,15 @@
 import type { CaptureState, CaptureTier } from '@sentinel/shared';
 import { MockSentinelHost } from './mock.js';
 import { HOST_ERROR_CAUSES } from './types.js';
-import type { HostAuthState, HostError, HostErrorCause, HostState, SentinelHost, WebView2Window } from './types.js';
+import type {
+  HostAuthState,
+  HostError,
+  HostErrorCause,
+  HostPendingCall,
+  HostState,
+  SentinelHost,
+  WebView2Window,
+} from './types.js';
 
 const HOST_WAIT_MS = 1500;
 const HOST_POLL_MS = 50;
@@ -134,7 +142,7 @@ function normaliseError(raw: unknown): HostError | null {
   return typeof detail === 'string' ? { cause, detail } : { cause };
 }
 
-function normalisePendingCall(raw: unknown): HostState['pendingCall'] {
+function normalisePendingCall(raw: unknown): HostPendingCall | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const source = raw as Record<string, unknown>;
   const callId = source['callId'];
