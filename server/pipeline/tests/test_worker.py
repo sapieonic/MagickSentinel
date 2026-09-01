@@ -235,3 +235,76 @@ def test_findings_reach_the_sink_with_the_rule_set_version():
     version, findings = sink.findings[outcome.call_id]
     assert version == 1, "a flag must be traceable to the rule text that raised it"
     assert findings == outcome.findings
+
+
+# ------------------------------------------------- coverage reconciliation
+
+from datetime import date, datetime, timedelta, timezone  # noqa: E402
+
+from sentinel_pipeline.coverage import CapturedCall, CdrCall, reconcile  # noqa: E402
+
+DAY = date(2026, 9, 1)
+
+
+def _at(minute: int) -> datetime:
+    return datetime(2026, 9, 1, 10, minute, tzinfo=timezone.utc)
+
+
+def test_full_coverage_matches_every_call():
+    cdr = [CdrCall("a1", _at(0), 300_000), CdrCall("a1", _at(10), 120_000)]
+    captured = [CapturedCall("a1", _at(0), 300_000), CapturedCall("a1", _at(10), 120_000)]
+    rows = reconcile("t", DAY, cdr, captured)
+    assert len(rows) == 1
+    assert rows[0].pct == 100.0
+    assert rows[0].gap_reason is None
+
+
+def test_ring_time_does_not_break_the_match():
+    # The dialer stamps when it dials; we stamp when speech is confirmed, after
+    # ringing. Without a tolerance every single call would read as uncaptured.
+    cdr = [CdrCall("a1", _at(0), 300_000)]
+    captured = [CapturedCall("a1", _at(0) + timedelta(seconds=18), 282_000)]
+    assert reconcile("t", DAY, cdr, captured)[0].captured_calls == 1
+
+
+def test_a_call_far_outside_the_window_is_not_matched():
+    cdr = [CdrCall("a1", _at(0), 300_000)]
+    captured = [CapturedCall("a1", _at(5), 300_000)]
+    assert reconcile("t", DAY, cdr, captured)[0].captured_calls == 0
+
+
+def test_a_dialer_call_id_matches_even_when_the_clocks_disagree():
+    cdr = [CdrCall("a1", _at(0), 300_000, dialer_call_id="D-1")]
+    captured = [CapturedCall("a1", _at(45), 300_000, dialer_call_id="D-1")]
+    assert reconcile("t", DAY, cdr, captured)[0].captured_calls == 1
+
+
+def test_an_agent_who_captured_nothing_gets_an_actionable_reason():
+    cdr = [CdrCall("a1", _at(i), 60_000) for i in range(0, 40, 10)]
+    rows = reconcile("t", DAY, cdr, [])
+    assert rows[0].pct == 0.0
+    assert "signed in" in rows[0].gap_reason
+
+
+def test_partial_coverage_points_at_the_device_events():
+    cdr = [CdrCall("a1", _at(i * 5), 60_000) for i in range(10)]
+    captured = [CapturedCall("a1", _at(i * 5), 60_000) for i in range(5)]
+    rows = reconcile("t", DAY, cdr, captured)
+    assert rows[0].pct == 50.0
+    assert "device events" in rows[0].gap_reason
+
+
+def test_agents_are_reported_separately():
+    # agent_for maps the dialer's agent id to the Firebase uid our own rows carry;
+    # the two identifier spaces are different and the mapping only goes one way.
+    cdr = [CdrCall("a1", _at(0), 60_000), CdrCall("a2", _at(0), 60_000)]
+    captured = [CapturedCall("uid-1", _at(0), 60_000)]
+    rows = reconcile("t", DAY, cdr, captured, agent_for={"a1": "uid-1", "a2": "uid-2"})
+    assert [r.user_uid for r in rows] == ["uid-1", "uid-2"]
+    assert rows[0].pct == 100.0 and rows[1].pct == 0.0
+
+
+def test_one_captured_call_cannot_satisfy_two_cdr_rows():
+    cdr = [CdrCall("a1", _at(0), 60_000), CdrCall("a1", _at(0), 60_000)]
+    captured = [CapturedCall("a1", _at(0), 60_000)]
+    assert reconcile("t", DAY, cdr, captured)[0].captured_calls == 1
