@@ -38,6 +38,9 @@ type PTP struct {
 	AgentConfirmed   *bool   `json:"agent_confirmed"`
 	AgentAmountPaise *int64  `json:"agent_amount_paise"`
 	AgentDueDate     *string `json:"agent_due_date"`
+	// The transcript span the amount and date were read from. Without it a reviewer
+	// cannot jump to the promise, which is the whole point of extracting one.
+	EvidenceSpanMS []int32 `json:"evidence_span_ms,omitempty"`
 }
 
 // CallFilter is the query surface shared by the me, team and compliance listings.
@@ -70,7 +73,8 @@ SELECT c.id::text, c.started_at, c.ended_at, c.duration_ms, c.user_uid, c.accoun
        a.disposition, a.summary, (a.sentiment->>'delta')::float8,
        COALESCE(f.n, 0), f.max_severity,
        p.amount_paise, p.due_date::text, p.confidence,
-       p.agent_confirmed, p.agent_amount_paise, p.agent_due_date::text
+       p.agent_confirmed, p.agent_amount_paise, p.agent_due_date::text,
+       lower(p.extracted_span), upper(p.extracted_span)
   FROM calls c
   LEFT JOIN analyses a ON a.call_id = c.id
   LEFT JOIN ptps p ON p.call_id = c.id
@@ -180,10 +184,12 @@ func scanCall(rows pgx.Rows) (CallSummary, error) {
 	var dueDate, agentDueDate *string
 	var confidence *float64
 	var agentConfirmed *bool
+	var spanStart, spanEnd *int32
 	err := rows.Scan(&c.ID, &c.StartedAt, &c.EndedAt, &c.DurationMS, &c.UserUID,
 		&c.AccountRef, &c.Direction, &c.CaptureTier, &c.Status,
 		&c.Disposition, &c.Summary, &c.SentimentDelta, &c.FlagCount, &c.MaxSeverity,
-		&amount, &dueDate, &confidence, &agentConfirmed, &agentAmount, &agentDueDate)
+		&amount, &dueDate, &confidence, &agentConfirmed, &agentAmount, &agentDueDate,
+		&spanStart, &spanEnd)
 	if err != nil {
 		return c, err
 	}
@@ -192,6 +198,9 @@ func scanCall(rows pgx.Rows) (CallSummary, error) {
 			Present: amount != nil, AmountPaise: amount, DueDate: dueDate,
 			Confidence: *confidence, AgentConfirmed: agentConfirmed,
 			AgentAmountPaise: agentAmount, AgentDueDate: agentDueDate,
+		}
+		if spanStart != nil && spanEnd != nil {
+			c.PTP.EvidenceSpanMS = []int32{*spanStart, *spanEnd}
 		}
 	}
 	return c, nil
@@ -567,17 +576,24 @@ type LiveCallEvent struct {
 
 // LiveCalls returns the calls currently in flight for a team.
 //
-// "In flight" means still ingesting and started within the last two hours. The
-// second condition matters: a call whose client died mid-upload never gets an
-// ended_at, and without the window those ghosts accumulate on the floor view until a
-// supervisor stops believing it.
+// `state` is the capturing device's last reported capture state, not the call row's
+// ingest status. The contract types it as a CaptureState and that is also what a
+// supervisor needs: "IN_CALL" and "WRAP" say what is happening on the floor right
+// now, whereas "ingesting" only says the server is still receiving bytes.
+//
+// "In flight" means no ended_at and started within the last two hours. The window
+// matters: a call whose client died mid-upload never gets an ended_at, and without
+// it those ghosts accumulate on the floor view until a supervisor stops believing
+// the screen.
 func (s *Store) LiveCalls(ctx context.Context, id *auth.Identity, teamID string, now time.Time) ([]LiveCallEvent, error) {
 	var out []LiveCallEvent
 	err := s.AsIdentity(ctx, id, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-SELECT c.id::text, c.user_uid, COALESCE(u.display_name, c.user_uid), c.status, c.started_at
+SELECT c.id::text, c.user_uid, COALESCE(u.display_name, c.user_uid),
+       COALESCE(d.last_capture_state, 'IN_CALL'), c.started_at
   FROM calls c
   LEFT JOIN users u ON u.firebase_uid = c.user_uid
+  LEFT JOIN devices d ON d.id = c.device_id
  WHERE c.ended_at IS NULL
    AND c.started_at > $2
    AND ($1::uuid IS NULL OR c.team_id = $1)

@@ -316,7 +316,16 @@ paths:
     get:
       operationId: getMyStats
       tags: [me]
-      summary: Coverage, PTP conversion and sentiment delta against the team median
+      summary: The agent's own numbers alongside their team median
+      description: |
+        The median is returned here because the agent self-view is defined as a
+        comparison against it, and the scorecards endpoint that also carries it is
+        gated on a capability agents do not hold.
+
+        Aggregates only. No per-agent numbers and no colleague names cross this
+        boundary, and there is deliberately no endpoint that hands an agent the
+        ranked list: leaderboards on a collections floor produce gaming, not
+        improvement. `median` is null when the agent belongs to no team.
       parameters:
         - { name: from, in: query, schema: { type: string, format: date } }
         - { name: to, in: query, schema: { type: string, format: date } }
@@ -325,7 +334,14 @@ paths:
           description: stats
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/AgentStats' }
+              schema:
+                type: object
+                required: [self]
+                properties:
+                  self: { $ref: '#/components/schemas/AgentStats' }
+                  median:
+                    allOf: [{ $ref: '#/components/schemas/AgentStats' }]
+                    nullable: true
 
   /v1/me/flags:
     get:
@@ -444,7 +460,15 @@ paths:
           description: single-use ticket from POST /v1/teams/{id}/live/ticket
       responses:
         '200':
-          description: text/event-stream of LiveCallEvent objects
+          description: |
+            A `text/event-stream` carrying three named event types:
+
+            * `call` — a `LiveCallEvent`, re-sent every poll for each in-flight call.
+            * `call_ended` — `{"call_id": "..."}`, sent once when a call leaves the
+              set. Without it a client can only remove rows by guessing at staleness,
+              and cannot tell a finished call from a frozen stream.
+            * `snapshot` — `{"count": n}`, closing each batch, so a client that
+              missed a `call_ended` can reconcile against the complete set.
           content:
             text/event-stream:
               schema: { $ref: '#/components/schemas/LiveCallEvent' }

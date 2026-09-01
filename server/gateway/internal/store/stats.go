@@ -80,6 +80,55 @@ func (s *Store) agentStats(ctx context.Context, tx pgx.Tx, userUID string, from,
 	return out, rows.Err()
 }
 
+// PeerMedian is the team median an agent is compared against.
+//
+// It has to be computed outside the caller's row-level security context, because an
+// agent can only see their own rows and a median of one is themselves. The values
+// returned are aggregates over the agent's own team — no per-agent numbers, no names,
+// and nothing that identifies a colleague. Comparison against the median is the
+// point; a leaderboard on a collections floor produces gaming, not improvement, so
+// there is no endpoint that returns the ranked list to an agent.
+func (s *Store) PeerMedian(ctx context.Context, tenantID, userUID string, from, to time.Time) (AgentStats, error) {
+	var agents []AgentStats
+	err := s.AsSystem(ctx, tenantID, func(tx pgx.Tx) error {
+		var teamID *string
+		if err := tx.QueryRow(ctx,
+			`SELECT team_id::text FROM users WHERE firebase_uid = $1`, userUID).Scan(&teamID); err != nil {
+			return err
+		}
+		if teamID == nil {
+			// No team, no peers. Returning the tenant-wide median instead would
+			// compare an unassigned agent against a population they are not part of.
+			return nil
+		}
+		rows, err := tx.Query(ctx, statsQuery+`
+ WHERE agg.user_uid IN (SELECT firebase_uid FROM users WHERE team_id = $4::uuid)`,
+			nil, from, to, *teamID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a AgentStats
+			var ptpCalls int
+			if err := rows.Scan(&a.UserUID, &a.DisplayName, &a.Calls, &ptpCalls,
+				&a.PTPAmountPaise, &a.AvgSentimentDelta, &a.TalkRatio, new(int),
+				&a.CoveragePct); err != nil {
+				return err
+			}
+			if a.Calls > 0 {
+				a.PTPRate = float64(ptpCalls) / float64(a.Calls)
+			}
+			agents = append(agents, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return AgentStats{}, err
+	}
+	return medianOf(agents, from, to), nil
+}
+
 // AgentStats returns one agent's numbers. RLS keeps an agent to their own row.
 func (s *Store) AgentStats(ctx context.Context, id *auth.Identity, userUID string, from, to time.Time) (AgentStats, error) {
 	out := AgentStats{

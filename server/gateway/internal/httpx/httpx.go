@@ -135,3 +135,44 @@ func Recover(log *slog.Logger, next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+
+// CORS applies an explicit allow-list of browser origins.
+//
+// The gateway sets no CORS headers by default, which is correct when the portal is
+// served same-origin or behind a reverse proxy and is a deployment surprise
+// otherwise. Configuring it is deliberate rather than automatic: a wildcard origin on
+// an API that serves borrower call content is not a default anyone should inherit.
+//
+// Credentials are allowed because the portal sends a bearer token, and a wildcard
+// origin is rejected outright for the same reason — the two combined would let any
+// page on the internet read a tenant's calls with a stolen token.
+func CORS(allowedOrigins []string, next http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		if o == "*" {
+			panic("httpx: a wildcard CORS origin is not permitted on an API serving call content")
+		}
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && allowed[origin] {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Origin", origin)
+			h.Set("Access-Control-Allow-Credentials", "true")
+			h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+			h.Set("Access-Control-Expose-Headers", "X-Request-Id")
+			h.Set("Access-Control-Max-Age", "600")
+			// The response varies by Origin, so a shared cache must not serve one
+			// tenant's portal the headers minted for another's.
+			h.Add("Vary", "Origin")
+		}
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

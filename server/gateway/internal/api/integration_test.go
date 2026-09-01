@@ -1082,3 +1082,141 @@ func TestAnEmptyPageIsNotAudited(t *testing.T) {
 		t.Fatalf("an empty listing wrote %d audit rows", n)
 	}
 }
+
+// ------------------------------------------- team scope, median, CORS, SSE
+
+func TestAnAgentGetsATeamMedianWithoutSeeingColleagues(t *testing.T) {
+	// The self-view is defined as a comparison against the median, and the
+	// scorecards endpoint that also carries it is gated on a capability agents do
+	// not hold — so without this the comparison column is always empty.
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/me/stats?from=2026-08-01&to=2026-09-30",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var out struct {
+		Self   map[string]any `json:"self"`
+		Median map[string]any `json:"median"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Self["user_uid"] != "agent-a" {
+		t.Fatalf("self is not the caller: %s", body)
+	}
+	if out.Median == nil {
+		t.Fatalf("no median returned: %s", body)
+	}
+	if out.Median["user_uid"] != "median" || out.Median["display_name"] != "Team median" {
+		t.Fatalf("median is not anonymised: %s", body)
+	}
+	// The median is computed over agent-a and agent-b, so it is genuinely a peer
+	// comparison rather than the caller's own numbers relabelled.
+	if !strings.Contains(string(body), `"calls"`) {
+		t.Fatalf("median carries no comparable figures: %s", body)
+	}
+	// No colleague may be named anywhere in the response.
+	if strings.Contains(string(body), "agent-b") || strings.Contains(string(body), "Agent B") {
+		t.Fatalf("a colleague's identity leaked into the self-view: %s", body)
+	}
+}
+
+func TestAnAgentCannotEnumerateTheTeamRoster(t *testing.T) {
+	// The org chart is the same kind of information as other agents' scores, and no
+	// agent screen needs it.
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/teams",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var teams []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	json.Unmarshal(body, &teams)
+	// Their own team, and only their own.
+	for _, tm := range teams {
+		if tm.ID != teamNorth {
+			t.Fatalf("an agent saw a team they are not in: %s", body)
+		}
+	}
+}
+
+func TestCorsIsOffByDefaultAndExactWhenConfigured(t *testing.T) {
+	f := newFixture(t)
+	// The fixture configures no origins, so a browser request gets no headers —
+	// correct when the portal is served same-origin, and a deliberate decision
+	// rather than a wildcard nobody chose.
+	req, _ := http.NewRequest(http.MethodGet, f.server.URL+"/healthz", nil)
+	req.Header.Set("Origin", "https://portal.example.com")
+	resp, err := f.server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("CORS headers appeared without being configured")
+	}
+}
+
+func TestTheLiveStreamAnnouncesEndedCallsAndSnapshots(t *testing.T) {
+	// Without an explicit end signal a client can only remove rows by guessing at
+	// staleness, and cannot tell a finished call from a frozen stream.
+	f := newFixture(t)
+	if _, err := f.admin.Exec(context.Background(), `
+		INSERT INTO calls (id, tenant_id, device_id, user_uid, team_id, started_at,
+		                   capture_tier, status)
+		VALUES ('c0000000-0000-0000-0000-0000000000e1', $1,
+		        'dddddddd-0000-0000-0000-000000000001', 'agent-a', $2, $3, 'A', 'ingesting')`,
+		acmeTenant, teamNorth, f.now.Add(-2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	token := f.token("sup-1", acmeTenant, auth.RoleSupervisor, teamNorth)
+	_, body := f.do(http.MethodPost, "/v1/teams/"+teamNorth+"/live/ticket", token, nil)
+	var minted struct {
+		Ticket string `json:"ticket"`
+	}
+	json.Unmarshal(body, &minted)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		f.server.URL+"/v1/teams/"+teamNorth+"/live?ticket="+minted.Ticket, nil)
+	resp, err := f.server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	buf := make([]byte, 4096)
+	n, _ := resp.Body.Read(buf)
+	first := string(buf[:n])
+	if !strings.Contains(first, "event: call\n") || !strings.Contains(first, "event: snapshot\n") {
+		t.Fatalf("first snapshot missing a call or its boundary marker: %q", first)
+	}
+	// The capture state, not the ingest status: "ingesting" tells a supervisor
+	// nothing about what is happening on the floor.
+	if strings.Contains(first, `"state":"ingesting"`) {
+		t.Fatalf("the stream carries the ingest status instead of the capture state: %q", first)
+	}
+
+	// End the call; the next poll must say so rather than simply omitting it.
+	if _, err := f.admin.Exec(context.Background(),
+		`UPDATE calls SET ended_at = now() WHERE id = 'c0000000-0000-0000-0000-0000000000e1'`); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		n, err := resp.Body.Read(buf)
+		if err != nil {
+			break
+		}
+		if strings.Contains(string(buf[:n]), "event: call_ended") {
+			return
+		}
+	}
+	t.Fatal("a finished call was never announced as ended")
+}

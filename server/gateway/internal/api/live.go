@@ -159,13 +159,23 @@ func (s *Server) streamTeamLive(w http.ResponseWriter, r *http.Request) {
 	keepalive := time.NewTicker(20 * time.Second)
 	defer keepalive.Stop()
 
+	// Calls seen in the previous snapshot, so a call that has gone away can be
+	// announced rather than left for the client to time out. Without an explicit
+	// end, removal is a staleness heuristic, and a supervisor watching a floor where
+	// nothing changes for a minute cannot tell a finished call from a frozen stream.
+	previous := map[string]bool{}
+
 	send := func() bool {
 		events, err := s.Store.LiveCalls(r.Context(), ticket.Identity, ticket.TeamID, s.now())
 		if err != nil {
+			// A transient database failure must not end the stream, and must not be
+			// reported as every call ending: the previous snapshot stands.
 			s.Log.Error("live view query", "error", err)
-			return true // a transient failure should not end the stream
+			return true
 		}
+		current := make(map[string]bool, len(events))
 		for _, e := range events {
+			current[e.CallID] = true
 			b, err := json.Marshal(e)
 			if err != nil {
 				continue
@@ -173,6 +183,22 @@ func (s *Server) streamTeamLive(w http.ResponseWriter, r *http.Request) {
 			if _, err := fmt.Fprintf(w, "event: call\ndata: %s\n\n", b); err != nil {
 				return false
 			}
+		}
+		for callID := range previous {
+			if current[callID] {
+				continue
+			}
+			if _, err := fmt.Fprintf(w,
+				"event: call_ended\ndata: {\"call_id\":%q}\n\n", callID); err != nil {
+				return false
+			}
+		}
+		previous = current
+		// A snapshot marker closes each batch, so a client that missed a call_ended
+		// can reconcile against the complete set rather than accumulating ghosts.
+		if _, err := fmt.Fprintf(w,
+			"event: snapshot\ndata: {\"count\":%d}\n\n", len(current)); err != nil {
+			return false
 		}
 		return rc.Flush() == nil
 	}

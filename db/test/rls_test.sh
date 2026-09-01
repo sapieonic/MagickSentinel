@@ -34,6 +34,7 @@ INSERT INTO users (firebase_uid, tenant_id, role, team_id, display_name) VALUES
   ('agent-b','11111111-1111-1111-1111-111111111111','agent','aaaaaaaa-0000-0000-0000-000000000001','Agent B'),
   ('agent-c','11111111-1111-1111-1111-111111111111','agent','aaaaaaaa-0000-0000-0000-000000000002','Agent C'),
   ('sup-north','11111111-1111-1111-1111-111111111111','supervisor','aaaaaaaa-0000-0000-0000-000000000001','Sup North'),
+  ('sup-south','11111111-1111-1111-1111-111111111111','supervisor','aaaaaaaa-0000-0000-0000-000000000002','Sup South'),
   ('qa-1','11111111-1111-1111-1111-111111111111','qa',NULL,'QA One'),
   ('client-1','11111111-1111-1111-1111-111111111111','client',NULL,'Bank Client'),
   ('rival-admin','22222222-2222-2222-2222-222222222222','admin',NULL,'Rival Admin');
@@ -45,6 +46,9 @@ INSERT INTO calls (id, tenant_id, device_id, user_uid, team_id, started_at, capt
   ('c0000000-0000-0000-0000-00000000000b','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000001','agent-b','aaaaaaaa-0000-0000-0000-000000000001', now(), 'A'),
   ('c0000000-0000-0000-0000-00000000000c','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000001','agent-c','aaaaaaaa-0000-0000-0000-000000000002', now(), 'A'),
   ('c0000000-0000-0000-0000-0000000000ff','22222222-2222-2222-2222-222222222222','dddddddd-0000-0000-0000-000000000002','rival-admin',NULL, now(), 'B');
+INSERT INTO team_memberships (tenant_id, user_uid, team_id) VALUES
+  ('11111111-1111-1111-1111-111111111111','sup-north','aaaaaaaa-0000-0000-0000-000000000002')
+ON CONFLICT DO NOTHING;
 INSERT INTO rule_sets (tenant_id, version, definition, active, created_by)
 SELECT t.id, 1, d.definition, true, 'system' FROM tenants t CROSS JOIN default_rule_set d;
 INSERT INTO flags (tenant_id, call_id, rule_id, rule_set_version, severity, tier) VALUES
@@ -68,8 +72,11 @@ expect "agent sees only own calls" \
 expect "agent cannot read a named other-agent call" \
   "0" "$(ctx $ACME agent-a agent "SELECT count(*) FROM calls WHERE id='c0000000-0000-0000-0000-00000000000b';")"
 
-expect "supervisor sees own team only" \
-  "2" "$(ctx $ACME sup-north supervisor 'SELECT count(*) FROM calls;')"
+expect "single-team supervisor sees only that team" \
+  "1" "$(ctx $ACME sup-south supervisor 'SELECT count(*) FROM calls;')"
+
+expect "single-team supervisor cannot read the other team's call" \
+  "0" "$(ctx $ACME sup-south supervisor "SELECT count(*) FROM calls WHERE id='c0000000-0000-0000-0000-00000000000a';")"
 
 expect "qa sees whole tenant" \
   "3" "$(ctx $ACME qa-1 qa 'SELECT count(*) FROM calls;')"
@@ -85,6 +92,15 @@ expect "rival tenant sees only its own call" \
 
 expect "missing context leaks zero rows" \
   "0" "$(APP "SET ROLE sentinel_app; SELECT count(*) FROM calls;" | tail -1)"
+
+expect "supervisor over two teams sees both" \
+  "3" "$(ctx $ACME sup-north supervisor 'SELECT count(*) FROM calls;')"
+
+expect "agent cannot enumerate the team roster" \
+  "1" "$(ctx $ACME agent-a agent 'SELECT count(*) FROM teams;')"
+
+expect "supervisor can enumerate the roster" \
+  "2" "$(ctx $ACME sup-north supervisor 'SELECT count(*) FROM teams;')"
 
 expect "agent cannot enumerate other users" \
   "1" "$(ctx $ACME agent-a agent 'SELECT count(*) FROM users;')"

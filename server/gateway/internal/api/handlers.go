@@ -238,7 +238,20 @@ func (s *Server) myStats(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, stats)
+	// The agent self-view is defined as a comparison against the team median, and
+	// the scorecards endpoint that carries it is gated on a capability agents do not
+	// hold. Without the median here every agent sees an empty comparison column on
+	// the screen the spec builds their whole experience around.
+	//
+	// Aggregates only: no per-agent numbers and no colleague names cross this
+	// boundary.
+	median, err := s.Store.PeerMedian(r.Context(), id.TenantID, id.UserUID, from, to)
+	if err != nil {
+		s.Log.Warn("peer median unavailable", "error", err)
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"self": stats, "median": nil})
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"self": stats, "median": median})
 }
 
 func (s *Server) myFlags(w http.ResponseWriter, r *http.Request) {

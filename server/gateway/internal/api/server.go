@@ -24,6 +24,9 @@ type Server struct {
 	LiveTickets *LiveTickets
 	// LivePoll is how often the floor view re-queries active calls.
 	LivePoll time.Duration
+	// AllowedOrigins enables CORS for exactly these browser origins. Empty means
+	// no CORS headers, which is right when the portal is served same-origin.
+	AllowedOrigins []string
 	Now    func() time.Time
 }
 
@@ -105,5 +108,9 @@ func (s *Server) Routes() http.Handler {
 		mux.Handle("/v1/ingest", s.Authenticate(RequireDevice(s.Ingest)))
 	}
 
-	return httpx.WithRequestID(httpx.Recover(s.Log, httpx.LogRequests(s.Log, mux)))
+	var handler http.Handler = mux
+	if len(s.AllowedOrigins) > 0 {
+		handler = httpx.CORS(s.AllowedOrigins, handler)
+	}
+	return httpx.WithRequestID(httpx.Recover(s.Log, httpx.LogRequests(s.Log, handler)))
 }
