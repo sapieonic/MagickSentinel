@@ -16,6 +16,8 @@ use std::time::Instant;
 struct Stream {
     samples: Vec<i16>,
     pos: usize,
+    /// Set when a glitch was injected, cleared by `take_discontinuity`.
+    discontinuity: bool,
     started: Instant,
     /// Sample indices at which to report a glitch gap, simulating
     /// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`.
@@ -155,6 +157,7 @@ impl CaptureSource for WavReplaySource {
             Stream {
                 samples: d.samples.clone(),
                 pos: 0,
+                discontinuity: false,
                 started: Instant::now(),
                 glitch_at,
                 direction: dir,
@@ -195,6 +198,9 @@ impl CaptureSource for WavReplaySource {
             .glitch_at
             .iter()
             .any(|&g| g > s.pos && g <= end);
+        if dropped {
+            s.discontinuity = true;
+        }
         s.pos = end;
         let _ = s.direction;
         Ok(if dropped { n.saturating_sub(FRAME_SAMPLES) } else { n })
@@ -203,6 +209,11 @@ impl CaptureSource for WavReplaySource {
     fn subscribe_device_changes(&mut self, tx: Sender<DeviceEvent>) -> Result<()> {
         self.subscribers.push(tx);
         Ok(())
+    }
+
+    fn take_discontinuity(&mut self, h: StreamHandle) -> Result<bool> {
+        let s = self.streams.get_mut(&h.0).ok_or(CaptureError::BadHandle(h.0))?;
+        Ok(std::mem::take(&mut s.discontinuity))
     }
 
     fn close(&mut self, h: StreamHandle) -> Result<()> {
@@ -330,6 +341,31 @@ mod tests {
         let mut buf = vec![0i16; 16_000 * 5];
         let n = s.read_frames(h, &mut buf).unwrap();
         assert!(n < 16_000, "a paced source cannot deliver 5 s of audio immediately, got {n}");
+    }
+
+    #[test]
+    fn a_glitch_is_reported_once_and_then_cleared() {
+        // The encoder needs this to set silence_inserted on the frame header.
+        // Without it the server cannot tell synthesised silence from a borrower
+        // saying nothing.
+        let mut s = WavReplaySource::new().without_realtime_pacing().with_glitch_every(3_200);
+        s.add_samples("far-1", "c", "n", Direction::Render, ramp(16_000));
+        let h = s.open(&DeviceId("far-1".into()), Direction::Render).unwrap();
+        assert!(!s.take_discontinuity(h).unwrap(), "no glitch before any read");
+
+        let mut buf = vec![0i16; FRAME_SAMPLES * 20];
+        while s.read_frames(h, &mut buf).unwrap() > 0 {}
+        assert!(s.take_discontinuity(h).unwrap(), "the injected glitch was not reported");
+        assert!(!s.take_discontinuity(h).unwrap(), "taking it must clear it");
+    }
+
+    #[test]
+    fn a_clean_stream_reports_no_discontinuity() {
+        let mut s = source();
+        let h = s.open(&DeviceId("far-1".into()), Direction::Render).unwrap();
+        let mut buf = vec![0i16; FRAME_SAMPLES * 20];
+        while s.read_frames(h, &mut buf).unwrap() > 0 {}
+        assert!(!s.take_discontinuity(h).unwrap());
     }
 
     #[test]

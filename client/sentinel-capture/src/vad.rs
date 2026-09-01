@@ -26,6 +26,8 @@ pub struct VadParams {
     /// Zero-crossing rate above which a frame is treated as noise rather than voice,
     /// which keeps keyboard clatter and line hiss out.
     pub max_zcr: f32,
+    /// Frames over which the noise floor is estimated as a running minimum.
+    pub floor_window_frames: usize,
 }
 
 impl Default for VadParams {
@@ -36,6 +38,7 @@ impl Default for VadParams {
             onset_frames: 2,
             hangover_frames: 25, // 500 ms at 20 ms frames
             max_zcr: 0.45,
+            floor_window_frames: 150, // 3 s
         }
     }
 }
@@ -43,8 +46,22 @@ impl Default for VadParams {
 #[derive(Debug, Clone)]
 pub struct Vad {
     params: VadParams,
-    noise_db: f32,
-    initialised: bool,
+    /// Recent frame levels, oldest first. The noise floor is their minimum.
+    ///
+    /// A minimum over a window rather than an exponential average, because the two
+    /// requirements on this estimator cannot both be met by a single adapting
+    /// scalar. An average seeded from the first frame goes permanently deaf when a
+    /// stream opens mid-speech — which is exactly what happens when a stream is
+    /// reopened after AUDCLNT_E_DEVICE_INVALIDATED, mid-call, while someone is
+    /// talking. Seeding it low instead makes a noisy line read as continuous speech,
+    /// and since the floor only adapts upward on non-speech frames, it then never
+    /// recovers.
+    ///
+    /// A windowed minimum has neither failure. Speech has gaps — inter-word pauses
+    /// sit 20 dB or more below the words — so within a few seconds the minimum finds
+    /// the real background whether the stream opened on silence or mid-sentence, and
+    /// a steady background is its own minimum from the first frame.
+    levels: std::collections::VecDeque<f32>,
     speech_run: u32,
     silence_run: u32,
     voiced: bool,
@@ -59,9 +76,8 @@ impl Default for Vad {
 impl Vad {
     pub fn new(params: VadParams) -> Self {
         Vad {
+            levels: std::collections::VecDeque::with_capacity(params.floor_window_frames),
             params,
-            noise_db: -60.0,
-            initialised: false,
             speech_run: 0,
             silence_run: 0,
             voiced: false,
@@ -73,7 +89,11 @@ impl Vad {
     }
 
     pub fn noise_floor_db(&self) -> f32 {
-        self.noise_db
+        self.levels
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
+            .max(self.params.absolute_floor_db)
     }
 
     /// Feed one 20 ms frame. Returns the current voiced state.
@@ -81,13 +101,14 @@ impl Vad {
         let db = frame_db(frame);
         let zcr = zero_crossing_rate(frame);
 
-        if !self.initialised {
-            self.noise_db = db;
-            self.initialised = true;
+        if self.levels.len() == self.params.floor_window_frames {
+            self.levels.pop_front();
         }
+        self.levels.push_back(db);
 
-        let loud_enough = db > self.params.absolute_floor_db
-            && db > self.noise_db + self.params.speech_margin_db;
+        let noise = self.noise_floor_db();
+        let loud_enough =
+            db > self.params.absolute_floor_db && db > noise + self.params.speech_margin_db;
         let speechlike = loud_enough && zcr <= self.params.max_zcr;
 
         if speechlike {
@@ -102,11 +123,6 @@ impl Vad {
             if self.silence_run >= self.params.hangover_frames {
                 self.voiced = false;
             }
-            // Adapt the noise floor only on non-speech frames, and only downward
-            // quickly: a loud stretch of speech must not drag the floor up until the
-            // detector goes deaf.
-            let alpha = if db < self.noise_db { 0.25 } else { 0.02 };
-            self.noise_db += alpha * (db - self.noise_db);
         }
 
         self.voiced
@@ -220,6 +236,38 @@ mod tests {
         vad.voiced_ms(&tone(300.0, 0.3, 20));
         assert!(vad.is_voiced());
         vad.voiced_ms(&silence(60)); // 1.2 s, well past the hangover
+        assert!(!vad.is_voiced());
+    }
+
+    /// Speech-shaped audio: bursts of voicing with the inter-word pauses real
+    /// speech always has. A continuous tone is not a stand-in for speech when the
+    /// property under test is how the detector finds the gaps.
+    fn speech(bursts: usize) -> Vec<i16> {
+        let mut out = Vec::new();
+        for _ in 0..bursts {
+            out.extend(tone(300.0, 0.3, 12)); // ~240 ms of voicing
+            out.extend(quiet_noise(4)); // ~80 ms pause
+        }
+        out
+    }
+
+    #[test]
+    fn a_stream_that_opens_mid_speech_still_detects_it() {
+        // The failure this guards against loses a whole call and leaves no trace.
+        // Reopening a stream after a device invalidation happens mid-call, while
+        // someone is talking, and an estimator seeded from that first frame learns
+        // speech as the background level and never fires again.
+        let mut vad = Vad::default();
+        let ms = vad.voiced_ms(&speech(8));
+        assert!(ms >= 1_500, "speech from the first frame must register, got {ms} ms");
+    }
+
+    #[test]
+    fn a_mid_speech_start_still_ends_the_call_on_silence() {
+        let mut vad = Vad::default();
+        vad.voiced_ms(&speech(8));
+        assert!(vad.is_voiced());
+        vad.voiced_ms(&silence(60));
         assert!(!vad.is_voiced());
     }
 

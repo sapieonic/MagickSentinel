@@ -81,14 +81,14 @@ fn invalid_records_are_rejected_with_the_documented_reason() {
         let bytes = hex_decode(case["hex"].as_str().unwrap());
         let err = MediaRecord::decode(&bytes).expect_err(&format!("{name} should be rejected"));
         let want = case["error"].as_str().unwrap();
-        let matched = match (&err, want) {
-            (ProtocolError::Version(_), "version") => true,
-            (ProtocolError::ReservedFlags(_), "reserved_flags") => true,
-            (ProtocolError::ReservedByte(_), "reserved_byte") => true,
-            (ProtocolError::Channel(_), "channel") => true,
-            (ProtocolError::Truncated { .. }, "truncated") => true,
-            _ => false,
-        };
+        let matched = matches!(
+            (&err, want),
+            (ProtocolError::Version(_), "version")
+                | (ProtocolError::ReservedFlags(_), "reserved_flags")
+                | (ProtocolError::ReservedByte(_), "reserved_byte")
+                | (ProtocolError::Channel(_), "channel")
+                | (ProtocolError::Truncated { .. }, "truncated")
+        );
         assert!(matched, "{name}: expected {want}, got {err:?}");
     }
 }

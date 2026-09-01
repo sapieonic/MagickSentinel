@@ -381,7 +381,7 @@ impl Spool {
             let over = stats.bytes - self.limits.max_bytes;
             // Delete in batches proportional to the overshoot so a large burst does
             // not turn into thousands of single-row deletes.
-            let batch = ((over / 3_000).max(1)).min(1_000) as i64;
+            let batch = (over / 3_000).clamp(1, 1_000) as i64;
             let n = self.conn.execute(
                 "DELETE FROM segments WHERE (call_id, channel, seq) IN (
                    SELECT call_id, channel, seq FROM segments

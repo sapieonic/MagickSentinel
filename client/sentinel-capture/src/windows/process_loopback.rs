@@ -133,9 +133,11 @@ impl ProcessLoopbackStream {
         }
         .map_err(|e| CaptureError::Platform(format!("ActivateAudioInterfaceAsync: {e}")))?;
 
-        // `prop` and `params` only had to outlive the call itself: the activation
-        // parameters are consumed synchronously even though the interface is not.
-        drop(prop);
+        // `prop` and `params` are plain data with no Drop impl, so there is nothing
+        // to free and nothing to release here — the activation parameters are read
+        // synchronously even though the interface arrives asynchronously, and both
+        // locals live to the end of this function. An explicit `drop` here would be
+        // a no-op that reads as cleanup.
 
         if unsafe { WaitForSingleObject(done, 5_000) } != WAIT_OBJECT_0 {
             unsafe { let _ = CloseHandle(done); }

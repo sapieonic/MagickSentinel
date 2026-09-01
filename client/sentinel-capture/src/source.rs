@@ -40,4 +40,20 @@ pub trait CaptureSource: Send {
     fn read_frames(&mut self, h: StreamHandle, buf: &mut [i16]) -> Result<usize>;
     fn subscribe_device_changes(&mut self, tx: Sender<DeviceEvent>) -> Result<()>;
     fn close(&mut self, h: StreamHandle) -> Result<()>;
+
+    /// Whether the audio engine reported a gap since the last call, clearing the
+    /// flag.
+    ///
+    /// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` has to reach the encoder or the
+    /// `silence_inserted` bit in the frame header can never be set on a real
+    /// capture, and the server has no way to tell synthesised silence from a
+    /// borrower saying nothing. Reported out-of-band rather than through
+    /// `read_frames` because a glitch is a property of the stream between two reads,
+    /// not of the samples either read returned.
+    ///
+    /// The default is `false` so a source with no notion of glitches — the WAV
+    /// replay source in most of its configurations — needs no implementation.
+    fn take_discontinuity(&mut self, _h: StreamHandle) -> Result<bool> {
+        Ok(false)
+    }
 }
