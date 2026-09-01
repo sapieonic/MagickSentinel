@@ -157,6 +157,14 @@ func (f *fixture) seed(ctx context.Context) {
 		             'Borrower disputed the amount.','dispute',
 		             '{"far":[],"near":[],"far_open":0.0,"far_close":-0.2,"delta":-0.2}'::jsonb,0.7,5)`,
 			acmeTenant),
+		fmt.Sprintf(`INSERT INTO transcripts (tenant_id, call_id, channel, asr_provider,
+		            asr_version, language, text, word_timings, confidence)
+		     VALUES ('%[1]s','c0000000-0000-0000-0000-00000000000a',1,'fixture','1','en',
+		             'good morning this is Ravi from Acme Recovery about your loan account',
+		             '[{"start_ms":0,"end_ms":500,"text":"good morning"}]'::jsonb, 0.9),
+		            ('%[1]s','c0000000-0000-0000-0000-00000000000a',0,'fixture','1','en',
+		             'yes speaking I will pay fifteen thousand on the fifteenth',
+		             '[{"start_ms":600,"end_ms":1200,"text":"yes speaking"}]'::jsonb, 0.9)`, acmeTenant),
 		fmt.Sprintf(`INSERT INTO ptps (tenant_id, call_id, amount_paise, due_date, confidence)
 		     VALUES ('%s','c0000000-0000-0000-0000-00000000000a',1500000,'2026-09-15',0.86)`, acmeTenant),
 		fmt.Sprintf(`INSERT INTO flags (tenant_id, call_id, rule_id, rule_set_version, severity, tier,
@@ -1030,5 +1038,47 @@ func TestAgentsCannotExportEvidence(t *testing.T) {
 		map[string]any{"flag_ids": []string{"ffffffff-0000-0000-0000-000000000001"}})
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestListingCallsIsAuditedNotJustOpeningOne(t *testing.T) {
+	// Section 12.8 covers reads, and a listing page carries summaries and account
+	// references. A reviewer paging the compliance queue reads borrower data; only
+	// auditing the detail view would miss it entirely.
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/calls?q=Ravi",
+		f.token("qa-1", acmeTenant, auth.RoleQA, ""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	var detail []byte
+	if err := f.admin.QueryRow(context.Background(),
+		`SELECT detail FROM audit_log WHERE action = 'call.list' AND actor_uid = 'qa-1'`).
+		Scan(&detail); err != nil {
+		t.Fatalf("listing not audited: %v", err)
+	}
+	if !strings.Contains(string(detail), "call_ids") || !strings.Contains(string(detail), `"searched": true`) {
+		t.Fatalf("the entry does not record what was read: %s", detail)
+	}
+	// The search term itself must not be there. A QA user searching for a borrower
+	// by name would otherwise write that name into a table every admin can read.
+	if strings.Contains(string(detail), "Ravi") {
+		t.Fatalf("the audit entry leaked the search term: %s", detail)
+	}
+}
+
+func TestAnEmptyPageIsNotAudited(t *testing.T) {
+	// Otherwise every poll from an idle portal tab writes a row, and the table that
+	// has to answer "who read this call" fills with noise.
+	f := newFixture(t)
+	f.do(http.MethodGet, "/v1/calls?from=2020-01-01T00:00:00Z&to=2020-01-02T00:00:00Z",
+		f.token("qa-1", acmeTenant, auth.RoleQA, ""), nil)
+
+	var n int
+	f.admin.QueryRow(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE action = 'call.list'`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("an empty listing wrote %d audit rows", n)
 	}
 }

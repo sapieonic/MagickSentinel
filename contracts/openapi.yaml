@@ -113,6 +113,39 @@ paths:
               schema: { $ref: '#/components/schemas/Policy' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /v1/ingest:
+    get:
+      operationId: ingest
+      tags: [device]
+      summary: WebSocket upgrade for audio ingest
+      description: |
+        The binary protocol is specified in `contracts/wire.md`, not here — OpenAPI
+        cannot describe a bidirectional frame protocol, and an approximation would
+        be a second source of truth that drifts.
+
+        Documented in this file anyway so the route is discoverable: an endpoint that
+        exists in the router but not in the contract is the one a security review
+        finds and nobody can explain.
+
+        Requires mutual TLS with the device certificate **and** a bearer token. The
+        tenant is derived from both and they must agree; a mismatch closes the socket
+        with 4403.
+      parameters:
+        - name: Upgrade
+          in: header
+          required: true
+          schema: { type: string, const: websocket }
+        - name: Sec-WebSocket-Protocol
+          in: header
+          required: true
+          schema: { type: string, const: sentinel.v1 }
+      responses:
+        '101':
+          description: switching protocols; see contracts/wire.md
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: device revoked, or the certificate and token disagree on tenant
+
   /v1/heartbeat:
     post:
       operationId: heartbeat

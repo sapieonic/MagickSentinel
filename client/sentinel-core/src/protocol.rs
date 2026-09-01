@@ -2,7 +2,7 @@
 //!
 //! `contracts/wire.md` is the specification; this module is its client-side
 //! implementation. The gateway's `internal/wire` package implements the same bytes,
-//! and `server/gateway/internal/wire/roundtrip_test.go` checks the two against a
+//! and `server/gateway/internal/wire/wire_test.go` checks the two against a
 //! shared fixture.
 
 use serde::{Deserialize, Serialize};

@@ -92,6 +92,7 @@ SELECT c.id::text, c.started_at, c.ended_at, c.duration_ms, c.user_uid, c.accoun
 func (s *Store) ListCalls(ctx context.Context, id *auth.Identity, f CallFilter) ([]CallSummary, *time.Time, error) {
 	var out []CallSummary
 	err := s.AsIdentity(ctx, id, func(tx pgx.Tx) error {
+		defer func() { _ = auditList(ctx, tx, id, f, out) }()
 		rows, err := tx.Query(ctx, callSelect+`
  WHERE ($1::text  IS NULL OR c.user_uid = $1)
    AND ($2::uuid  IS NULL OR c.team_id = $2)
@@ -129,6 +130,48 @@ func (s *Store) ListCalls(ctx context.Context, id *auth.Identity, f CallFilter) 
 		next = &out[len(out)-1].StartedAt
 	}
 	return out, next, nil
+}
+
+// auditList records a listing that returned call content.
+//
+// Spec section 12.8 requires the audit log to cover reads and exports, not only
+// writes, and a page of this listing carries summaries and account references — a
+// reviewer paging the compliance queue reads borrower data, and that has to leave a
+// trace. Auditing only the detail view would miss it entirely.
+//
+// The entry holds call ids and counts. It deliberately does not hold the free-text
+// search term: a QA user searching for a borrower by name would otherwise write that
+// name into a table the whole tenant's admins can read, which is the leak the audit
+// log exists to detect rather than to cause.
+func auditList(ctx context.Context, tx pgx.Tx, id *auth.Identity, f CallFilter, out []CallSummary) error {
+	if len(out) == 0 {
+		return nil
+	}
+	// Cap the id list. A 200-row page is a legitimate export-shaped read and the
+	// count plus the first ids are enough to reconstruct it from the query log.
+	const maxIDs = 200
+	ids := make([]string, 0, min(len(out), maxIDs))
+	for i, c := range out {
+		if i == maxIDs {
+			break
+		}
+		ids = append(ids, c.ID)
+	}
+	return auditTx(ctx, tx, id, "call.list", "call", "", map[string]any{
+		"count":      len(out),
+		"call_ids":   ids,
+		"searched":   f.Search != "",
+		"user_uid":   f.UserUID,
+		"team_id":    f.TeamID,
+		"has_flags":  f.HasFlags,
+	})
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func scanCall(rows pgx.Rows) (CallSummary, error) {
