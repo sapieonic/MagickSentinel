@@ -1,0 +1,37 @@
+[project]
+name = "sentinel-pipeline"
+version = "0.1.0"
+description = "ASR, analysis and compliance workers for MagickVoice Sentinel."
+# The spec targets 3.12; 3.11 is the floor so the package installs on the
+# distribution Python present in most CI images.
+requires-python = ">=3.11"
+dependencies = [
+    "jsonschema>=4.21",
+    "pydantic>=2.6",
+    "nats-py>=2.7",
+    "asyncpg>=0.29",
+    "boto3>=1.34",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.3"]
+# Provider SDKs are extras, not dependencies: no provider SDK is imported outside
+# its adapter, and a deployment that uses Sarvam should not have to install
+# Anthropic's client to start.
+sarvam = ["requests>=2.31"]
+anthropic = ["anthropic>=0.25"]
+openai = ["openai>=1.20"]
+whisper = ["faster-whisper>=1.0"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: sentinel-pipeline
+Version: 0.1.0
+Summary: ASR, analysis and compliance workers for MagickVoice Sentinel.
+Requires-Python: >=3.11
+Requires-Dist: jsonschema>=4.21
+Requires-Dist: pydantic>=2.6
+Requires-Dist: nats-py>=2.7
+Requires-Dist: asyncpg>=0.29
+Requires-Dist: boto3>=1.34
+Requires-Dist: structlog>=24.1
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+Requires-Dist: ruff>=0.3; extra == "dev"
+Provides-Extra: sarvam
+Requires-Dist: requests>=2.31; extra == "sarvam"
+Provides-Extra: anthropic
+Requires-Dist: anthropic>=0.25; extra == "anthropic"
+Provides-Extra: openai
+Requires-Dist: openai>=1.20; extra == "openai"
+Provides-Extra: whisper
+Requires-Dist: faster-whisper>=1.0; extra == "whisper"

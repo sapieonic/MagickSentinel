@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "sentinel-core",
     "sentinel-capture",
+    "sentinel-agent",
+    "sentinel-service",
 ]
 
 [workspace.package]
@@ -24,3 +26,23 @@ ulid = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = "0.32"
 hound = "3"
+
+# PKCE (RFC 7636): S256 challenge and the base64url-no-pad encoding it is expressed in.
+sha2 = "0.10"
+base64 = "0.22"
+
+# Uplink. `tungstenite` is the synchronous WebSocket implementation; TLS comes from
+# rustls so there is one TLS stack in the process and no OpenSSL in the MSI.
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# REST client for /v1/sessions, /v1/policy, /v1/heartbeat and the token endpoint.
+# `ureq` carries client-certificate support, which the device mTLS identity needs.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+
+# Opus at 16 kHz / 24 kbps / 20 ms frames (spec 6.5). `audiopus_sys` builds libopus
+# from source when the system does not provide it.
+audiopus = { version = "0.2", features = ["encoder"] }
+
+tempfile = "3"

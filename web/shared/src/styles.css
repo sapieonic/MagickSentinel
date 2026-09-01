@@ -1,0 +1,157 @@
+/* Shared design tokens and the primitives both surfaces render.
+   Surface-specific layout lives in widget/portal, not here. */
+
+:root {
+  --sx-bg: #0f1115;
+  --sx-surface: #171a21;
+  --sx-surface-2: #1f232c;
+  --sx-border: #2a2f3a;
+  --sx-text: #e6e9ef;
+  --sx-text-dim: #9aa3b2;
+  --sx-accent: #4c8dff;
+  --sx-ok: #2fbf71;
+  --sx-warn: #e2a03f;
+  --sx-danger: #e5484d;
+  --sx-critical: #ff2d55;
+  --sx-radius: 6px;
+  --sx-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --sx-mono: "Cascadia Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Windows desktops in this fleet run whatever the OS theme says; honour it. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --sx-bg: #f6f7f9;
+    --sx-surface: #ffffff;
+    --sx-surface-2: #eef0f4;
+    --sx-border: #d7dbe2;
+    --sx-text: #12151a;
+    --sx-text-dim: #5d6675;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--sx-font);
+  font-size: 13px;
+  color: var(--sx-text);
+  background: var(--sx-bg);
+}
+
+/* ---------------------------------------------------------------- chips */
+
+.sx-chip,
+.sx-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--sx-border);
+  background: var(--sx-surface-2);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.sx-chip--muted { color: var(--sx-text-dim); }
+
+.sx-sev { font-weight: 600; }
+.sx-sev--low { color: var(--sx-text-dim); }
+.sx-sev--medium { color: var(--sx-warn); border-color: var(--sx-warn); }
+.sx-sev--high { color: var(--sx-danger); border-color: var(--sx-danger); }
+.sx-sev--critical { color: #fff; background: var(--sx-critical); border-color: var(--sx-critical); }
+
+.sx-disp--ptp, .sx-disp--partial_payment { color: var(--sx-ok); border-color: var(--sx-ok); }
+.sx-disp--refusal, .sx-disp--dispute, .sx-disp--escalation { color: var(--sx-warn); border-color: var(--sx-warn); }
+
+.sx-ptp { font-variant-numeric: tabular-nums; }
+.sx-ptp--confirmed { border-color: var(--sx-ok); color: var(--sx-ok); }
+.sx-ptp__date { color: var(--sx-text-dim); }
+.sx-ptp__tick { font-weight: 700; }
+
+.sx-tier { font-family: var(--sx-mono); font-weight: 700; letter-spacing: 0.04em; }
+.sx-tier--a { color: var(--sx-ok); border-color: var(--sx-ok); }
+/* Tier B has to read as "different", not "broken": amber, never red. */
+.sx-tier--b { color: var(--sx-warn); border-color: var(--sx-warn); background: color-mix(in srgb, var(--sx-warn) 12%, transparent); }
+.sx-tier__note { font-weight: 400; font-family: var(--sx-font); }
+
+.sx-sentiment { font-variant-numeric: tabular-nums; }
+.sx-sentiment--up { color: var(--sx-ok); }
+.sx-sentiment--down { color: var(--sx-danger); }
+.sx-sentiment--flat { color: var(--sx-text-dim); }
+
+/* ----------------------------------------------------------- sparkline */
+
+.sx-spark__zero { stroke: var(--sx-border); stroke-width: 1; }
+.sx-spark__line { stroke: var(--sx-accent); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.sx-spark--near .sx-spark__line { stroke: var(--sx-text-dim); }
+.sx-spark__end { fill: var(--sx-accent); }
+.sx-spark--near .sx-spark__end { fill: var(--sx-text-dim); }
+
+/* --------------------------------------------------- recording indicator */
+
+.sx-rec {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--sx-danger) 16%, transparent);
+  color: var(--sx-danger);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sx-rec__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--sx-danger);
+  animation: sx-pulse 2s ease-in-out infinite;
+}
+
+/* Users who ask for reduced motion still get the indicator, just not the pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .sx-rec__dot { animation: none; }
+}
+
+@keyframes sx-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ------------------------------------------------------------- controls */
+
+button, select, input, textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--sx-surface-2);
+  border: 1px solid var(--sx-border);
+  border-radius: var(--sx-radius);
+  padding: 5px 9px;
+}
+
+button { cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.sx-btn--primary {
+  background: var(--sx-accent);
+  border-color: var(--sx-accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.sx-muted { color: var(--sx-text-dim); }
+.sx-mono { font-family: var(--sx-mono); }
+.sx-nums { font-variant-numeric: tabular-nums; }
+
+.sx-error {
+  border: 1px solid var(--sx-danger);
+  background: color-mix(in srgb, var(--sx-danger) 10%, transparent);
+  color: var(--sx-danger);
+  border-radius: var(--sx-radius);
+  padding: 8px 10px;
+}

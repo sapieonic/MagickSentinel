@@ -1,0 +1,29 @@
+{
+  "name": "@sentinel/web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "workspaces": ["shared", "widget", "portal"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p shared && tsc --noEmit -p widget && tsc --noEmit -p portal",
+    "build": "npm run typecheck && npm run build --workspace @sentinel/widget && npm run build --workspace @sentinel/portal",
+    "test": "vitest run",
+    "dev:widget": "npm run dev --workspace @sentinel/widget",
+    "dev:portal": "npm run dev --workspace @sentinel/portal"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.1"
+  }
+}
