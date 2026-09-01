@@ -20,12 +20,33 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+// A release build must not ship an unencrypted spool. The `sqlcipher` feature is off
+// by default so CI on Linux can run the spool tests without the SQLCipher toolchain,
+// and that convenience is exactly how an unencrypted build reaches a customer
+// desktop holding borrower audio. Failing the compile is the only check that cannot
+// be forgotten; `allow-unencrypted-spool` exists for the rare release-mode benchmark
+// and has to be typed deliberately.
+#[cfg(all(
+    not(debug_assertions),
+    not(feature = "sqlcipher"),
+    not(feature = "allow-unencrypted-spool")
+))]
+compile_error!(
+    "release builds must enable the `sqlcipher` feature: the spool holds borrower \
+     audio at rest. Build with --features sqlcipher, or --features \
+     allow-unencrypted-spool if you genuinely intend an unencrypted database."
+);
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {
     #[error("spool database error: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("spool is sealed after a fatal server error for call {0}")]
     Sealed(String),
+    #[error("no spool encryption key was supplied")]
+    MissingKey,
+    #[error("the spool key did not open the database")]
+    WrongKey,
 }
 
 /// A spooled segment, as handed back for upload.
@@ -125,7 +146,15 @@ impl Spool {
     fn from_connection(conn: Connection, key: &str, limits: SpoolLimits) -> Result<Self, SpoolError> {
         #[cfg(feature = "sqlcipher")]
         {
+            if key.is_empty() {
+                return Err(SpoolError::MissingKey);
+            }
             conn.pragma_update(None, "key", key)?;
+            // Prove the key worked before handing the caller a Spool. Without this a
+            // wrong key surfaces as a corrupt-database error on the first write,
+            // mid-call, rather than at open time where it can be reported.
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                .map_err(|_| SpoolError::WrongKey)?;
         }
         #[cfg(not(feature = "sqlcipher"))]
         {

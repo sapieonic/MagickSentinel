@@ -24,5 +24,8 @@ serde_json.workspace = true
 [features]
 default = []
 # Production builds link SQLCipher instead of plain SQLite. Kept behind a feature so
-# CI on Linux does not need the SQLCipher toolchain to run the spool tests.
+# CI on Linux does not need the SQLCipher toolchain to run the spool tests; a release
+# build without it fails to compile (see the guard in src/spool.rs).
 sqlcipher = ["rusqlite/bundled-sqlcipher"]
+# Escape hatch for a release-mode benchmark. Never ship with this.
+allow-unencrypted-spool = []
