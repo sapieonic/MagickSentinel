@@ -97,11 +97,15 @@ database-backed coverage.
 cd server/pipeline && python -m pytest
 ```
 
-The rule-engine and pipeline tests. They need `pytest`; the package's declared runtime
-dependencies are not imported by anything under test today, so
-`pip install -e '.[dev]'` works but a bare `pip install pytest` is enough. A prepared
-virtualenv exists at `.venv-dev/` in this container:
-`.venv-dev/bin/python -m pytest` from `server/pipeline` works without further setup.
+The rule-engine, analysis, judge, cost and worker tests. `pip install -e '.[dev]'` from
+`server/pipeline` is the documented setup and works on Python 3.11 and 3.12; in practice
+the suite needs only `pytest` and `jsonschema`, because the provider SDKs are imported
+inside their adapters and the rest of the declared runtime dependencies are not reached
+by anything under test. A prepared virtualenv exists at `.venv-dev/` in this container,
+so `.venv-dev/bin/python -m pytest` from `server/pipeline` works without further setup.
+
+Two modules have no test coverage at all: `sentinel_pipeline/retention.py` and
+`sentinel_pipeline/coverage.py`.
 
 ### Not yet runnable
 
@@ -112,12 +116,18 @@ an error in `web/shared/src/money.ts`. The CI workflow has a web job that skips 
 notice until those three things are fixed; see the comment in
 `.github/workflows/ci.yml`.
 
-`cargo fmt --check` currently reports diffs across most of the client tree, and
-`cargo clippy` reports two warnings. Both run in CI as advisory steps rather than gates,
-for the same reason: the client is owned by another work stream. Turning them into gates
-is a one-line change once the tree is clean.
+`cargo fmt --check` currently reports diffs across most of the client tree. It runs in
+CI as an advisory step rather than a gate, because failing the build on formatting in a
+tree that several work streams are editing simultaneously would block unrelated work;
+drop `continue-on-error` from that step once a `cargo fmt` pass has landed. `cargo
+clippy` does gate, but without `-D warnings` — it currently reports a handful of
+warnings and exits zero.
 
 ## What state each component is in
+
+The repository is under active development across several parallel work streams, so
+treat this as a snapshot rather than a fixed inventory. Everything below was read from
+the tree, not inferred; where something is a scaffold it says so.
 
 **`contracts/`** — usable. `openapi.yaml` is a valid OpenAPI 3.1 document describing 25
 paths. `wire.md` specifies version 1 of the binary ingest protocol and is implemented on
@@ -125,56 +135,74 @@ both sides. `schemas/` holds three JSON Schema 2020-12 documents: `analysis.json
 `judge.json` and `rule_set.json`. Two documented endpoints, `GET /v1/teams/{id}/live`
 and `POST /v1/compliance/exports`, are not yet routed by the gateway.
 
-**`db/`** — the furthest along. Five migrations build the full schema, enable row-level
-security on every tenant-scoped table, create the `sentinel_app` and `sentinel_pipeline`
-roles, install a default rule set, and add three narrow `SECURITY DEFINER` functions for
-the only three operations that legitimately precede a tenant context (consuming an
-enrollment token, registering the enrolled device, resolving a client certificate to a
-device). The schema goes beyond the spec's tables where the implementation needed it:
-`teams`, `enrollment_tokens`, `ingest_watermarks`, `prompt_templates`, `device_events`
-and `default_rule_set`.
+**`db/`** — the most complete part of the repository. Five migrations build the schema,
+enable row-level security on every tenant-scoped table, create the `sentinel_app` and
+`sentinel_pipeline` roles as `NOBYPASSRLS`, install a default rule set, and add three
+narrow `SECURITY DEFINER` functions for the only three operations that legitimately
+precede a tenant context: consuming an enrollment token, registering the enrolled
+device, and resolving a client certificate back to a device. The schema goes beyond the
+spec's tables where the implementation needed it — `teams`, `enrollment_tokens`,
+`ingest_watermarks`, `prompt_templates`, `device_events` and `default_rule_set`.
 
-**`client/sentinel-core`** — the platform-neutral half, and it is real: the call state
-machine including hold-resume and mid-call sign-out, the SQLCipher-backed spool with
+**`client/sentinel-core`** — the platform-neutral half, and it is real and tested: the
+call state machine including hold-resume and mid-call sign-out, the spool with
 ack-gated deletion and reported eviction, the wire codec, the policy types, and the
-uplink's retry policy. All of it is unit-tested.
+uplink's retry policy.
 
-**`client/sentinel-capture`** — split. The testable parts (the `CaptureSource` trait, the
-WAV replay source, VAD, the stateful resampler, container-ID device matching, tier
+**`client/sentinel-capture`** — split. The testable parts (the `CaptureSource` trait,
+the WAV replay source, VAD, the stateful resampler, container-ID device matching, tier
 classification, foreign-audio suppression) are implemented and tested. The Windows COM
-implementations of tier A process loopback, tier B endpoint loopback, softphone session
-tracking, device-change notification and OS build detection are written and type-check
-for the Windows target, but nothing exercises them — there is no Windows CI runner and
-no hardware-in-the-loop test. Treat them as unverified.
+implementations — tier A process loopback, tier B endpoint loopback, softphone session
+tracking, device-change notification, OS build detection from the registry — are written
+and type-check for the Windows target, but nothing exercises them. There is no Windows CI
+runner and no hardware-in-the-loop test, so treat them as unverified rather than as
+working.
 
-**Not present in `client/`** — there is no `sentinel-agent` binary, no `sentinel-service`
-binary, no WiX installer project, no named-pipe IPC, no PKCE login, no WebView2 widget
-shell, no Opus encoder (the framing that carries Opus packets exists; the encoder does
-not; `audiopus` is declared in the workspace manifest but unused), and no WebSocket
-uplink client. The workspace is two libraries.
+**`client/sentinel-service`** — substantial and unit-tested: the service control-manager
+entry point, the named-pipe host and its length-prefixed JSON codec, the agent
+supervisor with exponential backoff and restart counting, service recovery
+configuration, config sync, update staging, crash-dump handling and device identity.
+Like `sentinel-capture`, its Windows-specific halves type-check but do not run in CI.
 
-**`server/gateway`** — a working service. It verifies Identity Platform ID tokens against
-Google's JWKS, cross-checks the device certificate's tenant against the token's, enforces
-the `/v1/me` namespace rule mechanically in middleware, runs every query inside a
-transaction carrying the RLS context, and serves the WSS ingest endpoint with cumulative
-per-channel acks and idempotent `(call_id, channel, seq)` writes. Gaps: the certificate
-authority is an interface with no production implementation (the integration test
-supplies a development CA), object storage has a filesystem and an in-memory backend but
-no S3 adapter, and `main.go` refuses to start without `SENTINEL_BLOB_DIR` for that
-reason.
+**`client/sentinel-agent`** — a scaffold as of this writing. `src/lib.rs` is a
+placeholder and `src/main.rs` is an empty `main`. A PKCE implementation exists at
+`src/auth/pkce.rs` but is not yet reachable from the crate root, so it does not compile
+as part of the build. The workspace manifest declares the dependencies the agent will
+need — `tungstenite` and `rustls` for the uplink, `ureq` for the REST calls, `audiopus`
+for the encoder — ahead of the code that uses them.
 
-**`server/pipeline`** — libraries, not workers. All ten tier-1 rules are implemented and
-tested against a fixture corpus, the tier-2 judge validates against
-`contracts/schemas/judge.json` and discards an upheld verdict with no evidence span, the
-analyzer validates against `contracts/schemas/analysis.json`, the ASR module defines the
-provider interfaces and computes WER and numeric-entity error rate separately, and the
-cost controls are implemented. There are no real provider adapters — only a deterministic
-fake — and no NATS consumer or worker entry point, so nothing runs end to end yet.
+**`client/installer`** — the directory exists and is empty. There is no WiX project and
+no signed artefact, so nothing in this repository produces something deployable.
 
-**`web/`** — in progress elsewhere. `web/shared/` has the API client, the role
-capability map, money formatting in paise, and six presentational components including
-the non-dismissible recording indicator. `web/widget/` and `web/portal/` are empty apart
-from a `tsconfig.json`.
+**`server/gateway`** — a working service. It verifies Identity Platform ID tokens
+against Google's JWKS, cross-checks the device certificate's tenant against the token's,
+enforces the `/v1/me` namespace rule mechanically in middleware, runs every query inside
+a transaction carrying the row-level-security context, and serves the WSS ingest
+endpoint with cumulative per-channel acks and idempotent `(call_id, channel, seq)`
+writes. Two gaps: the certificate authority is an interface with no production
+implementation, so a real gateway answers `503 no_ca` to every enrollment (only the
+integration test supplies a development CA); and object storage has filesystem and
+in-memory backends but no S3 adapter, which is why `main.go` refuses to start without
+`SENTINEL_BLOB_DIR`.
+
+**`server/pipeline`** — the full shape is now present. All ten tier-1 rules are
+implemented and tested against a fixture corpus; the tier-2 judge validates against
+`contracts/schemas/judge.json` and discards an upheld verdict carrying no evidence span;
+the analyser validates against `contracts/schemas/analysis.json`; `worker.py`
+orchestrates ASR to analysis to compliance as a pure function over injected interfaces,
+with a deliberate degradation order (analysis failing must not stop compliance);
+`consumer.py` wraps that in a NATS JetStream loop; `cost.py` implements the budget,
+ceiling, minimum-duration and kill-switch controls; `asr/evaluate.py` computes WER and
+numeric-entity error rate separately; and `providers/` holds adapters for Sarvam,
+Whisper, Anthropic and OpenAI alongside a deterministic fake, each importing its SDK
+inside the adapter. `retention.py` and `coverage.py` implement the nightly purge and the
+CDR reconciliation arithmetic, both against `Protocol` interfaces with no concrete
+database implementation behind them yet, and neither is covered by a test.
+
+**`web/`** — in progress. `web/shared/` has the API client, the role capability map,
+money formatting in paise, and presentational components including the non-dismissible
+recording indicator. `web/widget/` and `web/portal/` contain a `tsconfig.json` and
+nothing else.
 
 ## Documentation
 

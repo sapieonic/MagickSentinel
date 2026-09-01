@@ -130,6 +130,7 @@ func (f *fixture) seed(ctx context.Context) {
 		     ('sup-1','%[1]s','supervisor','%[2]s','Sup One'),
 		     ('qa-1','%[1]s','qa',NULL,'QA One'),
 		     ('admin-1','%[1]s','admin',NULL,'Admin One'),
+		     ('client-1','%[1]s','client',NULL,'Bank Client'),
 		     ('rival-admin','%[3]s','admin',NULL,'Rival Admin')`, acmeTenant, teamNorth, rivalTenant),
 		fmt.Sprintf(`INSERT INTO devices (id, tenant_id, machine_guid, hw_fingerprint,
 		            cert_fingerprint, os_build, capture_tier, agent_version)
@@ -718,5 +719,155 @@ func TestHealthzNeedsNoCredentials(t *testing.T) {
 	resp, body := f.do(http.MethodGet, "/healthz", "", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}
+
+// ---------------------------------------------- scope-derived call explorer
+
+// One endpoint serves every role, with row-level security deciding the visible set.
+// These tests are the reason that design is safe: the same request, made by six
+// different roles, returns six correctly different answers with no per-role branch
+// in the handler.
+
+func TestTheCallExplorerReturnsTheCallersScope(t *testing.T) {
+	f := newFixture(t)
+	for _, c := range []struct {
+		name string
+		uid  string
+		role auth.Role
+		team string
+		want int
+	}{
+		{"agent sees own", "agent-a", auth.RoleAgent, teamNorth, 1},
+		{"supervisor sees the team", "sup-1", auth.RoleSupervisor, teamNorth, 2},
+		{"qa sees the tenant", "qa-1", auth.RoleQA, "", 2},
+		{"admin sees the tenant", "admin-1", auth.RoleAdmin, "", 2},
+		{"bank client sees flagged only", "client-1", auth.RoleClient, "", 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			resp, body := f.do(http.MethodGet, "/v1/calls",
+				f.token(c.uid, acmeTenant, c.role, c.team), nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d: %s", resp.StatusCode, body)
+			}
+			var page struct{ Items []json.RawMessage }
+			json.Unmarshal(body, &page)
+			if len(page.Items) != c.want {
+				t.Fatalf("saw %d calls, want %d: %s", len(page.Items), c.want, body)
+			}
+		})
+	}
+}
+
+func TestAFilterCanNarrowAScopeButNeverWidenIt(t *testing.T) {
+	f := newFixture(t)
+	// agent-a asking for agent-b's calls by parameter. The filter is applied on top
+	// of a set RLS has already restricted, so the answer is empty rather than
+	// someone else's data.
+	resp, body := f.do(http.MethodGet, "/v1/calls?user_uid=agent-b",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var page struct{ Items []json.RawMessage }
+	json.Unmarshal(body, &page)
+	if len(page.Items) != 0 {
+		t.Fatalf("a filter widened an agent's scope: %s", body)
+	}
+}
+
+func TestQaCanOpenAnyCallInTheTenantAndAnAgentCannot(t *testing.T) {
+	// The gap this endpoint exists to close: the call explorer is the workhorse
+	// screen and a QA reviewer has to be able to open another agent's call.
+	f := newFixture(t)
+	const other = "/v1/calls/c0000000-0000-0000-0000-00000000000b"
+
+	resp, body := f.do(http.MethodGet, other, f.token("qa-1", acmeTenant, auth.RoleQA, ""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("qa could not open a tenant call: %d %s", resp.StatusCode, body)
+	}
+	var detail struct {
+		UserUID string          `json:"user_uid"`
+		Flags   []json.RawMessage `json:"flags"`
+	}
+	json.Unmarshal(body, &detail)
+	if detail.UserUID != "agent-b" || len(detail.Flags) != 1 {
+		t.Fatalf("unexpected detail: %s", body)
+	}
+
+	resp, _ = f.do(http.MethodGet, other, f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("an agent reached another agent's call: %d", resp.StatusCode)
+	}
+}
+
+func TestAnOutOfScopeCallIsNotFoundRatherThanForbidden(t *testing.T) {
+	// Whether a call id exists in another team is itself information.
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodGet, "/v1/calls/c0000000-0000-0000-0000-0000000000ff",
+		f.token("admin-1", acmeTenant, auth.RoleAdmin, ""), nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestPlaybackIsWithheldWithoutWithholdingTheCall(t *testing.T) {
+	// The Acme tenant has allow_agent_audio_playback false. An agent still gets the
+	// transcript and the flags; only the audio URL is absent.
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/calls/c0000000-0000-0000-0000-00000000000a",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var detail struct {
+		AudioURL *string `json:"audio_url"`
+		Summary  *string `json:"summary"`
+	}
+	json.Unmarshal(body, &detail)
+	if detail.AudioURL != nil {
+		t.Fatal("audio playback leaked past the tenant policy")
+	}
+	if detail.Summary == nil {
+		t.Fatal("withholding audio must not withhold the rest of the call")
+	}
+}
+
+func TestFlaggedFilterAndTeamDiscovery(t *testing.T) {
+	f := newFixture(t)
+	token := f.token("qa-1", acmeTenant, auth.RoleQA, "")
+
+	resp, body := f.do(http.MethodGet, "/v1/calls?has_flags=true", token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var page struct{ Items []struct{ FlagCount int `json:"flag_count"` } }
+	json.Unmarshal(body, &page)
+	if len(page.Items) != 1 || page.Items[0].FlagCount != 1 {
+		t.Fatalf("unexpected flagged page: %s", body)
+	}
+
+	resp, body = f.do(http.MethodGet, "/v1/teams", token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var teams []struct{ Name string `json:"name"` }
+	json.Unmarshal(body, &teams)
+	if len(teams) != 1 || teams[0].Name != "North" {
+		t.Fatalf("unexpected teams: %s", body)
+	}
+}
+
+func TestCrossTenantIsolationHoldsOnTheExplorer(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/calls",
+		f.token("rival-admin", rivalTenant, auth.RoleAdmin, ""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var page struct{ Items []json.RawMessage }
+	json.Unmarshal(body, &page)
+	if len(page.Items) != 0 {
+		t.Fatalf("a rival tenant's admin saw %d calls", len(page.Items))
 	}
 }

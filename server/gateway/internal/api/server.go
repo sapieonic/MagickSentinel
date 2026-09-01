@@ -54,6 +54,12 @@ func (s *Server) Routes() http.Handler {
 		return s.Authenticate(auth.Require(c, AssertMeNamespace(h)))
 	}
 
+	// The call explorer. Scope comes from row-level security, not from the route,
+	// so one pair of handlers serves every role.
+	mux.Handle("GET /v1/calls", authed(s.listCalls))
+	mux.Handle("GET /v1/calls/{id}", authed(s.getCall))
+	mux.Handle("GET /v1/teams", authed(s.listTeams))
+
 	// Session and device.
 	mux.Handle("POST /v1/sessions", authed(s.createSession))
 	mux.Handle("DELETE /v1/sessions/current", authed(s.endSession))

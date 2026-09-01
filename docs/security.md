@@ -9,7 +9,8 @@ and read. Where something is partial, it is described as partial; where nothing 
 it says so.
 
 A summary table is at the end. Read the sections first — the table cannot carry the
-qualifications.
+qualifications. The repository is under active development, so this is a snapshot; the
+file paths are stable but the "not built yet" judgements may age faster than the rest.
 
 ---
 
@@ -19,10 +20,11 @@ qualifications.
 
 **Status: not implemented, and cannot be until there is something to sign.**
 
-There is no installer in this repository. `client/` is a two-crate Rust workspace —
-`sentinel-core` and `sentinel-capture` — with no `sentinel-agent` binary, no
-`sentinel-service` binary and no WiX project. There is no signing step in the build and
-no CI job that produces a shippable artefact.
+`client/installer/` exists as an empty directory. There is no WiX project, no signing
+step in the build, and no CI job that produces a shippable artefact. The workspace does
+now build two binaries — `SentinelService` and `SentinelAgent`, the latter currently a
+placeholder `main` — so the thing to sign is starting to exist even though the packaging
+around it does not.
 
 Two things to line up before this becomes urgent: obtaining the EV certificate itself,
 which involves an identity verification process with a lead time of its own, and
@@ -51,9 +53,10 @@ whichever comes first, and returns a `spool_eviction` event carrying the count o
 segments. A compliance product that quietly drops audio is worse than one that admits it
 did, and the tests cover that path specifically.
 
-What is not implemented is the process that would consume this: there is no uplink
-client, so nothing currently acks anything in production. The spool's logic is right and
-untested against a real server.
+What is not yet implemented is the process that would consume this. `sentinel-agent`,
+which will own the uplink, is a placeholder `main` at the time of writing, so nothing
+acks anything outside of tests. The spool's logic is right and has not been exercised
+against a real server.
 
 ## 3. Encryption
 
@@ -71,6 +74,10 @@ with `--features sqlcipher`, and there is no release build to enforce it in. The
 management the spec describes — a per-machine key generated at enrollment and wrapped
 with DPAPI at machine scope, machine scope because the service and the agent run as
 different principals — is documented in the module header and not implemented anywhere.
+
+This is the most checkable gap in this document. Anyone reviewing the encryption-at-rest
+claim should confirm that the shipped binary was built with the feature enabled, because
+nothing in the source tree guarantees it.
 
 **In transit — implemented.** `server/gateway/cmd/gateway/main.go` sets
 `tls.Config{MinVersion: tls.VersionTLS13}`. There is no path that negotiates lower.
@@ -110,9 +117,9 @@ adding a close button would be a compliance regression rather than a UX improvem
 also takes a `tierB` flag and labels the indicator differently on tier B, which is what
 surfaces the mixed-audio situation to the agent.
 
-The widget shell that would host it does not exist. There is no WebView2 host, no
-`window.chrome.webview` bridge, and `web/widget/` contains a `tsconfig.json` and nothing
-else. The requirement is therefore met at the component level and unmet at the product
+The widget shell that would host it does not exist. There is no WebView2 host and no
+`window.chrome.webview` bridge on the native side, and `web/widget/` contains a
+`tsconfig.json` and nothing else. The requirement is therefore met at the component level and unmet at the product
 level.
 
 ## 5. Data residency
@@ -144,8 +151,19 @@ returns them in the policy snapshot (`server/gateway/internal/api/handlers.go`).
 `blob.SegmentKey` partitions object keys as `audio/{tenant}/{day}/{call}/{channel}/...`
 specifically so a retention sweep can delete a day by prefix rather than row by row.
 
-Nothing sweeps. There is no scheduled job in the gateway, none in the pipeline, and no
-audit entries of a purge kind. Nothing in this repository deletes anything on a schedule.
+The purge itself is implemented in `server/pipeline/sentinel_pipeline/retention.py`.
+`RetentionJob.purge_tenant` reads the two periods per tenant rather than hard-coding
+them, deletes each audio object before its database row — so a failed object delete
+leaves the row for the next run to retry rather than orphaning audio no sweep can ever
+find again — and writes one `retention.purge` audit entry per tenant per run carrying
+counts and cutoff dates only, never a call id or an account reference.
+
+Three qualifications. The job is written entirely against `Protocol` interfaces
+(`RetentionStore`, `BlobStore`) and nothing in the repository implements either, so
+nothing actually deletes anything today. Nothing schedules it: there is no cron, no
+timer, and no entry point that calls `run()`. And the module has no test coverage at all.
+For a job whose failure mode is deleting the wrong data, that last point matters more
+than the other two.
 
 The two default numbers are placeholders — OPEN-6 — and should not be quoted to a
 customer as the product's retention policy.
@@ -175,10 +193,17 @@ narrow `SECURITY DEFINER` functions and grants the application role `EXECUTE` on
 nothing more. The set of tenant-crossing operations is therefore exactly three, and it is
 greppable.
 
-`calls.account_ref` is indexed per tenant, so lookup by account reference is cheap. But
-there is no data-subject export endpoint, no deletion path, and no handler for either.
-`POST /v1/compliance/exports` appears in `contracts/openapi.yaml` and is not routed by
-`server/gateway/internal/api/server.go`.
+`calls.account_ref` is indexed per tenant, so lookup by account reference is cheap, and
+`retention.py` defines a `SubjectRequest` dataclass carrying the tenant, the account
+reference, whether the request is an export or a deletion, who asked, and when. Its
+docstring states the position correctly: MagickVoice acts on the BPO's instruction rather
+than on the borrower's directly, and the path has to exist per tenant.
+
+That dataclass is the whole of it. Nothing fulfils a `SubjectRequest`, and there is no
+export endpoint and no deletion path. `POST /v1/compliance/exports` appears in
+`contracts/openapi.yaml` and is not routed by
+`server/gateway/internal/api/server.go`. A DPDP request arriving today would have to be
+serviced by hand against the database.
 
 ## 8. Audit log on read
 
@@ -229,9 +254,12 @@ detect-and-report: heartbeats every 30 seconds carrying capture state and spool 
 restart counting by the service, a server-side alert on "device online, user signed in,
 dialer session active, no capture", and a nightly coverage reconciliation that makes the
 gap a supervisor's conversation rather than an arms race. The endpoint side of that is
-partly built — `device_events` and `coverage_daily` exist in the schema, the heartbeat
-handler records events and touches the device — and the agent that would send the
-heartbeats does not exist yet.
+largely built on the server: `device_events` and `coverage_daily` exist in the schema,
+the heartbeat handler records events and touches the device, and
+`server/pipeline/sentinel_pipeline/coverage.py` does the reconciliation arithmetic behind
+a `CdrSource` interface. The agent that would send the heartbeats is still a placeholder,
+and no CDR source implementation exists (OPEN-7), so no coverage figure is currently
+produced from real data.
 
 ## 10. No PII in logs
 
@@ -264,16 +292,16 @@ names, would turn a convention into a guarantee.
 
 | # | Requirement | Status | Primary location |
 |---|---|---|---|
-| 1 | Code signing (EV) | Not started; nothing to sign yet | — |
+| 1 | Code signing (EV) | Not started; `client/installer/` is empty | — |
 | 2 | No local retention | Implemented and tested | `client/sentinel-core/src/spool.rs` |
 | 3 | SQLCipher at rest | Behind an unused feature flag; key management not built | `client/sentinel-core/Cargo.toml`, `src/spool.rs` |
 | 3 | TLS 1.3 | Implemented | `server/gateway/cmd/gateway/main.go` |
 | 3 | mTLS device auth | Implemented; certificate issuance is an unimplemented interface | `server/gateway/internal/api/middleware.go`, `internal/api/enroll.go` |
 | 4 | Recording indicator | Component built and non-dismissible; no widget to host it | `web/shared/src/components/RecordingIndicator.tsx` |
 | 5 | Data residency | Asserted in the contract; no infrastructure to enforce it (OPEN-4) | `contracts/openapi.yaml` |
-| 6 | Retention | Configuration present; no purge job anywhere (OPEN-6) | `db/migrations/0001_init.up.sql` |
+| 6 | Retention | Purge job implemented against interfaces nothing implements; unscheduled and untested (OPEN-6) | `server/pipeline/sentinel_pipeline/retention.py` |
 | 7 | DPDP: tenant isolation | Implemented in the database and tested | `db/migrations/0002_rls.up.sql`, `db/test/rls_test.sh` |
-| 7 | DPDP: subject export and deletion | Not built; the documented export route is not implemented | — |
+| 7 | DPDP: subject export and deletion | A request dataclass and nothing that fulfils it | `server/pipeline/sentinel_pipeline/retention.py` |
 | 8 | Audit on read | Single-call reads audited; listings return summaries unaudited | `server/gateway/internal/store/queries.go` |
 | 9 | EDR allowlisting | Process requirement, documented | `docs/deployment.md`, `docs/phase-0-checklist.md` |
 | 10 | No PII in logs | Enforced in the gateway's HTTP layer; no test guards it | `server/gateway/internal/httpx/httpx.go` |

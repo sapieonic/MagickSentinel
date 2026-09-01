@@ -48,6 +48,7 @@ type CallFilter struct {
 	To          *time.Time
 	Disposition string
 	Search      string
+	HasFlags    *bool
 	Limit       int
 	Cursor      *time.Time
 }
@@ -102,10 +103,11 @@ func (s *Store) ListCalls(ctx context.Context, id *auth.Identity, f CallFilter) 
          SELECT 1 FROM transcripts t
           WHERE t.call_id = c.id
             AND to_tsvector('simple', t.text) @@ plainto_tsquery('simple', $7)))
+   AND ($8::boolean IS NULL OR c.has_flags = $8)
  ORDER BY c.started_at DESC
- LIMIT $8`,
+ LIMIT $9`,
 			nullText(f.UserUID), nullUUID(f.TeamID), f.From, f.To,
-			nullText(f.Disposition), f.Cursor, nullText(f.Search), f.limit())
+			nullText(f.Disposition), f.Cursor, nullText(f.Search), f.HasFlags, f.limit())
 		if err != nil {
 			return err
 		}
@@ -474,3 +476,35 @@ func nullText(s string) *string {
 }
 
 func nullUUID(s string) *string { return nullText(s) }
+
+
+// Team is the minimum a supervisor needs to pick a scope.
+type Team struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ListTeams returns the teams visible to the caller.
+//
+// Team membership reaches the client only as a single team_id claim, so a supervisor
+// responsible for more than one team has no other way to discover them. RLS scopes
+// the rows to the tenant.
+func (s *Store) ListTeams(ctx context.Context, id *auth.Identity) ([]Team, error) {
+	var out []Team
+	err := s.AsIdentity(ctx, id, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id::text, name FROM teams ORDER BY name`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t Team
+			if err := rows.Scan(&t.ID, &t.Name); err != nil {
+				return err
+			}
+			out = append(out, t)
+		}
+		return rows.Err()
+	})
+	return out, err
+}

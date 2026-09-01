@@ -21,6 +21,7 @@ servers:
     description: local development
 
 tags:
+  - name: calls
   - name: device
   - name: session
   - name: me
@@ -147,6 +148,80 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: device revoked — client MUST stop capture
+
+  /v1/calls:
+    get:
+      operationId: listCalls
+      tags: [calls]
+      summary: Calls visible at the caller's scope
+      description: |
+        One listing for every role. The visible set is decided by row-level security
+        from the verified token, not by the path: an agent sees their own calls, a
+        supervisor their team's, qa/compliance/admin the whole tenant, and a bank
+        client only flagged calls.
+
+        This exists because the role matrix grants qa, compliance and admin "all
+        tenant calls" and the `me` and `teams` listings cannot express that — the
+        call explorer is the workhorse screen and a QA reviewer has to be able to
+        reach any call in the tenant.
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: user_uid, in: query, schema: { type: string }, description: narrows within the caller's scope; it can never widen it }
+        - { name: team_id, in: query, schema: { type: string, format: uuid } }
+        - { name: disposition, in: query, schema: { $ref: '#/components/schemas/Disposition' } }
+        - { name: has_flags, in: query, schema: { type: boolean } }
+        - { name: q, in: query, schema: { type: string }, description: full-text over transcripts in scope }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: page of calls
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CallPage' }
+
+  /v1/calls/{id}:
+    get:
+      operationId: getCall
+      tags: [calls]
+      summary: One call, if it is visible at the caller's scope
+      description: |
+        Returns 404 rather than 403 for a call outside the caller's scope: whether a
+        given call id exists in another team is itself information. Every read is
+        written to the audit log — a compliance product has to be able to answer who
+        listened to a borrower's call.
+      parameters: [{ $ref: '#/components/parameters/CallId' }]
+      responses:
+        '200':
+          description: call detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CallDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/teams:
+    get:
+      operationId: listTeams
+      tags: [team]
+      summary: Teams visible to the caller
+      description: |
+        Team membership reaches the client only as a single `team_id` claim, so a
+        supervisor responsible for more than one team has no other way to discover
+        them.
+      responses:
+        '200':
+          description: teams
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [id, name]
+                  properties:
+                    id: { type: string, format: uuid }
+                    name: { type: string }
 
   /v1/me/calls:
     get:
@@ -296,13 +371,44 @@ paths:
                     type: array
                     items: { $ref: '#/components/schemas/AgentStats' }
 
+  /v1/teams/{id}/live/ticket:
+    post:
+      operationId: createLiveTicket
+      tags: [team]
+      summary: Mint a short-lived ticket for the SSE stream
+      description: |
+        `EventSource` cannot send an `Authorization` header, so the browser cannot
+        present a bearer token on the live stream. Rather than accept the token in a
+        query string — where it would land in access logs and proxy caches — the
+        caller exchanges its token for a single-use ticket, scoped to one team, valid
+        for 60 seconds and consumed on connect.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '201':
+          description: ticket minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket, expires_at]
+                properties:
+                  ticket: { type: string }
+                  expires_at: { type: string, format: date-time }
+
   /v1/teams/{id}/live:
     get:
       operationId: streamTeamLive
       tags: [team]
       summary: SSE stream of active calls for the floor view
+      security: []
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: ticket
+          in: query
+          required: true
+          schema: { type: string }
+          description: single-use ticket from POST /v1/teams/{id}/live/ticket
       responses:
         '200':
           description: text/event-stream of LiveCallEvent objects
@@ -657,7 +763,8 @@ components:
 
     Policy:
       type: object
-      required: [version, pinned_devices, softphone, offline_grace_hours, rules_version, retention]
+      required: [version, pinned_devices, softphone, offline_grace_hours, rules_version,
+                 retention, allow_agent_audio_playback]
       properties:
         version: { type: integer }
         pinned_devices:
@@ -750,7 +857,7 @@ components:
 
     CallSummary:
       type: object
-      required: [id, started_at, capture_tier, status]
+      required: [id, started_at, user_uid, capture_tier, status, flag_count]
       properties:
         id: { type: string }
         started_at: { type: string, format: date-time }
@@ -844,6 +951,10 @@ components:
     Ptp:
       type: object
       nullable: true
+      description: |
+        Null when no promise was extracted. When present at all, `present` is
+        required, so "no PTP" has exactly one representation rather than three.
+      required: [present]
       properties:
         present: { type: boolean }
         amount_paise: { type: integer, format: int64, nullable: true }
