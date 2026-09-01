@@ -1,0 +1,3 @@
+BEGIN;
+DROP TABLE IF EXISTS default_rule_set;
+COMMIT;

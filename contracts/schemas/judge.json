@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.sentinel.magickvoice.com/schemas/judge.json",
+  "title": "Compliance judge verdict",
+  "description": "Tier-2 output. The judge MUST return the transcript span it relied on: a flag a reviewer cannot trace to specific words is not usable as evidence with a bank.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "rule_id", "confidence", "rationale"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["upheld", "not_a_violation", "inconclusive"] },
+    "rule_id": { "type": "string", "minLength": 1 },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "rationale": {
+      "type": "string", "minLength": 20, "maxLength": 1500,
+      "description": "One paragraph. Must reference what was actually said, not general policy."
+    },
+    "evidence_span_ms": {
+      "type": ["array", "null"],
+      "items": { "type": "integer", "minimum": 0 },
+      "minItems": 2, "maxItems": 2
+    },
+    "evidence_text": {
+      "type": ["string", "null"], "maxLength": 2000,
+      "description": "Verbatim transcript span. Required when verdict is upheld."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "upheld" } }, "required": ["verdict"] },
+      "then": { "required": ["evidence_span_ms", "evidence_text"] }
+    }
+  ]
+}

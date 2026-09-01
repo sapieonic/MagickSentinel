@@ -1,0 +1,973 @@
+openapi: 3.1.0
+info:
+  title: MagickVoice Sentinel API
+  version: 1.0.0
+  description: |
+    Source of truth for the Sentinel REST surface. Client, gateway and web all
+    generate types from this file; a change to an API shape starts here.
+
+    **Authorisation model.** Every route except `/v1/devices/enroll` and `/healthz`
+    requires a Google Cloud Identity Platform ID token as a bearer credential.
+    `tenant_id`, `role` and `team_id` are read from the *verified token claims* and
+    never from a request body or path parameter. Endpoints under `/v1/me` derive the
+    subject UID from the token; a UID supplied by the caller is ignored.
+
+    Device-scoped routes (`/v1/policy`, `/v1/heartbeat`, `/v1/ingest`) additionally
+    require mutual TLS with the certificate issued at enrollment.
+servers:
+  - url: https://api.sentinel.magickvoice.com
+    description: production (ap-south-1)
+  - url: http://localhost:8080
+    description: local development
+
+tags:
+  - name: device
+  - name: session
+  - name: me
+  - name: team
+  - name: compliance
+  - name: admin
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      operationId: health
+      security: []
+      summary: Liveness probe
+      responses:
+        '200':
+          description: healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+                  version: { type: string }
+
+  /v1/devices/enroll:
+    post:
+      operationId: enrollDevice
+      tags: [device]
+      security: []
+      summary: Exchange a single-use enrollment token and a CSR for a device certificate
+      description: |
+        Consumes an enrollment token minted in the portal (TTL 24 h, tenant-scoped).
+        The private key never leaves the endpoint: it is generated in CNG, marked
+        non-exportable, and only the CSR is sent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EnrollRequest' }
+      responses:
+        '201':
+          description: certificate issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrollResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: enrollment token invalid, expired, or already consumed
+        '409':
+          description: machine_guid already enrolled for this tenant with a different fingerprint
+
+  /v1/sessions:
+    post:
+      operationId: createSession
+      tags: [session]
+      summary: Open a Sentinel session and receive a policy snapshot
+      responses:
+        '200':
+          description: session opened
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: device revoked or user not permitted on this device
+
+  /v1/sessions/current:
+    delete:
+      operationId: endSession
+      tags: [session]
+      summary: Sign out. The client MUST flush its spool before calling this.
+      responses:
+        '204': { description: signed out }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/policy:
+    get:
+      operationId: getPolicy
+      tags: [device]
+      summary: Capture configuration for this device and tenant
+      responses:
+        '200':
+          description: policy snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/heartbeat:
+    post:
+      operationId: heartbeat
+      tags: [device]
+      summary: Report capture state, tier, version and spool depth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Heartbeat' }
+      responses:
+        '200':
+          description: accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [policy_version, server_time]
+                properties:
+                  policy_version: { type: integer }
+                  server_time: { type: string, format: date-time }
+                  commands:
+                    type: array
+                    description: out-of-band instructions, e.g. force update or stop capture
+                    items:
+                      type: object
+                      required: [kind]
+                      properties:
+                        kind:
+                          type: string
+                          enum: [refetch_policy, stop_capture, update_now, flush_spool]
+                        detail: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: device revoked — client MUST stop capture
+
+  /v1/me/calls:
+    get:
+      operationId: listMyCalls
+      tags: [me]
+      summary: The signed-in agent's own calls
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: disposition, in: query, schema: { $ref: '#/components/schemas/Disposition' } }
+        - { name: q, in: query, schema: { type: string }, description: full-text over own transcripts }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: page of calls
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CallPage' }
+
+  /v1/me/calls/{id}:
+    get:
+      operationId: getMyCall
+      tags: [me]
+      parameters: [{ $ref: '#/components/parameters/CallId' }]
+      responses:
+        '200':
+          description: call detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CallDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/me/calls/{id}/confirm:
+    post:
+      operationId: confirmMyCall
+      tags: [me]
+      summary: Agent confirms or corrects disposition and PTP
+      description: |
+        Permitted within `tenants.ptp_correction_window_hours` of `ended_at`
+        (default 24). Writes `ptps.agent_*` columns and an audit entry; never
+        overwrites the model's extraction in place.
+      parameters: [{ $ref: '#/components/parameters/CallId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CallConfirmation' }
+      responses:
+        '200':
+          description: confirmation recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CallDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: correction window has closed }
+
+  /v1/me/stats:
+    get:
+      operationId: getMyStats
+      tags: [me]
+      summary: Coverage, PTP conversion and sentiment delta against the team median
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: stats
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentStats' }
+
+  /v1/me/flags:
+    get:
+      operationId: listMyFlags
+      tags: [me]
+      summary: Compliance flags raised on the signed-in agent's own calls
+      responses:
+        '200':
+          description: flags
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Flag' }
+
+  /v1/me/flags/{id}/respond:
+    post:
+      operationId: respondToMyFlag
+      tags: [me]
+      summary: Agent contests or explains a flag on their own call
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [response]
+              properties:
+                response: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: response recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Flag' }
+
+  /v1/teams/{id}/calls:
+    get:
+      operationId: listTeamCalls
+      tags: [team]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: user_uid, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: page of calls
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CallPage' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/teams/{id}/scorecards:
+    get:
+      operationId: getTeamScorecards
+      tags: [team]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: per-agent scorecards plus the team median
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [median, agents]
+                properties:
+                  median: { $ref: '#/components/schemas/AgentStats' }
+                  agents:
+                    type: array
+                    items: { $ref: '#/components/schemas/AgentStats' }
+
+  /v1/teams/{id}/live:
+    get:
+      operationId: streamTeamLive
+      tags: [team]
+      summary: SSE stream of active calls for the floor view
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: text/event-stream of LiveCallEvent objects
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/LiveCallEvent' }
+
+  /v1/compliance/flags:
+    get:
+      operationId: listFlags
+      tags: [compliance]
+      parameters:
+        - { name: severity, in: query, schema: { $ref: '#/components/schemas/Severity' } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/FlagStatus' } }
+        - { name: rule_id, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: flag queue
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Flag' }
+                  next_cursor: { type: string, nullable: true }
+
+  /v1/compliance/flags/{id}:
+    patch:
+      operationId: updateFlag
+      tags: [compliance]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { $ref: '#/components/schemas/FlagStatus' }
+                reviewer_uid: { type: string }
+                note: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Flag' }
+
+  /v1/compliance/exports:
+    post:
+      operationId: createEvidenceExport
+      tags: [compliance]
+      summary: Queue an evidence pack (transcript spans, flags, audio where policy allows)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [flag_ids]
+              properties:
+                flag_ids:
+                  type: array
+                  items: { type: string, format: uuid }
+                  minItems: 1
+                include_audio: { type: boolean, default: false }
+      responses:
+        '202':
+          description: export queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job_id, status]
+                properties:
+                  job_id: { type: string, format: uuid }
+                  status: { type: string, enum: [queued, running, ready, failed] }
+                  download_url: { type: string, nullable: true }
+
+  /v1/admin/devices:
+    get:
+      operationId: listDevices
+      tags: [admin]
+      summary: Fleet view — tier distribution and coverage gaps
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [active, revoked, stale] } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: fleet
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, tier_distribution]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Device' }
+                  tier_distribution:
+                    type: object
+                    properties:
+                      A: { type: integer }
+                      B: { type: integer }
+                  next_cursor: { type: string, nullable: true }
+
+  /v1/admin/devices/{id}/revoke:
+    post:
+      operationId: revokeDevice
+      tags: [admin]
+      summary: Revoke a device. Live connections MUST be terminated within 60 s.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        '204': { description: revoked }
+
+  /v1/admin/enrollment-tokens:
+    post:
+      operationId: createEnrollmentToken
+      tags: [admin]
+      responses:
+        '201':
+          description: token minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, expires_at]
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+
+  /v1/admin/users:
+    get:
+      operationId: listUsers
+      tags: [admin]
+      responses:
+        '200':
+          description: users
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/User' }
+
+  /v1/admin/users/{uid}:
+    patch:
+      operationId: updateUser
+      tags: [admin]
+      parameters: [{ name: uid, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role: { $ref: '#/components/schemas/Role' }
+                team_id: { type: string, format: uuid, nullable: true }
+                status: { type: string, enum: [active, suspended] }
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /v1/admin/rules:
+    get:
+      operationId: getRules
+      tags: [admin]
+      responses:
+        '200':
+          description: active rule set plus version history
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleSet' }
+    put:
+      operationId: putRules
+      tags: [admin]
+      summary: Publish a new rule-set version. Never mutates an existing version.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuleSetDefinition' }
+      responses:
+        '201':
+          description: new version created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleSet' }
+
+  /v1/admin/audit:
+    get:
+      operationId: getAuditLog
+      tags: [admin]
+      parameters:
+        - { name: actor_uid, in: query, schema: { type: string } }
+        - { name: entity, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: audit entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntry' }
+                  next_cursor: { type: string, nullable: true }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Identity Platform ID token, verified server-side against Google's public keys.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    CallId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, description: ULID or UUID rendering of the call id }
+
+  responses:
+    BadRequest:
+      description: malformed request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: missing, expired or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: authenticated but not permitted
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: not found, or not visible at the caller's scope
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        request_id: { type: string }
+
+    Role:
+      type: string
+      enum: [agent, supervisor, qa, compliance, admin, client]
+
+    Severity:
+      type: string
+      enum: [low, medium, high, critical]
+
+    FlagStatus:
+      type: string
+      enum: [open, assigned, upheld, dismissed]
+
+    Disposition:
+      type: string
+      enum: [ptp, refusal, dispute, wrong_number, no_contact, callback_requested,
+             partial_payment, escalation, other]
+
+    CaptureTier:
+      type: string
+      enum: [A, B]
+
+    CaptureState:
+      type: string
+      enum: [IDLE, ARMED, IN_CALL, WRAP, FINALIZE, BLOCKED]
+
+    EnrollRequest:
+      type: object
+      required: [enrollment_token, csr_pem, machine_guid, hw_fingerprint, os_build, capture_tier, agent_version]
+      properties:
+        enrollment_token: { type: string }
+        csr_pem: { type: string, description: PKCS#10 CSR, P-256 key held non-exportably in CNG }
+        machine_guid: { type: string }
+        hw_fingerprint:
+          type: string
+          description: SHA-256 of machine GUID + baseboard serial + primary MAC
+        os_build: { type: string, example: '10.0.22631' }
+        capture_tier: { $ref: '#/components/schemas/CaptureTier' }
+        agent_version: { type: string }
+
+    EnrollResponse:
+      type: object
+      required: [device_id, certificate_pem, ca_chain_pem, not_after]
+      properties:
+        device_id: { type: string, format: uuid }
+        certificate_pem: { type: string }
+        ca_chain_pem: { type: string }
+        not_after: { type: string, format: date-time }
+
+    SessionResponse:
+      type: object
+      required: [user, policy, server_time]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        policy: { $ref: '#/components/schemas/Policy' }
+        server_time: { type: string, format: date-time }
+
+    User:
+      type: object
+      required: [firebase_uid, tenant_id, role, display_name, status]
+      properties:
+        firebase_uid: { type: string }
+        tenant_id: { type: string, format: uuid }
+        role: { $ref: '#/components/schemas/Role' }
+        team_id: { type: string, format: uuid, nullable: true }
+        display_name: { type: string }
+        status: { type: string, enum: [active, suspended] }
+
+    Policy:
+      type: object
+      required: [version, pinned_devices, softphone, offline_grace_hours, rules_version, retention]
+      properties:
+        version: { type: integer }
+        pinned_devices:
+          type: array
+          description: |
+            Admin-pinned audio endpoints, matched by container ID with the friendly
+            name as fallback. Capture MUST NOT start from the system default device.
+          items:
+            type: object
+            required: [container_id]
+            properties:
+              container_id: { type: string }
+              friendly_name: { type: string }
+        softphone:
+          type: object
+          description: Tenant configuration for call detection (OPEN-8).
+          properties:
+            process_names:
+              type: array
+              items: { type: string }
+              example: [Softphone.exe, avaya-oneX.exe]
+            uia_account_ref_selector:
+              type: string
+              nullable: true
+              description: UI Automation selector for the account reference; null disables the scrape.
+        offline_grace_hours: { type: integer, default: 8 }
+        idle_signout_minutes: { type: integer, default: 30 }
+        rules_version: { type: integer }
+        allow_agent_audio_playback: { type: boolean }
+        retention:
+          type: object
+          properties:
+            audio_days: { type: integer }
+            transcript_days: { type: integer }
+        vad:
+          type: object
+          properties:
+            speech_ms_to_confirm: { type: integer, default: 300 }
+            armed_timeout_ms: { type: integer, default: 20000 }
+            hangup_silence_ms: { type: integer, default: 8000 }
+            wrap_ms: { type: integer, default: 3000 }
+            debounce_ms: { type: integer, default: 2000 }
+
+    Heartbeat:
+      type: object
+      required: [device_id, capture_state, capture_tier, os_build, agent_version, spool_depth, sent_at]
+      properties:
+        device_id: { type: string, format: uuid }
+        capture_state: { $ref: '#/components/schemas/CaptureState' }
+        capture_tier: { $ref: '#/components/schemas/CaptureTier' }
+        os_build: { type: string }
+        agent_version: { type: string }
+        spool_depth: { type: integer, description: unacked segments held on disk }
+        spool_bytes: { type: integer }
+        last_call_at: { type: string, format: date-time, nullable: true }
+        dialer_session_active: { type: boolean }
+        signed_in: { type: boolean }
+        agent_restarts: { type: integer }
+        pinned_device_present: { type: boolean }
+        events:
+          type: array
+          description: client-side events since the last heartbeat (no PII)
+          items:
+            type: object
+            required: [kind, at]
+            properties:
+              kind:
+                type: string
+                enum: [tier_downgrade, spool_eviction, device_lost, device_restored,
+                       agent_restart, capture_error, foreign_audio_suppressed]
+              at: { type: string, format: date-time }
+              count: { type: integer }
+              detail: { type: string }
+        sent_at: { type: string, format: date-time }
+
+    Device:
+      type: object
+      required: [id, machine_guid, os_build, capture_tier, agent_version, status]
+      properties:
+        id: { type: string, format: uuid }
+        machine_guid: { type: string }
+        os_build: { type: string }
+        capture_tier: { $ref: '#/components/schemas/CaptureTier' }
+        agent_version: { type: string }
+        pinned_device_id: { type: string, nullable: true }
+        status: { type: string, enum: [active, revoked] }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        last_capture_state: { $ref: '#/components/schemas/CaptureState' }
+        coverage_pct_7d: { type: number, nullable: true }
+
+    CallSummary:
+      type: object
+      required: [id, started_at, capture_tier, status]
+      properties:
+        id: { type: string }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time, nullable: true }
+        duration_ms: { type: integer, nullable: true }
+        user_uid: { type: string }
+        account_ref: { type: string, nullable: true }
+        direction: { type: string, nullable: true }
+        capture_tier: { $ref: '#/components/schemas/CaptureTier' }
+        status:
+          type: string
+          enum: [ingesting, transcribing, analyzing, complete, failed, discarded]
+        disposition: { $ref: '#/components/schemas/Disposition' }
+        summary: { type: string, nullable: true }
+        ptp: { $ref: '#/components/schemas/Ptp' }
+        sentiment_delta: { type: number, nullable: true }
+        flag_count: { type: integer }
+        max_severity: { $ref: '#/components/schemas/Severity' }
+
+    CallPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CallSummary' }
+        next_cursor: { type: string, nullable: true }
+
+    CallDetail:
+      allOf:
+        - $ref: '#/components/schemas/CallSummary'
+        - type: object
+          properties:
+            transcript:
+              type: array
+              description: speaker-separated turns, merged from the two channels by timestamp
+              items: { $ref: '#/components/schemas/TranscriptTurn' }
+            sentiment: { $ref: '#/components/schemas/SentimentSeries' }
+            flags:
+              type: array
+              items: { $ref: '#/components/schemas/Flag' }
+            talk_ratio: { type: number, nullable: true }
+            interruptions: { type: integer, nullable: true }
+            next_action: { type: string, nullable: true }
+            audio_url:
+              type: string
+              nullable: true
+              description: |
+                Short-lived signed URL. Null when the caller's role or the tenant's
+                `allow_agent_audio_playback` policy forbids playback. Every issuance
+                writes an audit entry.
+            analysis:
+              type: object
+              properties:
+                model: { type: string }
+                prompt_version: { type: string }
+                asr_provider: { type: string }
+                asr_version: { type: string }
+
+    TranscriptTurn:
+      type: object
+      required: [channel, speaker, start_ms, end_ms, text]
+      properties:
+        channel: { type: integer, enum: [0, 1] }
+        speaker: { type: string, enum: [borrower, agent] }
+        start_ms: { type: integer }
+        end_ms: { type: integer }
+        text: { type: string }
+        confidence: { type: number, nullable: true }
+
+    SentimentSeries:
+      type: object
+      properties:
+        far:
+          type: array
+          items: { $ref: '#/components/schemas/SentimentPoint' }
+        near:
+          type: array
+          items: { $ref: '#/components/schemas/SentimentPoint' }
+        far_open: { type: number }
+        far_close: { type: number }
+        delta: { type: number }
+
+    SentimentPoint:
+      type: object
+      required: [t_ms, v]
+      properties:
+        t_ms: { type: integer }
+        v: { type: number, minimum: -1, maximum: 1 }
+
+    Ptp:
+      type: object
+      nullable: true
+      properties:
+        present: { type: boolean }
+        amount_paise: { type: integer, format: int64, nullable: true }
+        due_date: { type: string, format: date, nullable: true }
+        confidence: { type: number }
+        evidence_span_ms:
+          type: array
+          items: { type: integer }
+          minItems: 2
+          maxItems: 2
+        agent_confirmed: { type: boolean, nullable: true }
+        agent_amount_paise: { type: integer, format: int64, nullable: true }
+        agent_due_date: { type: string, format: date, nullable: true }
+
+    CallConfirmation:
+      type: object
+      required: [disposition]
+      properties:
+        disposition: { $ref: '#/components/schemas/Disposition' }
+        ptp_present: { type: boolean }
+        ptp_amount_paise:
+          type: integer
+          format: int64
+          nullable: true
+          description: Paise. Never rupees, never a float.
+        ptp_due_date: { type: string, format: date, nullable: true }
+        note: { type: string, maxLength: 500 }
+
+    Flag:
+      type: object
+      required: [id, call_id, rule_id, severity, tier, status]
+      properties:
+        id: { type: string, format: uuid }
+        call_id: { type: string }
+        rule_id: { type: string }
+        rule_set_version: { type: integer }
+        severity: { $ref: '#/components/schemas/Severity' }
+        tier: { type: integer, enum: [1, 2], description: 1 deterministic, 2 LLM judge }
+        span_start_ms: { type: integer, nullable: true }
+        span_end_ms: { type: integer, nullable: true }
+        evidence_text: { type: string, nullable: true }
+        judge_rationale: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/FlagStatus' }
+        reviewer_uid: { type: string, nullable: true }
+        agent_response: { type: string, nullable: true }
+        resolved_at: { type: string, format: date-time, nullable: true }
+
+    AgentStats:
+      type: object
+      properties:
+        user_uid: { type: string }
+        display_name: { type: string }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        calls: { type: integer }
+        coverage_pct: { type: number, nullable: true }
+        ptp_rate: { type: number, description: PTP calls / connected calls }
+        ptp_amount_paise: { type: integer, format: int64 }
+        avg_sentiment_delta: { type: number, nullable: true }
+        talk_ratio: { type: number, nullable: true }
+        flags_per_1000: { type: number }
+
+    LiveCallEvent:
+      type: object
+      required: [call_id, user_uid, state, started_at]
+      properties:
+        call_id: { type: string }
+        user_uid: { type: string }
+        display_name: { type: string }
+        state: { $ref: '#/components/schemas/CaptureState' }
+        started_at: { type: string, format: date-time }
+        elapsed_ms: { type: integer }
+        sentiment_far: { type: number, nullable: true }
+        sentiment_near: { type: number, nullable: true }
+        alert: { type: string, nullable: true }
+
+    RuleSetDefinition:
+      type: object
+      required: [rules]
+      properties:
+        call_hours:
+          type: object
+          properties:
+            start: { type: string, example: '08:00' }
+            end: { type: string, example: '19:00' }
+            timezone: { type: string, default: Asia/Kolkata }
+        judge_sample_pct: { type: number, default: 5 }
+        rules:
+          type: array
+          items:
+            type: object
+            required: [rule_id, enabled, severity]
+            properties:
+              rule_id: { type: string }
+              enabled: { type: boolean }
+              severity: { $ref: '#/components/schemas/Severity' }
+              params:
+                type: object
+                additionalProperties: true
+                description: rule-specific parameters, e.g. term lists per language
+
+    RuleSet:
+      allOf:
+        - type: object
+          required: [id, version, active, created_at, created_by]
+          properties:
+            id: { type: string, format: uuid }
+            version: { type: integer }
+            active: { type: boolean }
+            created_at: { type: string, format: date-time }
+            created_by: { type: string }
+        - $ref: '#/components/schemas/RuleSetDefinition'
+
+    AuditEntry:
+      type: object
+      required: [id, action, entity, at]
+      properties:
+        id: { type: integer, format: int64 }
+        actor_uid: { type: string, nullable: true }
+        action: { type: string }
+        entity: { type: string }
+        entity_id: { type: string, nullable: true }
+        at: { type: string, format: date-time }
+        detail:
+          type: object
+          additionalProperties: true
+          description: MUST NOT contain transcript text, borrower names or account references.

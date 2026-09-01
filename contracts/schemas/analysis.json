@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.sentinel.magickvoice.com/schemas/analysis.json",
+  "title": "Call analysis",
+  "description": "Structured output of one CallAnalyzer invocation over a finalized call. Validated before persistence; a schema failure retries once, then the call is marked failed rather than persisting partial data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "disposition", "ptp", "sentiment", "talk_ratio", "interruptions"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 1200,
+      "description": "2-4 sentences. Factual account of what was said and agreed. No advice, no coaching, no speculation about the borrower's circumstances."
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["ptp", "refusal", "dispute", "wrong_number", "no_contact",
+               "callback_requested", "partial_payment", "escalation", "other"]
+    },
+    "ptp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["present"],
+      "properties": {
+        "present": { "type": "boolean" },
+        "amount_paise": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Indian paise. Never rupees, never a float. 15000 rupees is 1500000."
+        },
+        "due_date": { "type": ["string", "null"], "format": "date" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence_span_ms": {
+          "type": ["array", "null"],
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[start_ms, end_ms] of the transcript span the amount and date were read from."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "present": { "const": true } }, "required": ["present"] },
+          "then": { "required": ["present", "amount_paise", "confidence", "evidence_span_ms"] }
+        }
+      ]
+    },
+    "sentiment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["far", "near", "far_open", "far_close", "delta"],
+      "properties": {
+        "far": { "$ref": "#/$defs/series" },
+        "near": { "$ref": "#/$defs/series" },
+        "far_open": { "$ref": "#/$defs/valence" },
+        "far_close": { "$ref": "#/$defs/valence" },
+        "delta": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 2,
+          "description": "far_close - far_open. Computed server-side, never in the UI."
+        }
+      }
+    },
+    "next_action": { "type": ["string", "null"], "maxLength": 300 },
+    "talk_ratio": {
+      "type": "number", "minimum": 0, "maximum": 1,
+      "description": "Fraction of speech time on the near (agent) channel."
+    },
+    "interruptions": {
+      "type": "integer", "minimum": 0,
+      "description": "Count of near-channel onsets while the far channel was already voiced."
+    }
+  },
+  "$defs": {
+    "valence": { "type": "number", "minimum": -1, "maximum": 1 },
+    "series": {
+      "type": "array",
+      "description": "Sampled at 30-second buckets.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["t_ms", "v"],
+        "properties": {
+          "t_ms": { "type": "integer", "minimum": 0 },
+          "v": { "$ref": "#/$defs/valence" }
+        }
+      }
+    }
+  }
+}
