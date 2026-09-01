@@ -8,7 +8,7 @@ import { formatPaise } from '../money.js';
  * reviewer can still see what was extracted.
  */
 export function PtpChip({ ptp }: { ptp: Ptp | null | undefined }) {
-  if (!ptp || ptp.present === false) return <span className="sx-chip sx-chip--muted">No PTP</span>;
+  if (!ptp || !ptp.present) return <span className="sx-chip sx-chip--muted">No PTP</span>;
 
   const amount = ptp.agent_amount_paise ?? ptp.amount_paise ?? null;
   const dueDate = ptp.agent_due_date ?? ptp.due_date ?? null;

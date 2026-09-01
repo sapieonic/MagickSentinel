@@ -1,6 +1,6 @@
 /**
- * Portal session: who is signed in, what the tenant policy allows, and the one
- * ApiClient every screen uses.
+ * Portal session: who is signed in, what the tenant policy allows, the teams the
+ * caller can name, and the one ApiClient every screen uses.
  *
  * The portal has its own Identity Platform session (the widget's token comes from
  * the native layer instead), so the token provider here reads from whatever the
@@ -10,7 +10,7 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ApiClient, canPlayAudio } from '@sentinel/shared';
-import type { Capability, Policy, Role, User } from '@sentinel/shared';
+import type { Capability, Policy, Role, Team, User } from '@sentinel/shared';
 import { can } from '@sentinel/shared';
 
 export interface Session {
@@ -27,6 +27,10 @@ interface SessionContextValue {
   can: (capability: Capability) => boolean;
   /** Applies the two policy-gated cells of spec 13.4's matrix. */
   canPlayAudio: boolean;
+  /** Empty until the listing resolves, and for roles that never name a team. */
+  teams: readonly Team[];
+  /** A team's name, or the raw id when it is not in the listing. */
+  teamName: (id: string | null | undefined) => string;
 }
 
 const SessionContext = createContext<SessionContextValue | null>(null);
@@ -50,6 +54,7 @@ export function SessionProvider({
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [teams, setTeams] = useState<readonly Team[]>([]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -65,8 +70,29 @@ export function SessionProvider({
     return () => controller.abort();
   }, [api]);
 
+  const role = session?.user.role ?? null;
+  // Only roles that work across teams ask for the listing. An agent has no use for
+  // the tenant's team roster and asking for it would put a list of every team on
+  // the floor into a screen that never shows one.
+  const wantsTeams = can(role, 'team_calls') || can(role, 'manage_devices_users');
+
+  useEffect(() => {
+    if (!wantsTeams) {
+      setTeams([]);
+      return;
+    }
+    const controller = new AbortController();
+    void api
+      .listTeams(controller.signal)
+      .then((found) => setTeams(found))
+      // A failed team listing degrades a label to a raw id; it must not take the
+      // screen down, so nothing is surfaced here.
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [api, wantsTeams]);
+
   const value = useMemo<SessionContextValue>(() => {
-    const role = session?.user.role ?? null;
+    const byId = new Map(teams.map((team) => [team.id, team.name]));
     return {
       api,
       session,
@@ -74,9 +100,11 @@ export function SessionProvider({
       error,
       role,
       can: (capability: Capability) => can(role, capability),
-      canPlayAudio: canPlayAudio(role, session?.policy.allow_agent_audio_playback === true),
+      canPlayAudio: canPlayAudio(role, session?.policy.allow_agent_audio_playback ?? false),
+      teams,
+      teamName: (id) => (id ? (byId.get(id) ?? id) : '—'),
     };
-  }, [api, session, loading, error]);
+  }, [api, session, loading, error, role, teams]);
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }

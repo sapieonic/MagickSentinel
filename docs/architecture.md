@@ -45,14 +45,16 @@ mixed.
                          └──────────────┘
 ```
 
-**How much of this exists.** The gateway is real and runs. Postgres and its
-row-level-security model are real and tested. The client's platform-neutral logic — the
-call state machine, the spool, the wire codec — is real and tested, and the Windows
-capture code is written but unexercised. Neither Windows binary in the top box exists
-yet: there is no service, no agent executable, no named pipe, no PKCE flow, no Opus
-encoder, no uplink client and no WebView2 shell. The pipeline is a set of libraries with
-no worker loop and no NATS consumer. Object storage has a filesystem backend and no S3
-adapter. See the README for the component-by-component state.
+**How much of this exists.** This is a design diagram, not an inventory. As of writing:
+the gateway runs; Postgres and its row-level-security model are real and tested; the
+client's platform-neutral logic — state machine, spool, wire codec — is real and tested;
+the Windows capture code and most of `SentinelService` are written and type-check but are
+exercised by nothing, because there is no Windows CI runner. `SentinelAgent` is a
+placeholder `main`, so the endpoint has no PKCE login, no Opus encoder, no uplink client
+and no WebView2 shell yet. The pipeline has its worker orchestration and a NATS consumer
+but is not deployed. Object storage has a filesystem backend and no S3 adapter, and there
+is no installer. The README carries the component-by-component state and is the place to
+keep it current.
 
 Data flows one way through the endpoint: two audio streams are captured, resampled to
 16 kHz mono, encoded, framed with a sequence number and a call-relative timestamp,

@@ -6,7 +6,7 @@ this repository, names the file, and says plainly what is not built yet.
 
 It is written for someone who will check the claims. Every file path below can be opened
 and read. Where something is partial, it is described as partial; where nothing exists,
-it says so.
+it says so. Verified against commit `3056427`.
 
 A summary table is at the end. Read the sections first — the table cannot carry the
 qualifications. The repository is under active development, so this is a snapshot; the
@@ -200,9 +200,14 @@ docstring states the position correctly: MagickVoice acts on the BPO's instructi
 than on the borrower's directly, and the path has to exist per tenant.
 
 That dataclass is the whole of it. Nothing fulfils a `SubjectRequest`, and there is no
-export endpoint and no deletion path. `POST /v1/compliance/exports` appears in
-`contracts/openapi.yaml` and is not routed by
-`server/gateway/internal/api/server.go`. A DPDP request arriving today would have to be
+per-tenant subject export and no deletion path by account reference.
+
+`POST /v1/compliance/exports` is a different thing and should not be mistaken for one:
+it is the compliance queue's evidence pack, it is routed and audited
+(`evidence.export`), it refuses a request containing a flag the caller cannot see so
+that the endpoint cannot be used as an oracle for flag ids in other teams, and it gates
+audio inclusion on the tenant's playback policy. What it does today is return a job id.
+Nothing produces the pack. A DPDP request arriving today would have to be
 serviced by hand against the database.
 
 ## 8. Audit log on read
@@ -216,7 +221,8 @@ row inside the same transaction that returns the call, its transcript and its fl
 the read and its audit entry commit together or not at all. Writes are audited too:
 `call.confirm`, `flag.update`, `flag.agent_response`, `device.revoke`, `user.update`,
 `rule_set.publish` and `enrollment_token.create` all go through `auditTx` in
-`server/gateway/internal/store/store.go`.
+`server/gateway/internal/store/store.go` — as does `evidence.export`, which records the
+flag ids and whether audio was requested.
 
 **The gap.** `Store.ListCalls` is not audited, and the `callSelect` query it shares with
 the team and compliance listings returns `a.summary` and `c.account_ref`. That is call

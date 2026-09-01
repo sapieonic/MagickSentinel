@@ -7,8 +7,10 @@
 package httpx
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"net"
 	"log/slog"
 	"net/http"
 	"time"
@@ -66,6 +68,35 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// The three methods below exist because embedding http.ResponseWriter in a wrapper
+// silently *removes* the optional interfaces the real writer implements. Both
+// long-lived endpoints this service exists for depend on them: the SSE floor view
+// needs Flusher, and the WebSocket upgrade on /v1/ingest needs Hijacker.
+//
+// The failure is invisible until production. It is a runtime type assertion, not a
+// compile error, and it only happens under the full middleware chain — so a handler
+// mounted directly in a test passes while the deployed service returns 501 on every
+// upgrade. internal/httpx/httpx_test.go mounts the chain for exactly this reason.
+//
+// Unwrap serves http.ResponseController; Flush and Hijack serve the many libraries
+// that still type-assert directly, coder/websocket among them.
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := s.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return h.Hijack()
 }
 
 // LogRequests emits one structured line per request.

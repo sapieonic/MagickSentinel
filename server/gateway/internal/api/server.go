@@ -20,6 +20,10 @@ type Server struct {
 	Ingest http.Handler
 	// CA signs device certificates at enrollment.
 	CA CertificateAuthority
+	// LiveTickets backs the SSE floor view. Nil disables the live routes.
+	LiveTickets *LiveTickets
+	// LivePoll is how often the floor view re-queries active calls.
+	LivePoll time.Duration
 	Now    func() time.Time
 }
 
@@ -77,10 +81,15 @@ func (s *Server) Routes() http.Handler {
 	// Team.
 	mux.Handle("GET /v1/teams/{id}/calls", gated(auth.CapTeamCalls, s.listTeamCalls))
 	mux.Handle("GET /v1/teams/{id}/scorecards", gated(auth.CapTeamCalls, s.teamScorecards))
+	mux.Handle("POST /v1/teams/{id}/live/ticket", gated(auth.CapTeamCalls, s.createLiveTicket))
+	// Deliberately outside Authenticate: the ticket is the credential, and it
+	// carries the identity that was verified when it was minted.
+	mux.Handle("GET /v1/teams/{id}/live", http.HandlerFunc(s.streamTeamLive))
 
 	// Compliance.
 	mux.Handle("GET /v1/compliance/flags", gated(auth.CapResolveFlags, s.listFlags))
 	mux.Handle("PATCH /v1/compliance/flags/{id}", gated(auth.CapResolveFlags, s.updateFlag))
+	mux.Handle("POST /v1/compliance/exports", gated(auth.CapResolveFlags, s.createEvidenceExport))
 
 	// Admin.
 	mux.Handle("GET /v1/admin/devices", gated(auth.CapManageFleet, s.listDevices))

@@ -21,13 +21,14 @@ describes what the repository contains today and how to work with it.
 ## Repository layout
 
 ```
-contracts/     OpenAPI, the WSS binary protocol, JSON Schemas for AI output
-db/            SQL migrations and the row-level-security acceptance tests
-client/        Rust workspace: sentinel-core, sentinel-capture
-server/gateway Go: REST API and WSS ingest
-server/pipeline Python: compliance rules, analysis, ASR interfaces, cost controls
-web/           React: shared components, widget and portal entry points
-docs/          Deployment, security, architecture, Phase 0 checklist, open decisions
+contracts/        OpenAPI, the WSS binary protocol, JSON Schemas for AI output
+db/               SQL migrations and the row-level-security acceptance tests
+client/           Rust workspace: sentinel-core, sentinel-capture,
+                  sentinel-service, sentinel-agent, and an empty installer/
+server/gateway/   Go: REST API and WSS ingest
+server/pipeline/  Python: ASR, analysis, compliance, cost, retention, coverage
+web/              React: shared components plus the widget and portal apps
+docs/             Deployment, security, architecture, Phase 0, open decisions
 ```
 
 `contracts/` is the source of truth. Client, gateway and web are all expected to
@@ -38,25 +39,31 @@ without a test failing.
 
 ## Running the test suites
 
-Every command below was run against this working tree and passes.
+Every command below was run against this working tree and passes. Several work streams
+are editing the repository at once, so if one of them fails for you, check `git log`
+before assuming the command is wrong.
 
 ```
 cd client && cargo test
 ```
 
-Unit tests for the call state machine, the spool, the wire codec, the VAD, the
-resampler, device matching, tier classification and foreign-audio suppression, plus an
-integration test against the shared wire fixture. No audio hardware, no network, no
-database. This is the suite to run while working on the client.
+Unit tests across the whole workspace: the call state machine, the spool, the wire
+codec, the VAD, the resampler, device matching, tier classification, foreign-audio
+suppression, the service's IPC codec and supervisor, plus an integration test against the
+shared wire fixture. No audio hardware, no network, no database. This is the suite to run
+while working on the client.
 
 ```
 cd client && cargo check --target x86_64-pc-windows-gnu
 ```
 
-Type-checks the Windows-only capture code — the COM work under
-`client/sentinel-capture/src/windows/` — which is compiled out on Linux. The target and
-mingw-w64 are installed in the dev container. This catches signature and feature-flag
-breakage in code that has no test coverage; it does not tell you the code works.
+Type-checks the Windows-only code — the COM work under
+`client/sentinel-capture/src/windows/` and `client/sentinel-service/src/windows/` — which
+is compiled out on Linux. The target and mingw-w64 are installed in the dev container;
+mingw is needed because `rusqlite` and `audiopus` build C sources for the target rather
+than only type-checking Rust. Add `--all-targets` to cover the test targets too. This
+catches signature and feature-flag breakage in code that no test exercises; it does not
+tell you the code works.
 
 ```
 bash db/test/rls_test.sh
@@ -107,33 +114,46 @@ so `.venv-dev/bin/python -m pytest` from `server/pipeline` works without further
 Two modules have no test coverage at all: `sentinel_pipeline/retention.py` and
 `sentinel_pipeline/coverage.py`.
 
-### Not yet runnable
+```
+cd web && npm run typecheck && npm test && npm run build
+```
 
-`web/` is under active construction in a separate work stream. `npm ci` currently fails
-because `package-lock.json` predates the `@sentinel/shared` workspace, `web/widget/` and
-`web/portal/` contain a `tsconfig.json` and nothing else, and `npm run typecheck` reports
-an error in `web/shared/src/money.ts`. The CI workflow has a web job that skips with a
-notice until those three things are fixed; see the comment in
-`.github/workflows/ci.yml`.
+Typechecks the three workspaces, runs the vitest suites, and builds the widget and the
+portal with vite. All three ran green against an installed `web/node_modules` while this
+was written. The workspace is being edited continuously, so expect transient failures
+here in a way you should not expect from the Rust, Go and Python suites.
+
+**`npm ci` does not work yet, and that is structural rather than transient.**
+`web/package-lock.json` is out of sync with the workspaces — it predates
+`@sentinel/shared` and `@sentinel/portal` — so a clean install refuses to run at all. The
+fix is one command in `web/`, `npm install`, with the regenerated lockfile committed.
+Until that lands, the CI web job detects the out-of-sync lockfile and skips with a notice
+rather than failing. The guard is a real `npm ci --dry-run`, so the job starts enforcing
+by itself the moment the lockfile is fixed.
+
+### Advisory rather than gating
 
 `cargo fmt --check` currently reports diffs across most of the client tree. It runs in
 CI as an advisory step rather than a gate, because failing the build on formatting in a
 tree that several work streams are editing simultaneously would block unrelated work;
 drop `continue-on-error` from that step once a `cargo fmt` pass has landed. `cargo
-clippy` does gate, but without `-D warnings` — it currently reports a handful of
-warnings and exits zero.
+clippy` does gate, but without `-D warnings` — it reports a handful of warnings and exits
+zero, so add the flag when the tree is clean.
 
 ## What state each component is in
 
 The repository is under active development across several parallel work streams, so
 treat this as a snapshot rather than a fixed inventory. Everything below was read from
-the tree, not inferred; where something is a scaffold it says so.
+the tree at commit `3056427`, not inferred; where something is a scaffold it says so.
 
-**`contracts/`** — usable. `openapi.yaml` is a valid OpenAPI 3.1 document describing 25
-paths. `wire.md` specifies version 1 of the binary ingest protocol and is implemented on
-both sides. `schemas/` holds three JSON Schema 2020-12 documents: `analysis.json`,
-`judge.json` and `rule_set.json`. Two documented endpoints, `GET /v1/teams/{id}/live`
-and `POST /v1/compliance/exports`, are not yet routed by the gateway.
+**`contracts/`** — usable. `openapi.yaml` is a valid OpenAPI 3.1 document, and every
+path in it is currently routed by the gateway. `wire.md` specifies version 1 of the
+binary ingest protocol and is implemented on both sides; `/v1/ingest` is described there
+rather than in the OpenAPI document, which is the one place the two diverge. `schemas/`
+holds three JSON Schema 2020-12 documents — `analysis.json`, `judge.json` and
+`rule_set.json`. The CI contracts job checks that all of these parse and that the schemas
+are valid; nothing checks the contract against the implementation, so that agreement is
+maintained by hand.
 
 **`db/`** — the most complete part of the repository. Five migrations build the schema,
 enable row-level security on every tenant-scoped table, create the `sentinel_app` and
@@ -199,10 +219,11 @@ inside the adapter. `retention.py` and `coverage.py` implement the nightly purge
 CDR reconciliation arithmetic, both against `Protocol` interfaces with no concrete
 database implementation behind them yet, and neither is covered by a test.
 
-**`web/`** — in progress. `web/shared/` has the API client, the role capability map,
-money formatting in paise, and presentational components including the non-dismissible
-recording indicator. `web/widget/` and `web/portal/` contain a `tsconfig.json` and
-nothing else.
+**`web/`** — all three workspaces now exist and build. `web/shared/` holds the API
+client, the role capability map, money formatting in paise, and presentational components
+including the non-dismissible recording indicator; `web/widget/` and `web/portal/` are
+vite applications with their own vitest suites. The one outstanding problem is the
+out-of-sync lockfile described above.
 
 ## Documentation
 

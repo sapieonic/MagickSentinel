@@ -19,14 +19,16 @@ assumption recorded here is still not a decision.
 
 **Blocks:** Phase 1 start.
 
-**Status: settled in practice.** The client is built in Rust with `windows-rs`. See
-`client/Cargo.toml`, `client/sentinel-core/` and `client/sentinel-capture/`. The
-recommendation was Rust — a single static binary with no runtime dependency in the MSI,
-and one fewer question in the bank's security review — and that is what exists.
+**Status: settled in practice.** The client is built in Rust with `windows-rs`. The
+workspace at `client/Cargo.toml` has four members — `sentinel-core`,
+`sentinel-capture`, `sentinel-service` and `sentinel-agent` — and produces the
+`SentinelService` and `SentinelAgent` binaries. The recommendation was Rust for a single
+static binary with no runtime dependency in the MSI and one fewer question in the bank's
+security review, and that is what exists.
 
-Reversing this now means rewriting both crates, including the COM work under
-`client/sentinel-capture/src/windows/`. Treat it as decided unless something forces the
-question open again.
+Reversing this now means rewriting all four crates, including the COM work under
+`client/sentinel-capture/src/windows/` and `client/sentinel-service/src/windows/`. Treat
+it as decided unless something forces the question open again.
 
 **What would settle it formally:** a note in the architecture record confirming the
 choice. There is no outstanding evidence to gather.
@@ -44,8 +46,11 @@ Platform ID tokens against Google's JWKS
 from the verified claims. That works identically whether the upstream is a SAML
 federation to Entra ID or a password credential, so the build has not had to guess.
 
-What has not been built either way is the desktop PKCE login flow, so the practical
-consequences of this decision are still ahead.
+A PKCE implementation exists at `client/sentinel-agent/src/auth/pkce.rs`, though at the
+time of writing the agent crate's root is still a placeholder and does not compile it in.
+Either way, PKCE against Identity Platform is the same flow whether the upstream is
+federated or not, so this decision's practical consequences — provisioning,
+deprovisioning, MFA behaviour on a shared desktop — are still ahead.
 
 **What would settle it:** the identity provider inventory in
 `docs/phase-0-checklist.md` — the provider and tenant, whether agents have individual
@@ -99,9 +104,9 @@ position.
 
 **Blocks:** the Phase 1 MSI.
 
-**Working assumption:** none — there is no installer in the repository. `client/` has no
-WiX project and no widget shell, so neither the Evergreen bootstrapper nor a
-fixed-version runtime has been bundled.
+**Working assumption:** none. `client/installer/` exists as an empty directory — no WiX
+project — and there is no widget shell, so neither the Evergreen bootstrapper nor a
+fixed-version runtime has been bundled or even chosen between.
 
 The question is whether the Evergreen bootstrapper, which fetches the runtime from
 Microsoft at install time, is acceptable, or whether a fixed-version runtime has to ship
@@ -127,9 +132,13 @@ gateway returns both in the policy snapshot, and `blob.SegmentKey` partitions ob
 keys by day specifically so that a retention sweep can delete a day's audio by prefix
 rather than row by row (`server/gateway/internal/blob/blob.go`).
 
-Do not read those numbers as a decision. No purge job exists anywhere in the repository,
-so nothing is currently deleted on any schedule, and the numbers have never been tested
-against a real requirement.
+The purge job now exists too, at `server/pipeline/sentinel_pipeline/retention.py`. It
+reads the two periods per tenant rather than hard-coding them, which is the right shape
+for a value that is still open — but it runs against `Protocol` interfaces that nothing
+implements, nothing schedules it, and it has no tests.
+
+Do not read the two defaults as a decision. They have never been checked against a real
+requirement, and the code that would enforce them has never deleted anything.
 
 **What would settle it:** the bank client's retention requirement and the BPO's, which
 are often different, plus whatever the applicable RBI guidance requires for recovery-call
@@ -142,10 +151,14 @@ transcripts, and a single number for both is a sign the question was not really 
 
 **Blocks:** Phase 4, coverage reconciliation.
 
-**Working assumption:** none. `coverage_daily` exists in the schema with columns for
-dialer calls, captured calls, dialer minutes, captured minutes and a gap reason
-(`db/migrations/0001_init.up.sql`), and nothing populates it. There is no importer, no
-scheduled job, and no format assumed.
+**Working assumption:** no format is assumed, and that is deliberate.
+`coverage_daily` exists in the schema with columns for dialer calls, captured calls,
+dialer minutes, captured minutes and a gap reason
+(`db/migrations/0001_init.up.sql`). `server/pipeline/sentinel_pipeline/coverage.py`
+implements the reconciliation arithmetic behind a `CdrSource` protocol, with the
+docstring recording that the format and delivery differ per bank and that only the
+arithmetic belongs in that module. Nothing implements `CdrSource`, nothing populates
+`coverage_daily`, and the module has no tests.
 
 This one is worth pressing on early despite blocking a later phase. Coverage percentage
 against the dialer's own record of calls is the metric that turns tamper detection from
@@ -192,7 +205,7 @@ a way that only shows up when capture silently never arms.
 | OPEN-2 | Does the customer run Entra ID | Phase 1 | None; token verification is provider-agnostic |
 | OPEN-3 | Agent replay of own call audio | Phase 4 | Per-tenant flag, defaults to off |
 | OPEN-4 | Data residency | Phase 1 infra | India only, asserted in the OpenAPI server list; no infrastructure yet |
-| OPEN-5 | Air-gapped WebView2 path | Phase 1 MSI | None; no installer exists |
-| OPEN-6 | Audio and transcript retention | Phase 3 | Schema defaults of 30 and 365 days, explicitly placeholders; no purge job |
-| OPEN-7 | Dialer CDR export | Phase 4 | None; `coverage_daily` exists and is unpopulated |
+| OPEN-5 | Air-gapped WebView2 path | Phase 1 MSI | None; `client/installer/` is empty |
+| OPEN-6 | Audio and transcript retention | Phase 3 | Schema defaults of 30 and 365 days, explicitly placeholders; purge job written, unwired and untested |
+| OPEN-7 | Dialer CDR export | Phase 4 | No format assumed; reconciliation arithmetic written behind a `CdrSource` nothing implements |
 | OPEN-8 | Softphone names and UIA selectors | Phase 2 | Tenant config shape built; no worked example |

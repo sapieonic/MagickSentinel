@@ -559,3 +559,39 @@ func validFlagStatus(s string) bool {
 	}
 	return false
 }
+
+func (s *Server) createEvidenceExport(w http.ResponseWriter, r *http.Request) {
+	id := auth.MustFromContext(r.Context())
+	var body struct {
+		FlagIDs      []string `json:"flag_ids"`
+		IncludeAudio bool     `json:"include_audio"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.FlagIDs) == 0 {
+		httpx.WriteError(w, r, http.StatusBadRequest, "bad_request",
+			"at least one flag id is required")
+		return
+	}
+	if len(body.FlagIDs) > 500 {
+		httpx.WriteError(w, r, http.StatusBadRequest, "too_many",
+			"an evidence pack is capped at 500 flags")
+		return
+	}
+	if body.IncludeAudio {
+		policy, err := s.Store.PolicyForTenant(r.Context(), id.TenantID)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if !id.CanPlayAudio(policy.AllowAgentAudioPlayback) {
+			httpx.WriteError(w, r, http.StatusForbidden, "audio_forbidden",
+				"this role may not export call audio for this tenant")
+			return
+		}
+	}
+	job, err := s.Store.QueueEvidenceExport(r.Context(), id, body.FlagIDs, body.IncludeAudio)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusAccepted, job)
+}

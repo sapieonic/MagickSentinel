@@ -86,7 +86,7 @@ export function PostCallCard({ callId, endedAt, tier, api, onConfirm, onOpenPort
     const applyExtraction = (next: CallDetail) => {
       if (!touched.current.disposition && next.disposition) setDisposition(next.disposition);
       if (!touched.current.ptp && next.ptp) {
-        setPtpPresent(next.ptp.present === true);
+        setPtpPresent(next.ptp.present);
         const extracted = next.ptp.agent_amount_paise ?? next.ptp.amount_paise;
         if (extracted !== null && extracted !== undefined) setAmountInput(paiseToInputValue(extracted));
         const extractedDate = next.ptp.agent_due_date ?? next.ptp.due_date;

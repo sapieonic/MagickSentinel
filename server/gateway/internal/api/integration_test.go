@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,6 +103,8 @@ func newFixture(t *testing.T) *fixture {
 		Version: "test",
 		Now:     func() time.Time { return f.now },
 		CA:      devCA(t),
+		LiveTickets: api.NewLiveTickets(60 * time.Second),
+		LivePoll:    50 * time.Millisecond,
 		Verifier: &auth.Verifier{
 			Keys:     staticKeys{&priv.PublicKey},
 			Issuer:   "https://securetoken.google.com/sentinel-test",
@@ -869,5 +872,163 @@ func TestCrossTenantIsolationHoldsOnTheExplorer(t *testing.T) {
 	json.Unmarshal(body, &page)
 	if len(page.Items) != 0 {
 		t.Fatalf("a rival tenant's admin saw %d calls", len(page.Items))
+	}
+}
+
+// -------------------------------------------------- live view and exports
+
+func TestALiveTicketIsSingleUseAndTeamScoped(t *testing.T) {
+	f := newFixture(t)
+	token := f.token("sup-1", acmeTenant, auth.RoleSupervisor, teamNorth)
+
+	resp, body := f.do(http.MethodPost, "/v1/teams/"+teamNorth+"/live/ticket", token, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var minted struct {
+		Ticket string `json:"ticket"`
+	}
+	json.Unmarshal(body, &minted)
+	if minted.Ticket == "" {
+		t.Fatal("no ticket returned")
+	}
+
+	// A ticket for one team must not open another team's stream.
+	other := "aaaaaaaa-0000-0000-0000-0000000000ff"
+	resp, _ = f.do(http.MethodGet, "/v1/teams/"+other+"/live?ticket="+minted.Ticket, "", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("a ticket crossed teams: %d", resp.StatusCode)
+	}
+
+	// That attempt consumed it, so even the right team is now refused: a ticket is
+	// spent on presentation, not on success, so a leaked one cannot be replayed.
+	resp, _ = f.do(http.MethodGet, "/v1/teams/"+teamNorth+"/live?ticket="+minted.Ticket, "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a consumed ticket was accepted again: %d", resp.StatusCode)
+	}
+}
+
+func TestTheLiveStreamNeedsATicketAndNotABearerToken(t *testing.T) {
+	f := newFixture(t)
+	// A perfectly valid bearer token is not a substitute: the route is outside the
+	// authentication middleware precisely because EventSource cannot send one.
+	resp, _ := f.do(http.MethodGet, "/v1/teams/"+teamNorth+"/live",
+		f.token("sup-1", acmeTenant, auth.RoleSupervisor, teamNorth), nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without a ticket, got %d", resp.StatusCode)
+	}
+	resp, _ = f.do(http.MethodGet, "/v1/teams/"+teamNorth+"/live?ticket=forged", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a forged ticket was accepted: %d", resp.StatusCode)
+	}
+}
+
+func TestAnAgentCannotMintALiveTicket(t *testing.T) {
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodPost, "/v1/teams/"+teamNorth+"/live/ticket",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestTheLiveStreamEmitsInFlightCalls(t *testing.T) {
+	f := newFixture(t)
+	// One call still ingesting, and one stale ghost that must not appear.
+	if _, err := f.admin.Exec(context.Background(), `
+		INSERT INTO calls (id, tenant_id, device_id, user_uid, team_id, started_at,
+		                   capture_tier, status)
+		VALUES ('c0000000-0000-0000-0000-0000000000e1', $1,
+		        'dddddddd-0000-0000-0000-000000000001', 'agent-a', $2, $3, 'A', 'ingesting'),
+		       ('c0000000-0000-0000-0000-0000000000e2', $1,
+		        'dddddddd-0000-0000-0000-000000000001', 'agent-a', $2, $4, 'A', 'ingesting')`,
+		acmeTenant, teamNorth, f.now.Add(-2*time.Minute), f.now.Add(-6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	token := f.token("sup-1", acmeTenant, auth.RoleSupervisor, teamNorth)
+	_, body := f.do(http.MethodPost, "/v1/teams/"+teamNorth+"/live/ticket", token, nil)
+	var minted struct {
+		Ticket string `json:"ticket"`
+	}
+	json.Unmarshal(body, &minted)
+
+	req, _ := http.NewRequest(http.MethodGet,
+		f.server.URL+"/v1/teams/"+teamNorth+"/live?ticket="+minted.Ticket, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := f.server.Client().Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		t.Fatalf("content type %q, status %d, body %s", got, resp.StatusCode, b)
+	}
+
+	// Read just the first burst; the stream never ends on its own.
+	buf := make([]byte, 4096)
+	n, _ := resp.Body.Read(buf)
+	payload := string(buf[:n])
+	if !strings.Contains(payload, "c0000000-0000-0000-0000-0000000000e1") {
+		t.Fatalf("the in-flight call was not streamed: %q", payload)
+	}
+	if strings.Contains(payload, "c0000000-0000-0000-0000-0000000000e2") {
+		t.Fatal("a six-hour-old ingesting call is a ghost and must not appear on the floor view")
+	}
+}
+
+func TestEvidenceExportIsAuditedWithWhatWasRequested(t *testing.T) {
+	f := newFixture(t)
+	var flagID string
+	if err := f.admin.QueryRow(context.Background(),
+		`SELECT id::text FROM flags LIMIT 1`).Scan(&flagID); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := f.do(http.MethodPost, "/v1/compliance/exports",
+		f.token("qa-1", acmeTenant, auth.RoleQA, ""),
+		map[string]any{"flag_ids": []string{flagID}, "include_audio": true})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var job struct {
+		JobID  string `json:"job_id"`
+		Status string `json:"status"`
+	}
+	json.Unmarshal(body, &job)
+	if job.JobID == "" || job.Status != "queued" {
+		t.Fatalf("unexpected job: %s", body)
+	}
+
+	var detail []byte
+	if err := f.admin.QueryRow(context.Background(),
+		`SELECT detail FROM audit_log WHERE action = 'evidence.export'`).Scan(&detail); err != nil {
+		t.Fatalf("export not audited: %v", err)
+	}
+	if !strings.Contains(string(detail), flagID) || !strings.Contains(string(detail), "include_audio") {
+		t.Fatalf("the audit entry does not record what left the system: %s", detail)
+	}
+}
+
+func TestExportingAFlagOutsideScopeIsRefusedWithoutConfirmingItExists(t *testing.T) {
+	// Otherwise an export request doubles as an oracle for flag ids in other teams:
+	// ask for one, see whether the job is accepted.
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodPost, "/v1/compliance/exports",
+		f.token("qa-1", acmeTenant, auth.RoleQA, ""),
+		map[string]any{"flag_ids": []string{"ffffffff-0000-0000-0000-000000000001"}})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestAgentsCannotExportEvidence(t *testing.T) {
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodPost, "/v1/compliance/exports",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth),
+		map[string]any{"flag_ids": []string{"ffffffff-0000-0000-0000-000000000001"}})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
 	}
 }

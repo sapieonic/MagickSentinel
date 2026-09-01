@@ -33,11 +33,13 @@ import type {
   HealthResponse,
   Heartbeat,
   HeartbeatResponse,
+  LiveTicket,
   Policy,
   RuleSet,
   RuleSetDefinition,
   SessionResponse,
   Severity,
+  Team,
   User,
   UserUpdate,
 } from './types.js';
@@ -209,6 +211,30 @@ export class ApiClient {
     return this.#request('DELETE', '/v1/sessions/current', sig(signal));
   }
 
+  /* ----------------------------------------------------------------- calls */
+
+  /**
+   * The listing every role shares. What comes back is decided by row-level
+   * security from the verified token; the parameters only narrow it, so passing an
+   * id outside the caller's scope yields an empty page rather than someone else's
+   * calls.
+   */
+  listCalls(params: CallQuery = {}, signal?: AbortSignal): Promise<CallPage> {
+    return this.#request('GET', '/v1/calls', { query: params, ...sig(signal) });
+  }
+
+  /**
+   * One call at the caller's scope. Rejects with 404 — never 403 — when the call is
+   * outside it, so callers must not word a failure as "this call does not exist".
+   */
+  getCall(id: string, signal?: AbortSignal): Promise<CallDetail> {
+    return this.#request('GET', `/v1/calls/${encodeURIComponent(id)}`, sig(signal));
+  }
+
+  listTeams(signal?: AbortSignal): Promise<Team[]> {
+    return this.#request('GET', '/v1/teams', sig(signal));
+  }
+
   /* -------------------------------------------------------------------- me */
 
   listMyCalls(
@@ -273,12 +299,25 @@ export class ApiClient {
   }
 
   /**
-   * URL of the live-floor SSE stream. Returned rather than subscribed because
-   * `EventSource` cannot set an Authorization header; how the stream is
-   * authenticated is unresolved in the contract, so the caller owns that decision.
+   * Exchanges the bearer token for a ticket the SSE stream will accept. The ticket
+   * is single-use and short-lived, so mint one per connection attempt and never
+   * cache it.
    */
-  teamLiveUrl(teamId: string): string {
-    return `${this.#baseUrl}/v1/teams/${encodeURIComponent(teamId)}/live`;
+  createLiveTicket(teamId: string, signal?: AbortSignal): Promise<LiveTicket> {
+    return this.#request('POST', `/v1/teams/${encodeURIComponent(teamId)}/live/ticket`, sig(signal));
+  }
+
+  /**
+   * URL of the live-floor SSE stream. Built rather than subscribed because
+   * `EventSource` belongs to the caller's lifecycle, not the client's. The ticket
+   * travels in the query string precisely so the bearer token does not: a ticket in
+   * an access log is worthless a minute later, a token is not.
+   */
+  teamLiveUrl(teamId: string, ticket: string): string {
+    return (
+      `${this.#baseUrl}/v1/teams/${encodeURIComponent(teamId)}/live` +
+      `?ticket=${encodeURIComponent(ticket)}`
+    );
   }
 
   /* ------------------------------------------------------------ compliance */
@@ -349,6 +388,19 @@ export class ApiClient {
   ): Promise<AuditPage> {
     return this.#request('GET', '/v1/admin/audit', { query: params, ...sig(signal) });
   }
+}
+
+/** Query surface of GET /v1/calls. Every field narrows; none can widen. */
+export interface CallQuery {
+  from?: string | undefined;
+  to?: string | undefined;
+  user_uid?: string | undefined;
+  team_id?: string | undefined;
+  disposition?: Disposition | undefined;
+  has_flags?: boolean | undefined;
+  q?: string | undefined;
+  limit?: number | undefined;
+  cursor?: string | undefined;
 }
 
 /* --------------------------------------------------------------- internals */

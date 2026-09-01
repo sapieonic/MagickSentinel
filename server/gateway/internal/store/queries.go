@@ -508,3 +508,92 @@ func (s *Store) ListTeams(ctx context.Context, id *auth.Identity) ([]Team, error
 	})
 	return out, err
 }
+
+// LiveCallEvent is one row of the supervisor floor view.
+type LiveCallEvent struct {
+	CallID        string    `json:"call_id"`
+	UserUID       string    `json:"user_uid"`
+	DisplayName   string    `json:"display_name"`
+	State         string    `json:"state"`
+	StartedAt     time.Time `json:"started_at"`
+	ElapsedMS     int64     `json:"elapsed_ms"`
+	SentimentFar  *float64  `json:"sentiment_far"`
+	SentimentNear *float64  `json:"sentiment_near"`
+	Alert         *string   `json:"alert"`
+}
+
+// LiveCalls returns the calls currently in flight for a team.
+//
+// "In flight" means still ingesting and started within the last two hours. The
+// second condition matters: a call whose client died mid-upload never gets an
+// ended_at, and without the window those ghosts accumulate on the floor view until a
+// supervisor stops believing it.
+func (s *Store) LiveCalls(ctx context.Context, id *auth.Identity, teamID string, now time.Time) ([]LiveCallEvent, error) {
+	var out []LiveCallEvent
+	err := s.AsIdentity(ctx, id, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+SELECT c.id::text, c.user_uid, COALESCE(u.display_name, c.user_uid), c.status, c.started_at
+  FROM calls c
+  LEFT JOIN users u ON u.firebase_uid = c.user_uid
+ WHERE c.ended_at IS NULL
+   AND c.started_at > $2
+   AND ($1::uuid IS NULL OR c.team_id = $1)
+ ORDER BY c.started_at`, nullUUID(teamID), now.Add(-2*time.Hour))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e LiveCallEvent
+			if err := rows.Scan(&e.CallID, &e.UserUID, &e.DisplayName, &e.State,
+				&e.StartedAt); err != nil {
+				return err
+			}
+			e.ElapsedMS = now.Sub(e.StartedAt).Milliseconds()
+			// Live sentiment arrives with the streaming ASR path in phase 5. Until
+			// then the fields are null rather than zero: zero would render as
+			// neutral on a sparkline and read as a measurement.
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// EvidenceExport is a queued evidence-pack job.
+type EvidenceExport struct {
+	JobID       string  `json:"job_id"`
+	Status      string  `json:"status"`
+	DownloadURL *string `json:"download_url"`
+}
+
+// QueueEvidenceExport records the request and audits it.
+//
+// An evidence pack is call content leaving the system, so it is audited with the
+// exact flag ids requested and whether audio was included. "Who exported this
+// borrower's call" is a question a bank will ask, and it has to be answerable from
+// the audit log alone.
+func (s *Store) QueueEvidenceExport(ctx context.Context, id *auth.Identity, flagIDs []string,
+	includeAudio bool) (EvidenceExport, error) {
+	job := EvidenceExport{Status: "queued"}
+	err := s.AsIdentity(ctx, id, func(tx pgx.Tx) error {
+		// Confirm every flag is visible to this caller before promising a pack.
+		// Without it an export request doubles as an oracle for flag ids in other
+		// teams: ask for one, see whether the job is accepted.
+		var visible int
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM flags WHERE id = ANY($1::uuid[])`, flagIDs).Scan(&visible); err != nil {
+			return err
+		}
+		if visible != len(flagIDs) {
+			return ErrNotFound
+		}
+		if err := tx.QueryRow(ctx, `SELECT gen_random_uuid()::text`).Scan(&job.JobID); err != nil {
+			return err
+		}
+		return auditTx(ctx, tx, id, "evidence.export", "flag", job.JobID, map[string]any{
+			"flag_ids": flagIDs, "include_audio": includeAudio,
+		})
+	})
+	return job, err
+}

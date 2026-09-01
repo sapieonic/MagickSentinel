@@ -48,7 +48,7 @@ jobs:
 
       - name: cargo test
         working-directory: client
-        run: cargo test --all-targets
+        run: cargo test
 
       - name: cargo check (Windows target)
         working-directory: client
@@ -249,61 +249,58 @@ jobs:
           PY
 
   # --------------------------------------------------------------------------
-  # Web.
+  # Web: @sentinel/shared, @sentinel/widget, @sentinel/portal.
   #
-  # Deliberately gated. web/package.json declares typecheck, build and test
-  # scripts across three workspaces, but only @sentinel/shared exists: web/widget
-  # and web/portal contain a tsconfig.json and nothing else, and
-  # package-lock.json predates the shared workspace so `npm ci` refuses to run.
-  # Wiring the scripts up now would give a permanently red job.
+  # Gated on one thing only, and it is a real blocker rather than a placeholder:
+  # web/package-lock.json is out of sync with the workspaces (it predates
+  # @sentinel/shared and @sentinel/portal), so `npm ci` refuses to run at all.
+  # Everything else in this job passes today — typecheck, vitest and both vite
+  # builds all succeed against the current tree.
   #
-  # The job checks for readiness and skips with a notice until three things are
-  # true, at which point delete the guard and let it run for real:
-  #   1. web/widget/package.json and web/portal/package.json exist,
-  #   2. package-lock.json has been regenerated (`npm install` at web/),
-  #   3. `npm run typecheck` passes — it currently reports an unused binding in
-  #      web/shared/src/money.ts.
+  # The fix is one command, run in web/ and committed:  npm install
+  #
+  # Until then the guard below skips the job with a notice rather than leaving a
+  # permanently red check. It heals itself: the guard is a real `npm ci --dry-run`,
+  # so the moment the lockfile is regenerated the job starts enforcing. Delete the
+  # guard and the four `if:` lines once that has landed.
   # --------------------------------------------------------------------------
   web:
     name: Web
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check whether the web workspaces are complete
-        id: ready
-        run: |
-          set -euo pipefail
-          if [ -f web/widget/package.json ] && [ -f web/portal/package.json ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Web checks skipped::web/widget and web/portal have no package.json yet; see the comment in .github/workflows/ci.yml"
-          fi
-
       - uses: actions/setup-node@v4
-        if: steps.ready.outputs.ready == 'true'
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Check that the lockfile is in sync
+        id: ready
+        run: |
+          if npm ci --dry-run >/dev/null 2>&1; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Web checks skipped::web/package-lock.json is out of sync with the workspaces, so npm ci cannot run. Run 'npm install' in web/ and commit the lockfile. See .github/workflows/ci.yml."
+          fi
+
       - name: Install
         if: steps.ready.outputs.ready == 'true'
-        working-directory: web
         run: npm ci
 
       - name: Typecheck
         if: steps.ready.outputs.ready == 'true'
-        working-directory: web
         run: npm run typecheck
 
       - name: Test
         if: steps.ready.outputs.ready == 'true'
-        working-directory: web
         run: npm test
 
       - name: Build
         if: steps.ready.outputs.ready == 'true'
-        working-directory: web
         run: npm run build

@@ -127,8 +127,11 @@ export interface Policy {
   offline_grace_hours: number;
   idle_signout_minutes?: number;
   rules_version: number;
-  /** Tenant flag behind the two policy-gated cells of the role matrix. */
-  allow_agent_audio_playback?: boolean;
+  /**
+   * Tenant flag behind the two policy-gated cells of the role matrix. Required, so
+   * an absent flag can never be read as permission to play borrower audio.
+   */
+  allow_agent_audio_playback: boolean;
   retention: RetentionConfig;
   vad?: VadConfig;
 }
@@ -206,8 +209,12 @@ export interface DevicePage {
 
 /* ------------------------------------------------------------------ calls */
 
+/**
+ * Null when nothing was extracted. `present` is required whenever the object exists
+ * at all, so "no PTP" has exactly one representation instead of three.
+ */
 export interface Ptp {
-  present?: boolean;
+  present: boolean;
   amount_paise?: number | null;
   due_date?: string | null;
   confidence?: number;
@@ -223,7 +230,7 @@ export interface CallSummary {
   started_at: string;
   ended_at?: string | null;
   duration_ms?: number | null;
-  user_uid?: string;
+  user_uid: string;
   account_ref?: string | null;
   direction?: string | null;
   capture_tier: CaptureTier;
@@ -232,7 +239,7 @@ export interface CallSummary {
   summary?: string | null;
   ptp?: Ptp | null;
   sentiment_delta?: number | null;
-  flag_count?: number;
+  flag_count: number;
   max_severity?: Severity;
 }
 
@@ -359,6 +366,25 @@ export interface AgentStats {
 export interface TeamScorecards {
   median: AgentStats;
   agents: AgentStats[];
+}
+
+/**
+ * A team the caller may name. Membership reaches the browser only as one `team_id`
+ * claim, so this listing is the only way to put a name to a team id.
+ */
+export interface Team {
+  id: string;
+  name: string;
+}
+
+/**
+ * Single-use credential for the live SSE stream, valid for about a minute and
+ * scoped to one team. It is spent the moment the stream connects, so a reconnect
+ * needs a fresh one.
+ */
+export interface LiveTicket {
+  ticket: string;
+  expires_at: string;
 }
 
 export interface LiveCallEvent {
