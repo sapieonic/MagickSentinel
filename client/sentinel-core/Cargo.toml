@@ -18,6 +18,9 @@ ulid.workspace = true
 uuid.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [features]
 default = []
 # Production builds link SQLCipher instead of plain SQLite. Kept behind a feature so

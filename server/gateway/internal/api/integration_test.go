@@ -1,0 +1,722 @@
+package api_test
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/magickvoice/sentinel/server/gateway/internal/api"
+	"github.com/magickvoice/sentinel/server/gateway/internal/auth"
+	"github.com/magickvoice/sentinel/server/gateway/internal/store"
+)
+
+// These tests exercise the handlers against a real Postgres with the real row-level
+// security policies applied, because the isolation guarantees they check are enforced
+// by the database rather than by the Go code. Point SENTINEL_TEST_DATABASE_URL at a
+// database with db/migrations applied; db/test/pgtest.sh will build one.
+//
+// Skipped, not failed, when no database is available: a developer without one should
+// still be able to run the unit suite.
+
+const (
+	acmeTenant  = "11111111-1111-1111-1111-111111111111"
+	rivalTenant = "22222222-2222-2222-2222-222222222222"
+	teamNorth   = "aaaaaaaa-0000-0000-0000-000000000001"
+)
+
+type fixture struct {
+	t *testing.T
+	// pool is the application connection: role sentinel_app, NOBYPASSRLS. Every
+	// assertion about what a caller can see runs through it.
+	pool *pgxpool.Pool
+	// admin is the owner connection, used only to seed and to read back rows the
+	// application role is correctly forbidden from reading.
+	admin    *pgxpool.Pool
+	store    *store.Store
+	server   *httptest.Server
+	priv     *rsa.PrivateKey
+	now      time.Time
+	deviceID string
+}
+
+type staticKeys struct{ key *rsa.PublicKey }
+
+func (s staticKeys) Key(context.Context, string) (*rsa.PublicKey, error) { return s.key, nil }
+
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	dsn := os.Getenv("SENTINEL_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SENTINEL_TEST_DATABASE_URL not set; run via db/test/pgtest.sh")
+	}
+	adminDSN := os.Getenv("SENTINEL_TEST_ADMIN_DATABASE_URL")
+	if adminDSN == "" {
+		t.Skip("SENTINEL_TEST_ADMIN_DATABASE_URL not set; run via db/test/gateway_it.sh")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	admin, err := pgxpool.New(ctx, adminDSN)
+	if err != nil {
+		t.Fatalf("connect as owner: %v", err)
+	}
+	t.Cleanup(admin.Close)
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fixture{
+		t: t, pool: pool, admin: admin, store: store.New(pool), priv: priv,
+		now: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC),
+	}
+	f.seed(ctx)
+
+	srv := &api.Server{
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Store:   f.store,
+		Version: "test",
+		Now:     func() time.Time { return f.now },
+		CA:      devCA(t),
+		Verifier: &auth.Verifier{
+			Keys:     staticKeys{&priv.PublicKey},
+			Issuer:   "https://securetoken.google.com/sentinel-test",
+			Audience: "sentinel-test",
+			Leeway:   time.Minute,
+			Now:      func() time.Time { return f.now },
+		},
+	}
+	f.server = httptest.NewServer(srv.Routes())
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+func (f *fixture) seed(ctx context.Context) {
+	f.t.Helper()
+	stmts := []string{
+		`TRUNCATE audit_log, device_events, flags, ptps, analyses, transcripts,
+		          ingest_watermarks, media_segments, calls, devices, enrollment_tokens,
+		          rule_sets, users, teams, tenants RESTART IDENTITY CASCADE`,
+		fmt.Sprintf(`INSERT INTO tenants (id, name, idp_tenant_id, allow_agent_audio_playback)
+		     VALUES ('%s','Acme BPO','acme',false), ('%s','Rival BPO','rival',true)`, acmeTenant, rivalTenant),
+		fmt.Sprintf(`INSERT INTO teams (id, tenant_id, name) VALUES ('%s','%s','North')`, teamNorth, acmeTenant),
+		fmt.Sprintf(`INSERT INTO users (firebase_uid, tenant_id, role, team_id, display_name) VALUES
+		     ('agent-a','%[1]s','agent','%[2]s','Agent A'),
+		     ('agent-b','%[1]s','agent','%[2]s','Agent B'),
+		     ('sup-1','%[1]s','supervisor','%[2]s','Sup One'),
+		     ('qa-1','%[1]s','qa',NULL,'QA One'),
+		     ('admin-1','%[1]s','admin',NULL,'Admin One'),
+		     ('rival-admin','%[3]s','admin',NULL,'Rival Admin')`, acmeTenant, teamNorth, rivalTenant),
+		fmt.Sprintf(`INSERT INTO devices (id, tenant_id, machine_guid, hw_fingerprint,
+		            cert_fingerprint, os_build, capture_tier, agent_version)
+		     VALUES ('dddddddd-0000-0000-0000-000000000001','%s','mg-1','hw-1','cf-1',
+		             '10.0.22631','A','1.0.0')`, acmeTenant),
+		fmt.Sprintf(`INSERT INTO calls (id, tenant_id, device_id, user_uid, team_id, started_at,
+		            ended_at, duration_ms, capture_tier, status, account_ref)
+		     VALUES ('c0000000-0000-0000-0000-00000000000a','%[1]s',
+		             'dddddddd-0000-0000-0000-000000000001','agent-a','%[2]s',
+		             '2026-09-01T10:00:00Z','2026-09-01T10:05:00Z',300000,'A','complete','LN-1'),
+		            ('c0000000-0000-0000-0000-00000000000b','%[1]s',
+		             'dddddddd-0000-0000-0000-000000000001','agent-b','%[2]s',
+		             '2026-09-01T11:00:00Z','2026-09-01T11:04:00Z',240000,'A','complete','LN-2')`,
+			acmeTenant, teamNorth),
+		fmt.Sprintf(`INSERT INTO analyses (call_id, tenant_id, prompt_version, model, summary,
+		            disposition, sentiment, talk_ratio, interruptions)
+		     VALUES ('c0000000-0000-0000-0000-00000000000a','%[1]s','v1','test',
+		             'Borrower agreed to pay.','ptp',
+		             '{"far":[],"near":[],"far_open":-0.1,"far_close":-0.4,"delta":-0.3}'::jsonb,0.6,2),
+		            ('c0000000-0000-0000-0000-00000000000b','%[1]s','v1','test',
+		             'Borrower disputed the amount.','dispute',
+		             '{"far":[],"near":[],"far_open":0.0,"far_close":-0.2,"delta":-0.2}'::jsonb,0.7,5)`,
+			acmeTenant),
+		fmt.Sprintf(`INSERT INTO ptps (tenant_id, call_id, amount_paise, due_date, confidence)
+		     VALUES ('%s','c0000000-0000-0000-0000-00000000000a',1500000,'2026-09-15',0.86)`, acmeTenant),
+		fmt.Sprintf(`INSERT INTO flags (tenant_id, call_id, rule_id, rule_set_version, severity, tier,
+		            span_start_ms, span_end_ms, evidence_text)
+		     VALUES ('%[1]s','c0000000-0000-0000-0000-00000000000b','false_legal_threat',1,
+		             'critical',1,92100,98400,'we will file a police case')`, acmeTenant),
+		fmt.Sprintf(`INSERT INTO rule_sets (tenant_id, version, definition, active, created_by)
+		     SELECT '%s', 1, definition, true, 'system' FROM default_rule_set WHERE version = 1`, acmeTenant),
+	}
+	for _, s := range stmts {
+		if _, err := f.admin.Exec(ctx, s); err != nil {
+			f.t.Fatalf("seed: %v\n%s", err, s)
+		}
+	}
+}
+
+func (f *fixture) token(uid, tenant string, role auth.Role, team string) string {
+	f.t.Helper()
+	c := &auth.Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   uid,
+			Issuer:    "https://securetoken.google.com/sentinel-test",
+			Audience:  jwt.ClaimStrings{"sentinel-test"},
+			ExpiresAt: jwt.NewNumericDate(f.now.Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(f.now),
+		},
+		TenantID: tenant, Role: role, TeamID: team,
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, c)
+	tok.Header["kid"] = "test-key"
+	s, err := tok.SignedString(f.priv)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return s
+}
+
+func (f *fixture) do(method, path, token string, body any) (*http.Response, []byte) {
+	f.t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		rdr = bytesReader(b)
+	}
+	req, err := http.NewRequest(method, f.server.URL+path, rdr)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := f.server.Client().Do(req)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp, out
+}
+
+func bytesReader(b []byte) io.Reader { return io.NopCloser(readerOf(b)) }
+
+type readerOf []byte
+
+func (r readerOf) Read(p []byte) (int, error) {
+	if len(r) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r)
+	return n, nil
+}
+
+func devCA(t *testing.T) *api.DevCA {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Sentinel Dev CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(2, 0, 0),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, _ := x509.ParseCertificate(der)
+	pemStr := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	return api.NewDevCA(cert, key, pemStr)
+}
+
+// -------------------------------------------------------------------- tests
+
+func TestAgentSeesOnlyOwnCalls(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/me/calls", f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var page struct {
+		Items []struct {
+			ID      string `json:"id"`
+			UserUID string `json:"user_uid"`
+			Summary string `json:"summary"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("agent saw %d calls, want 1: %s", len(page.Items), body)
+	}
+	if page.Items[0].UserUID != "agent-a" {
+		t.Fatalf("agent saw another agent's call: %s", body)
+	}
+}
+
+func TestAgentCannotReadAnotherAgentsCallById(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/me/calls/c0000000-0000-0000-0000-00000000000b",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestTheMeNamespaceRefusesASuppliedUid(t *testing.T) {
+	// The desktop binary must not be repointable at another agent's data. The
+	// middleware refuses the request outright rather than trusting handlers to
+	// ignore the parameter.
+	f := newFixture(t)
+	for _, q := range []string{"?user_uid=agent-b", "?uid=agent-b", "?as_user=agent-b"} {
+		resp, body := f.do(http.MethodGet, "/v1/me/calls"+q,
+			f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", q, resp.StatusCode, body)
+		}
+	}
+}
+
+func TestCrossTenantAccessReturnsNothing(t *testing.T) {
+	f := newFixture(t)
+	// A rival tenant's admin, with a perfectly valid token, asking for a call by id.
+	resp, body := f.do(http.MethodGet, "/v1/me/calls/c0000000-0000-0000-0000-00000000000a",
+		f.token("rival-admin", rivalTenant, auth.RoleAdmin, ""), nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestQaSeesTheWholeTenantAndSupervisorSeesTheTeam(t *testing.T) {
+	f := newFixture(t)
+	for _, c := range []struct {
+		uid  string
+		role auth.Role
+		team string
+		want int
+	}{
+		{"qa-1", auth.RoleQA, "", 2},
+		{"sup-1", auth.RoleSupervisor, teamNorth, 2},
+	} {
+		resp, body := f.do(http.MethodGet, "/v1/teams/"+teamNorth+"/calls",
+			f.token(c.uid, acmeTenant, c.role, c.team), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status %d: %s", c.uid, resp.StatusCode, body)
+		}
+		var page struct{ Items []json.RawMessage }
+		json.Unmarshal(body, &page)
+		if len(page.Items) != c.want {
+			t.Fatalf("%s saw %d calls, want %d", c.uid, len(page.Items), c.want)
+		}
+	}
+}
+
+func TestAgentIsRefusedTeamAndAdminRoutes(t *testing.T) {
+	f := newFixture(t)
+	token := f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth)
+	for _, path := range []string{
+		"/v1/teams/" + teamNorth + "/calls",
+		"/v1/compliance/flags",
+		"/v1/admin/devices",
+		"/v1/admin/rules",
+		"/v1/admin/audit",
+	} {
+		resp, _ := f.do(http.MethodGet, path, token, nil)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: expected 403 for an agent, got %d", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestUnauthenticatedRequestsAreRejected(t *testing.T) {
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodGet, "/v1/me/calls", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+	resp, _ = f.do(http.MethodGet, "/v1/me/calls", "not-a-token", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestDeviceScopedRoutesRequireACertificate(t *testing.T) {
+	// A valid user token alone must not be enough to read a tenant's capture
+	// configuration; the endpoint has to prove it is an enrolled device.
+	f := newFixture(t)
+	token := f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth)
+	for _, path := range []string{"/v1/policy", "/v1/heartbeat"} {
+		method := http.MethodGet
+		if path == "/v1/heartbeat" {
+			method = http.MethodPost
+		}
+		resp, _ := f.do(method, path, token, map[string]any{})
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: expected 403 without a device certificate, got %d", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestComplianceQueueAndFlagResolution(t *testing.T) {
+	f := newFixture(t)
+	token := f.token("qa-1", acmeTenant, auth.RoleQA, "")
+	resp, body := f.do(http.MethodGet, "/v1/compliance/flags?severity=critical", token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var list struct {
+		Items []struct {
+			ID           string `json:"id"`
+			RuleID       string `json:"rule_id"`
+			EvidenceText string `json:"evidence_text"`
+			SpanStartMS  int    `json:"span_start_ms"`
+		} `json:"items"`
+	}
+	json.Unmarshal(body, &list)
+	if len(list.Items) != 1 || list.Items[0].RuleID != "false_legal_threat" {
+		t.Fatalf("unexpected queue: %s", body)
+	}
+	if list.Items[0].EvidenceText == "" || list.Items[0].SpanStartMS == 0 {
+		t.Fatal("a flag must carry the span a reviewer can trace it to")
+	}
+
+	resp, body = f.do(http.MethodPatch, "/v1/compliance/flags/"+list.Items[0].ID, token,
+		map[string]any{"status": "upheld", "reviewer_uid": "qa-1", "note": "clear violation"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var updated struct {
+		Status     string `json:"status"`
+		ResolvedAt string `json:"resolved_at"`
+	}
+	json.Unmarshal(body, &updated)
+	if updated.Status != "upheld" || updated.ResolvedAt == "" {
+		t.Fatalf("flag not resolved: %s", body)
+	}
+}
+
+func TestAgentCanRespondToAFlagOnTheirOwnCall(t *testing.T) {
+	f := newFixture(t)
+	var flagID string
+	if err := f.admin.QueryRow(context.Background(),
+		`SELECT id::text FROM flags LIMIT 1`).Scan(&flagID); err != nil {
+		t.Fatal(err)
+	}
+	// The flag is on agent-b's call, so agent-a must not reach it.
+	resp, _ := f.do(http.MethodPost, "/v1/me/flags/"+flagID+"/respond",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth),
+		map[string]any{"response": "not mine"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("agent-a reached another agent's flag: %d", resp.StatusCode)
+	}
+	// agent-b can.
+	resp, body := f.do(http.MethodPost, "/v1/me/flags/"+flagID+"/respond",
+		f.token("agent-b", acmeTenant, auth.RoleAgent, teamNorth),
+		map[string]any{"response": "I was quoting the notice, not threatening."})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestConfirmingACallRecordsTheAgentCorrectionWithoutLosingTheModelValue(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodPost, "/v1/me/calls/c0000000-0000-0000-0000-00000000000a/confirm",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth),
+		map[string]any{
+			"disposition": "ptp", "ptp_present": true,
+			"ptp_amount_paise": 1200000, "ptp_due_date": "2026-09-20",
+		})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var model, agent *int64
+	if err := f.admin.QueryRow(context.Background(),
+		`SELECT amount_paise, agent_amount_paise FROM ptps
+		  WHERE call_id = 'c0000000-0000-0000-0000-00000000000a'`).Scan(&model, &agent); err != nil {
+		t.Fatal(err)
+	}
+	if model == nil || *model != 1500000 {
+		t.Fatalf("the model's extraction was overwritten: %v", model)
+	}
+	if agent == nil || *agent != 1200000 {
+		t.Fatalf("the agent's correction was not recorded: %v", agent)
+	}
+}
+
+func TestConfirmRejectsRupeeShapedAmounts(t *testing.T) {
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodPost, "/v1/me/calls/c0000000-0000-0000-0000-00000000000a/confirm",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth),
+		map[string]any{"disposition": "ptp", "ptp_present": true, "ptp_amount_paise": -1})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a negative amount, got %d", resp.StatusCode)
+	}
+	resp, _ = f.do(http.MethodPost, "/v1/me/calls/c0000000-0000-0000-0000-00000000000a/confirm",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth),
+		map[string]any{"disposition": "not_a_disposition"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown disposition, got %d", resp.StatusCode)
+	}
+}
+
+func TestReadingACallIsAudited(t *testing.T) {
+	// "Who listened to this borrower's call" has to be answerable, so reads are
+	// audited and not only writes.
+	f := newFixture(t)
+	f.do(http.MethodGet, "/v1/me/calls/c0000000-0000-0000-0000-00000000000a",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+
+	var n int
+	if err := f.admin.QueryRow(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE action = 'call.read' AND actor_uid = 'agent-a'`).
+		Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected one call.read audit entry, got %d", n)
+	}
+}
+
+func TestPublishingRulesCreatesANewVersionRatherThanMutating(t *testing.T) {
+	f := newFixture(t)
+	token := f.token("admin-1", acmeTenant, auth.RoleAdmin, "")
+
+	resp, body := f.do(http.MethodPut, "/v1/admin/rules", token, map[string]any{
+		"judge_sample_pct": 10,
+		"rules": []map[string]any{
+			{"rule_id": "abusive_language", "enabled": true, "severity": "critical"},
+		},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var rs struct {
+		Version int  `json:"version"`
+		Active  bool `json:"active"`
+	}
+	json.Unmarshal(body, &rs)
+	if rs.Version != 2 || !rs.Active {
+		t.Fatalf("expected an active version 2, got %+v", rs)
+	}
+
+	var versions int
+	f.admin.QueryRow(context.Background(),
+		`SELECT count(*) FROM rule_sets WHERE tenant_id = $1`, acmeTenant).Scan(&versions)
+	if versions != 2 {
+		t.Fatalf("version 1 was mutated away; %d versions remain", versions)
+	}
+	var activeCount int
+	f.admin.QueryRow(context.Background(),
+		`SELECT count(*) FROM rule_sets WHERE tenant_id = $1 AND active`, acmeTenant).Scan(&activeCount)
+	if activeCount != 1 {
+		t.Fatalf("expected exactly one active rule set, got %d", activeCount)
+	}
+}
+
+func TestAgentCannotReadRawRuleDefinitions(t *testing.T) {
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodGet, "/v1/admin/rules",
+		f.token("agent-a", acmeTenant, auth.RoleAgent, teamNorth), nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestFleetViewReportsTierDistribution(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/admin/devices",
+		f.token("admin-1", acmeTenant, auth.RoleAdmin, ""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var fleet struct {
+		Items            []json.RawMessage `json:"items"`
+		TierDistribution map[string]int    `json:"tier_distribution"`
+	}
+	json.Unmarshal(body, &fleet)
+	if len(fleet.Items) != 1 || fleet.TierDistribution["A"] != 1 {
+		t.Fatalf("unexpected fleet: %s", body)
+	}
+}
+
+func TestRevokingADeviceMarksItRevokedAndAudits(t *testing.T) {
+	f := newFixture(t)
+	token := f.token("admin-1", acmeTenant, auth.RoleAdmin, "")
+	resp, body := f.do(http.MethodPost,
+		"/v1/admin/devices/dddddddd-0000-0000-0000-000000000001/revoke", token,
+		map[string]any{"reason": "laptop left the building"})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var status string
+	f.admin.QueryRow(context.Background(),
+		`SELECT status FROM devices WHERE id = 'dddddddd-0000-0000-0000-000000000001'`).Scan(&status)
+	if status != "revoked" {
+		t.Fatalf("device status is %q", status)
+	}
+	var n int
+	f.admin.QueryRow(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE action = 'device.revoke'`).Scan(&n)
+	if n != 1 {
+		t.Fatalf("revocation not audited (%d entries)", n)
+	}
+}
+
+func TestEnrollmentTokensAreSingleUseAndStoredHashed(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodPost, "/v1/admin/enrollment-tokens",
+		f.token("admin-1", acmeTenant, auth.RoleAdmin, ""), nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var minted struct {
+		Token string `json:"token"`
+	}
+	json.Unmarshal(body, &minted)
+	if minted.Token == "" {
+		t.Fatal("no token returned")
+	}
+
+	// The plaintext must not be recoverable from the database.
+	var stored string
+	f.admin.QueryRow(context.Background(),
+		`SELECT token_hash FROM enrollment_tokens LIMIT 1`).Scan(&stored)
+	if stored == minted.Token {
+		t.Fatal("the enrollment token is stored in plaintext")
+	}
+	if stored != store.HashEnrollmentToken(minted.Token) {
+		t.Fatal("stored hash does not match the issued token")
+	}
+
+	ctx := context.Background()
+	tenant, err := f.store.ConsumeEnrollmentToken(ctx, minted.Token, f.now)
+	if err != nil || tenant != acmeTenant {
+		t.Fatalf("first use failed: %v (tenant %q)", err, tenant)
+	}
+	if _, err := f.store.ConsumeEnrollmentToken(ctx, minted.Token, f.now); err == nil {
+		t.Fatal("a consumed enrollment token was accepted a second time")
+	}
+	// An expired token is refused too.
+	if _, err := f.store.ConsumeEnrollmentToken(ctx, minted.Token, f.now.Add(48*time.Hour)); err == nil {
+		t.Fatal("an expired token was accepted")
+	}
+}
+
+func TestEnrollmentIssuesACertificateForAValidCsr(t *testing.T) {
+	f := newFixture(t)
+	_, body := f.do(http.MethodPost, "/v1/admin/enrollment-tokens",
+		f.token("admin-1", acmeTenant, auth.RoleAdmin, ""), nil)
+	var minted struct {
+		Token string `json:"token"`
+	}
+	json.Unmarshal(body, &minted)
+
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: "mg-2"}}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+
+	resp, body := f.do(http.MethodPost, "/v1/devices/enroll", "", map[string]any{
+		"enrollment_token": minted.Token, "csr_pem": csrPEM,
+		"machine_guid": "mg-2", "hw_fingerprint": "hw-2",
+		"os_build": "10.0.19045", "capture_tier": "B", "agent_version": "1.0.0",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var issued struct {
+		DeviceID       string `json:"device_id"`
+		CertificatePEM string `json:"certificate_pem"`
+	}
+	json.Unmarshal(body, &issued)
+	if issued.DeviceID == "" || issued.CertificatePEM == "" {
+		t.Fatalf("incomplete enrollment response: %s", body)
+	}
+	// The device is now resolvable by the fingerprint of the certificate we issued,
+	// which is how mTLS will identify it on the next connection.
+	blk, _ := pem.Decode([]byte(issued.CertificatePEM))
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceID, tenantID, status, err := f.store.DeviceByCertFingerprint(
+		context.Background(), auth.CertFingerprint(cert))
+	if err != nil {
+		t.Fatalf("device not resolvable by certificate: %v", err)
+	}
+	if deviceID != issued.DeviceID || tenantID != acmeTenant || status != "active" {
+		t.Fatalf("device row wrong: %s / %s / %s", deviceID, tenantID, status)
+	}
+}
+
+func TestEnrollmentRejectsTierCMachines(t *testing.T) {
+	f := newFixture(t)
+	resp, _ := f.do(http.MethodPost, "/v1/devices/enroll", "", map[string]any{
+		"enrollment_token": "x", "csr_pem": "x", "machine_guid": "mg",
+		"hw_fingerprint": "hw", "capture_tier": "C",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a machine with no supported capture path must not enrol: %d", resp.StatusCode)
+	}
+}
+
+func TestScorecardsReportAMedianAndNoRanking(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/v1/teams/"+teamNorth+"/scorecards",
+		f.token("sup-1", acmeTenant, auth.RoleSupervisor, teamNorth), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var out struct {
+		Median struct {
+			DisplayName string `json:"display_name"`
+		} `json:"median"`
+		Agents []struct {
+			DisplayName string `json:"display_name"`
+		} `json:"agents"`
+	}
+	json.Unmarshal(body, &out)
+	if out.Median.DisplayName != "Team median" {
+		t.Fatalf("no median returned: %s", body)
+	}
+	if len(out.Agents) != 2 {
+		t.Fatalf("expected two agents, got %d", len(out.Agents))
+	}
+	// Alphabetical, not by performance: the response carries no ranking signal.
+	if out.Agents[0].DisplayName > out.Agents[1].DisplayName {
+		t.Fatal("scorecards are ordered by performance, which invites a leaderboard")
+	}
+}
+
+func TestHealthzNeedsNoCredentials(t *testing.T) {
+	f := newFixture(t)
+	resp, body := f.do(http.MethodGet, "/healthz", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}
