@@ -18,7 +18,7 @@
 
 use crate::ipc::codec::{self, FrameReader, Request, Response, MAX_FRAME_BYTES, PIPE_NAME, PIPE_SDDL};
 use std::io::{Read, Write};
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, LocalFree, HLOCAL,
 };
@@ -81,7 +81,7 @@ impl Drop for PipeSecurity {
     fn drop(&mut self) {
         if !self.descriptor.is_invalid() {
             unsafe {
-                let _ = LocalFree(Some(HLOCAL(self.descriptor.0)));
+                let _ = LocalFree(HLOCAL(self.descriptor.0));
             }
         }
     }
@@ -89,6 +89,12 @@ impl Drop for PipeSecurity {
 
 /// A connected pipe instance, closed on drop.
 struct PipeInstance(HANDLE);
+
+// `HANDLE` is a raw pointer, so it is not `Send` by default, but a kernel handle is
+// process-wide and safe to use from any thread. The invariant that makes this sound
+// is ownership: exactly one `PipeInstance` exists per handle and it is moved — never
+// shared — into the thread that services the connection.
+unsafe impl Send for PipeInstance {}
 
 impl Drop for PipeInstance {
     fn drop(&mut self) {
@@ -135,7 +141,7 @@ pub fn serve<H: RequestHandler>(
     let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
 
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        let mut attrs = security.attributes();
+        let attrs = security.attributes();
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
@@ -148,7 +154,7 @@ pub fn serve<H: RequestHandler>(
                 PIPE_BUFFER,
                 PIPE_BUFFER,
                 0,
-                Some(&mut attrs),
+                Some(&attrs),
             )
         };
         if handle.is_invalid() {

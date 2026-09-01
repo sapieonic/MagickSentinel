@@ -105,10 +105,16 @@ pub fn staging_path(root: &Path, version: &str) -> PathBuf {
     // The version is interpolated into a path, so it must not be able to escape the
     // staging directory. The manifest comes from the server over TLS, but "trusted
     // input" is exactly how directory traversal gets shipped.
-    let safe: String = version
+    let mut safe: String = version
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
         .collect();
+    // Filtering out the separators is not enough on its own: `..` survives it, and
+    // while a name with no separator cannot traverse today, a later caller that joins
+    // this onto another path component would inherit the problem.
+    while safe.contains("..") {
+        safe = safe.replace("..", ".");
+    }
     root.join(format!("SentinelAgent-{safe}.msi"))
 }
 

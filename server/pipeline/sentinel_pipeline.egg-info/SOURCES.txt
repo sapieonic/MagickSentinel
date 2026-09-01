@@ -1,7 +1,11 @@
+README.md
 pyproject.toml
 sentinel_pipeline/__init__.py
+sentinel_pipeline/consumer.py
 sentinel_pipeline/cost.py
+sentinel_pipeline/coverage.py
 sentinel_pipeline/models.py
+sentinel_pipeline/retention.py
 sentinel_pipeline/worker.py
 sentinel_pipeline.egg-info/PKG-INFO
 sentinel_pipeline.egg-info/SOURCES.txt
@@ -17,6 +21,13 @@ sentinel_pipeline/compliance/__init__.py
 sentinel_pipeline/compliance/engine.py
 sentinel_pipeline/compliance/judge.py
 sentinel_pipeline/providers/__init__.py
+sentinel_pipeline/providers/anthropic.py
+sentinel_pipeline/providers/base.py
 sentinel_pipeline/providers/fake.py
+sentinel_pipeline/providers/openai.py
+sentinel_pipeline/providers/sarvam.py
+sentinel_pipeline/providers/whisper.py
 tests/test_analysis.py
+tests/test_judge_and_cost.py
 tests/test_rule_engine.py
+tests/test_worker.py

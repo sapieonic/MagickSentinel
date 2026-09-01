@@ -46,7 +46,14 @@ export async function resolveHost(waitMs = HOST_WAIT_MS): Promise<ResolvedHost> 
     if (Date.now() >= deadline) break;
     await new Promise((resolve) => setTimeout(resolve, HOST_POLL_MS));
   }
-  return { host: new MockSentinelHost(), native: false };
+  const mock = new MockSentinelHost();
+  // Exposed only in a dev build so a developer can drive the states from the
+  // console (`__sentinelMock.simulateCall()`); the production bundle has no handle
+  // on the host object at all.
+  if (import.meta.env?.DEV) {
+    (globalThis as unknown as { __sentinelMock?: MockSentinelHost }).__sentinelMock = mock;
+  }
+  return { host: mock, native: false };
 }
 
 /**

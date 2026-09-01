@@ -42,6 +42,10 @@ pub struct AgentProcess {
     pub pid: u32,
 }
 
+// The handles are owned solely by this value and only ever used through `&self`, so
+// moving one to another thread is sound even though `HANDLE` is a raw pointer.
+unsafe impl Send for AgentProcess {}
+
 impl AgentProcess {
     /// Has the process exited?
     pub fn has_exited(&self) -> bool {
@@ -99,7 +103,7 @@ pub fn launch_agent(session_id: u32, exe_path: &str) -> windows::core::Result<Ag
         // `false`: do not inherit the service's environment. The point of the block
         // is the user's profile variables, and merging SYSTEM's in would reintroduce
         // exactly the wrong %APPDATA%.
-        CreateEnvironmentBlock(&mut env, Some(token.0), false)?;
+        CreateEnvironmentBlock(&mut env, token.0, false)?;
         let env = EnvBlock(env);
 
         // CreateProcessAsUserW may modify the command line in place, so it must be a
@@ -113,7 +117,7 @@ pub fn launch_agent(session_id: u32, exe_path: &str) -> windows::core::Result<Ag
             .chain(std::iter::once(0))
             .collect();
 
-        let mut si = STARTUPINFOW {
+        let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             lpDesktop: PWSTR(desktop.as_mut_ptr()),
             ..Default::default()
@@ -121,9 +125,9 @@ pub fn launch_agent(session_id: u32, exe_path: &str) -> windows::core::Result<Ag
         let mut pi = PROCESS_INFORMATION::default();
 
         CreateProcessAsUserW(
-            Some(token.0),
+            token.0,
             None,
-            Some(PWSTR(cmdline.as_mut_ptr())),
+            PWSTR(cmdline.as_mut_ptr()),
             None,
             None,
             false,

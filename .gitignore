@@ -25,3 +25,5 @@ venv/
 spool.db
 client/target/
 .venv-dev/
+web/node_modules/
+web/*/dist/

@@ -1,0 +1,67 @@
+[package]
+name = "sentinel-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "User-session process: PKCE login, WASAPI capture, call detection, Opus encoding, spool, WSS uplink and the WebView2 widget shell."
+
+# Library plus binary: the binary is a thin `main` and everything worth testing lives
+# in the library, where integration tests can reach it.
+[lib]
+name = "sentinel_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "SentinelAgent"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }
+sentinel-capture = { path = "../sentinel-capture" }
+# For the IPC codec and the device identity: one definition each, shared by both
+# processes rather than two that can drift.
+sentinel-service = { path = "../sentinel-service" }
+
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+ulid.workspace = true
+sha2.workspace = true
+base64.workspace = true
+tungstenite.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+ureq.workspace = true
+audiopus.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# `windows-core` is a direct dependency because the `#[implement]` macro expands to
+# paths rooted at that crate, not at `windows::core`.
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+hound.workspace = true

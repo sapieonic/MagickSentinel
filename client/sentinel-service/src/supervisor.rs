@@ -228,9 +228,11 @@ mod tests {
         }
         assert_eq!(s.restarts(), 3);
 
-        s.poll(now + COUNTER_RESET_MS - 1);
+        // The reset is measured from the supervisor's epoch, not from the last crash.
+        assert!(now < COUNTER_RESET_MS - 1);
+        s.poll(COUNTER_RESET_MS - 1);
         assert_eq!(s.restarts(), 3, "the counter holds until a full day has passed");
-        s.poll(now + COUNTER_RESET_MS);
+        s.poll(COUNTER_RESET_MS);
         assert_eq!(s.restarts(), 0);
     }
 

@@ -72,8 +72,12 @@ export function PostCallCard({ callId, endedAt, tier, api, onConfirm, onOpenPort
         applyExtraction(next);
         if (next.status === 'complete' || next.status === 'failed' || next.status === 'discarded') return;
       } catch (error) {
-        // A failed summary fetch is not a failed card: the agent can still confirm.
-        if (stopped || (error instanceof ApiError && error.isNotFound === false && error.isAuthFailure)) return;
+        // A failed summary fetch is never a failed card — the agent can still
+        // confirm. Only stop retrying when retrying cannot help: a 404 is expected
+        // for a few seconds while the call is still being ingested, but a rejected
+        // token or a forbidden call will be rejected identically forever.
+        if (stopped) return;
+        if (error instanceof ApiError && (error.isAuthFailure || error.isForbidden)) return;
       }
       if (stopped || attempt >= delays.length) return;
       setTimeout(poll, delays[attempt++]!);
