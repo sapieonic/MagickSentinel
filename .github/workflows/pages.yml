@@ -1,0 +1,46 @@
+# Publishes illustration/ to GitHub Pages.
+#
+# Only that directory is uploaded, so the site root is index.html and nothing else in
+# the repository is exposed. The first run needs Pages enabled with "GitHub Actions" as
+# the source; `enablement: true` asks for that automatically where the token is allowed
+# to, and Settings → Pages does it by hand where it is not.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'illustration/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy in flight: a half-published site is worse than a stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy illustration/
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: illustration
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

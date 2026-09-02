@@ -228,6 +228,8 @@ out-of-sync lockfile described above.
 
 ## Documentation
 
+- [`illustration/`](illustration/) — animated diagrams of the build, the service map, call
+  detection, the ingest protocol and tenant isolation. Published as GitHub Pages.
 - [`docs/local-setup-guide.md`](docs/local-setup-guide.md) — getting the stack running on
   a development machine, and what to poke at once it is.
 - [`docs/architecture.md`](docs/architecture.md) — the system shape and the design
