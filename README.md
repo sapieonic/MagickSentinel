@@ -228,6 +228,8 @@ out-of-sync lockfile described above.
 
 ## Documentation
 
+- [`docs/local-setup-guide.md`](docs/local-setup-guide.md) — getting the stack running on
+  a development machine, and what to poke at once it is.
 - [`docs/architecture.md`](docs/architecture.md) — the system shape and the design
   decisions that get questioned most often.
 - [`docs/deployment.md`](docs/deployment.md) — customer-facing: the Windows support
