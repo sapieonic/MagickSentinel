@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en" data-theme="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel — how it works</title>
+<meta name="description" content="Animated technical illustrations of MagickVoice Sentinel: the build, the service map, call detection, the ingest protocol, and tenant isolation.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="shell">
+
+<aside class="rail">
+  <div class="rail__mark"><span class="rail__dot"></span> Sentinel internals</div>
+  <nav id="nav">
+    <a href="#system"><b>01</b> Service map</a>
+    <a href="#build"><b>02</b> Building the .exe</a>
+    <a href="#processes"><b>03</b> Two processes</a>
+    <a href="#detect"><b>04</b> Call detection</a>
+    <a href="#audio"><b>05</b> Audio path</a>
+    <a href="#wire"><b>06</b> Ingest protocol</a>
+    <a href="#lifecycle"><b>07</b> End-to-end sequence</a>
+    <a href="#isolation"><b>08</b> Tenant isolation</a>
+  </nav>
+  <button class="theme" id="theme" type="button">Light</button>
+  <div class="rail__foot">
+    Drawn from the code in
+    <a href="https://github.com/sapieonic/MagickSentinel">sapieonic/MagickSentinel</a>.
+    Every constant on this page is the one the source uses.
+  </div>
+</aside>
+
+<main>
+
+  <header class="masthead">
+    <span class="eyebrow">MagickVoice Sentinel</span>
+    <h1>How a call gets from a headset to a compliance flag</h1>
+    <p class="lede">
+      Sentinel captures both sides of a collections call on the agent's Windows desktop,
+      ships them to a Go gateway, and turns them into a summary, a promise-to-pay and RBI
+      compliance flags. These diagrams are the machinery in between — what builds, what
+      runs, and who calls whom.
+    </p>
+    <div class="masthead__meta">
+      <span class="chip">Rust client</span>
+      <span class="chip">Go gateway</span>
+      <span class="chip">Python pipeline</span>
+      <span class="chip">PostgreSQL + RLS</span>
+      <span class="chip">React portal</span>
+    </div>
+  </header>
+
+  <!-- =============================================================== 01 -->
+  <section id="system">
+    <div class="sec-head">
+      <span class="sec-head__no">01 — SERVICE MAP</span>
+      <h2>Who calls whom</h2>
+    </div>
+    <p>
+      Six moving parts. The <strong>gateway is the only thing the endpoint can reach</strong> —
+      no AI keys, no database credentials and no object-store credentials exist on a
+      collections agent's desktop. Two identities authenticate every ingest connection at
+      once: the device certificate supplies <code>tenant_id</code> and <code>device_id</code>,
+      the bearer token supplies <code>user_uid</code> and <code>role</code>, and a disagreement
+      between them closes the socket with <code>4403</code>.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">system.map — steady state</span>
+        <button class="btn" data-flow-toggle aria-pressed="true">Pause flow</button>
+      </div>
+      <div class="fig__body">
+        <svg viewBox="0 0 1040 520" role="img" aria-label="Service map: the Windows endpoint and browser talk only to the gateway; the gateway owns Postgres, object storage and NATS; the pipeline consumes from NATS and object storage and writes back to Postgres.">
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--line)"/>
+            </marker>
+            <marker id="ah-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--flow)"/>
+            </marker>
+            <marker id="ah-todo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--tier-b)"/>
+            </marker>
+          </defs>
+
+          <!-- endpoint -->
+          <rect class="n-box n-box--ghost" x="20" y="34" width="290" height="196" rx="10"/>
+          <text class="n-lane" x="34" y="54">WINDOWS ENDPOINT</text>
+          <rect class="n-box" x="36" y="64" width="258" height="52" rx="8"/>
+          <text class="n-title" x="50" y="86">SentinelService.exe</text>
+          <text class="n-sub" x="50" y="103">SYSTEM · session 0</text>
+          <rect class="n-box" x="36" y="166" width="258" height="52" rx="8"/>
+          <text class="n-title" x="50" y="188">SentinelAgent.exe</text>
+          <text class="n-sub" x="50" y="205">interactive user session</text>
+          <path class="edge" d="M100,116 L100,166" marker-end="url(#ah)" marker-start="url(#ah)"/>
+          <text class="n-tiny" x="114" y="136">named pipe</text>
+          <text class="n-tiny" x="114" y="150">GetConfig · ReportHealth</text>
+
+          <!-- gateway -->
+          <rect class="n-box" x="430" y="90" width="200" height="76" rx="8"/>
+          <text class="n-title" x="446" y="120">API + ingest gateway</text>
+          <text class="n-sub" x="446" y="139">Go · stateless</text>
+
+          <!-- browser -->
+          <rect class="n-box" x="760" y="90" width="260" height="76" rx="8"/>
+          <text class="n-title" x="776" y="120">Portal + Widget</text>
+          <text class="n-sub" x="776" y="139">React · browser / WebView2</text>
+
+          <!-- endpoint -> gateway -->
+          <path class="edge edge--live" data-flow d="M310,96 L430,112" marker-end="url(#ah-flow)"/>
+          <text class="edge-label" x="316" y="88">policy · enroll (mTLS)</text>
+          <path class="edge edge--live" data-flow d="M310,192 L430,150" marker-end="url(#ah-flow)"/>
+          <text class="edge-label" x="316" y="208">WSS /v1/ingest</text>
+          <text class="edge-label" x="316" y="222">heartbeat · REST</text>
+
+          <!-- browser -> gateway -->
+          <path class="edge edge--live" data-flow d="M760,128 L634,128" marker-end="url(#ah-flow)"/>
+          <text class="edge-label" x="662" y="118">REST + SSE</text>
+
+          <!-- stores -->
+          <rect class="n-box" x="330" y="270" width="170" height="64" rx="8"/>
+          <text class="n-title" x="344" y="296">PostgreSQL 16</text>
+          <text class="n-sub" x="344" y="314">RLS · pgvector</text>
+
+          <rect class="n-box" x="530" y="270" width="180" height="64" rx="8"/>
+          <text class="n-title" x="544" y="296">Object store</text>
+          <text class="n-sub" x="544" y="314">Opus segments</text>
+
+          <rect class="n-box" x="740" y="270" width="180" height="64" rx="8"/>
+          <text class="n-title" x="754" y="296">NATS JetStream</text>
+          <text class="n-sub" x="754" y="314">call.finalize</text>
+
+          <path class="edge edge--live" data-flow d="M505,166 L420,270" marker-end="url(#ah-flow)"/>
+          <path class="edge edge--live" data-flow d="M556,166 L610,270" marker-end="url(#ah-flow)"/>
+          <path class="edge edge--todo" d="M600,166 C 720,190 790,220 822,266" marker-end="url(#ah-todo)"/>
+          <text class="edge-label" x="628" y="212" fill="var(--tier-b)">not wired yet</text>
+
+          <!-- pipeline -->
+          <rect class="n-box" x="330" y="390" width="590" height="76" rx="8"/>
+          <text class="n-title" x="348" y="420">Pipeline workers</text>
+          <text class="n-sub" x="348" y="439">Python · ASR → analysis → tier-1 rules → tier-2 judge</text>
+
+          <path class="edge edge--live" data-flow d="M822,334 L822,386" marker-end="url(#ah-flow)"/>
+          <text class="edge-label" x="834" y="364">consume</text>
+          <path class="edge edge--live" data-flow d="M614,334 L614,386" marker-end="url(#ah-flow)"/>
+          <text class="edge-label" x="626" y="364">read audio</text>
+          <path class="edge edge--live" data-flow d="M404,386 L404,338" marker-end="url(#ah-flow)"/>
+          <text class="edge-label" x="392" y="360" text-anchor="end">transcript · analysis · flags</text>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><i class="live"></i> implemented and tested</span>
+        <span><i class="todo"></i> designed, no publisher yet</span>
+        <span>the gateway owns every credential the endpoint does not have</span>
+      </div>
+      <figcaption class="fig__note">
+        <b>The one honest gap.</b> When a call ends the gateway sets
+        <code>calls.status = 'transcribing'</code> and stops. The pipeline's JetStream consumer
+        is written and tested against <code>sentinel.call.finalize</code>, but nothing publishes
+        that subject yet — so finalized calls queue in the database rather than in NATS. It is
+        drawn dashed here because a diagram that hides it would be a diagram you cannot deploy from.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== 02 -->
+  <section id="build">
+    <div class="sec-head">
+      <span class="sec-head__no">02 — BUILD</span>
+      <h2>How the <code>.exe</code> gets built</h2>
+    </div>
+    <p>
+      Two executables come out of one Cargo workspace, and a WiX v4 package wraps them into a
+      per-machine x64 MSI for SCCM or Intune. <strong>The build runs on Windows only</strong> —
+      WiX targets .NET, and the binaries must come from the MSVC toolchain rather than mingw,
+      because EV signing and WER symbolication both expect MSVC PDBs. One command drives it:
+      <code>client/installer/build.ps1</code>.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">build.ps1 — cargo → sign → wix → sign</span>
+        <button class="btn" data-build="play">Run build</button>
+        <button class="btn" data-build="step">Step</button>
+        <button class="btn" data-build="reset">Reset</button>
+        <span class="readout" data-build-readout>idle</span>
+      </div>
+      <div class="fig__body">
+        <div class="stepper" id="build-steps">
+          <div class="step" data-step="0">
+            <div class="step__no">1</div>
+            <div>
+              <h4>Compile both binaries for <code>x86_64-pc-windows-msvc</code></h4>
+              <p>One workspace, two <code>[[bin]]</code> targets. The SQLCipher feature is not
+                optional here: without it the on-disk spool is plain SQLite and call audio sits
+                unencrypted on the endpoint.</p>
+<pre>cargo build <span class="flag">--target</span> x86_64-pc-windows-msvc <span class="flag">--release</span> \
+      <span class="flag">-p</span> sentinel-agent <span class="flag">-p</span> sentinel-service \
+      <span class="flag">--features</span> sentinel-core/sqlcipher</pre>
+            </div>
+          </div>
+          <div class="step" data-step="1">
+            <div class="step__no">2</div>
+            <div>
+              <h4>Two executables land in <code>target/…/release</code></h4>
+              <p><code>SentinelService.exe</code> runs as SYSTEM and owns machine state;
+                <code>SentinelAgent.exe</code> runs in the interactive session and owns capture.
+                Splitting them is what lets capture die and restart without losing the device
+                identity.</p>
+            </div>
+          </div>
+          <div class="step" data-step="2">
+            <div class="step__no">3</div>
+            <div>
+              <h4>Sign the binaries — <em>before</em> the MSI is built</h4>
+              <p>An MSI's signature covers the package file, not the files inside it. Sign only
+                the MSI and you leave two unsigned executables on disk for EDR to find. SHA-256
+                digests and an RFC 3161 timestamp, or every signature expires with the certificate.</p>
+<pre>signtool sign <span class="flag">/sha1</span> &lt;EV thumbprint&gt; <span class="flag">/fd</span> SHA256 \
+         <span class="flag">/tr</span> http://timestamp.digicert.com <span class="flag">/td</span> SHA256 \
+         SentinelAgent.exe SentinelService.exe</pre>
+            </div>
+          </div>
+          <div class="step" data-step="3">
+            <div class="step__no">4</div>
+            <div>
+              <h4>Package with WiX v4</h4>
+              <p>The signed binaries, the built widget bundle from <code>web/widget/dist</code>, and
+                the WebView2 Evergreen bootstrapper from <code>redist/</code> — deliberately not
+                downloaded by the build script, because a build that fetches an executable off the
+                internet and packages it unverified is the supply-chain problem the bank's security
+                review exists to find.</p>
+<pre>wix build Sentinel.wxs <span class="flag">-arch</span> x64 \
+    <span class="flag">-ext</span> WixToolset.Util.wixext <span class="flag">-ext</span> WixToolset.UI.wixext \
+    <span class="flag">-d</span> ProductVersion=0.1.0 <span class="flag">-out</span> Sentinel-0.1.0-x64.msi</pre>
+            </div>
+          </div>
+          <div class="step" data-step="4">
+            <div class="step__no">5</div>
+            <div>
+              <h4>The tier gate is compiled into the package</h4>
+              <p>Tier C — Windows 8.1, Windows 10 before build 18362, x86 and ARM64 — must fail to
+                install. The check is a <code>FileSearch</code> on <code>kernel32.dll</code>'s version
+                resource, not a registry read: <code>CurrentBuildNumber</code> is a string, and MSI
+                compares it <em>lexically</em>, under which <code>"9600" &gt;= "18362"</code> is true.
+                A registry-based build check is either dead or backwards, and both fail silently.</p>
+            </div>
+          </div>
+          <div class="step" data-step="5">
+            <div class="step__no">6</div>
+            <div>
+              <h4>Sign the package, then deploy silently</h4>
+              <p>The enrollment token is single-use, expires in 24 hours, and is marked
+                <code>Secure</code> and hidden so it survives elevation without appearing in the
+                verbose log an administrator attaches to a support ticket.</p>
+<pre>msiexec <span class="flag">/i</span> Sentinel-0.1.0-x64.msi <span class="flag">/qn</span> \
+        ENROLLMENTTOKEN=&lt;single-use&gt; \
+        APIBASEURL=https://api.sentinel.magickvoice.com</pre>
+            </div>
+          </div>
+        </div>
+      </div>
+      <figcaption class="fig__note">
+        <b>No <code>Run</code> key, no UI, no reboot.</b> The agent is launched by the service on
+        <code>WTS_SESSION_LOGON</code>, because a <code>Run</code> key is removed by the first agent
+        who goes looking for it. Uninstall removes the service but keeps
+        <code>%PROGRAMDATA%\MagickVoice\Sentinel</code> unless it is empty — an uninstall that
+        destroys undelivered evidence is the wrong default for a compliance product.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== 03 -->
+  <section id="processes">
+    <div class="sec-head">
+      <span class="sec-head__no">03 — ENDPOINT</span>
+      <h2>Two processes, one pipe</h2>
+    </div>
+    <p>
+      Capture has to run in the interactive session — WASAPI has no audio in session 0. Device
+      identity has to survive a shift change. Those are different lifetimes, so they are different
+      processes. The service supervises the agent and <strong>relaunches it on a doubling
+      backoff</strong>; a run that stays healthy for 120 s resets the ladder, so an agent that
+      crashes after 55 s of work cannot inch its way back to a one-second retry loop.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">supervisor — relaunch backoff</span>
+        <button class="btn" data-sup="crash">Crash the agent</button>
+        <button class="btn" data-sup="healthy">Let it run 120 s</button>
+        <button class="btn" data-sup="reset">Reset</button>
+        <span class="readout" data-sup-readout>agent running</span>
+      </div>
+      <div class="fig__body">
+        <svg viewBox="0 0 1040 400" role="img" aria-label="Session 0 holds the SCM and SentinelService; session 1 holds SentinelAgent and the widget. The service relaunches a crashed agent on a 1, 2, 4, 8, 16, 32, 60 second backoff.">
+          <rect class="n-box n-box--ghost" x="20" y="26" width="1000" height="120" rx="10"/>
+          <text class="n-lane" x="34" y="46">SESSION 0 · LOCALSYSTEM</text>
+          <rect class="n-box n-box--ghost" x="20" y="200" width="1000" height="150" rx="10"/>
+          <text class="n-lane" x="34" y="220">SESSION 1 · INTERACTIVE USER</text>
+
+          <rect class="n-box" x="44" y="58" width="160" height="62" rx="8"/>
+          <text class="n-title" x="58" y="83">Service Control</text>
+          <text class="n-sub" x="58" y="101">auto-start</text>
+
+          <rect class="n-box" x="264" y="58" width="220" height="62" rx="8" id="sup-service"/>
+          <text class="n-title" x="278" y="83">SentinelService.exe</text>
+          <text class="n-sub" x="278" y="101">watchdog · updater · certs</text>
+
+          <path class="edge" d="M204,89 L260,89" marker-end="url(#ah)"/>
+
+          <rect class="n-box" x="264" y="232" width="220" height="62" rx="8" id="sup-agent"/>
+          <text class="n-title" x="278" y="257" id="sup-agent-title">SentinelAgent.exe</text>
+          <text class="n-sub" x="278" y="275" id="sup-agent-sub">capture · spool · uplink</text>
+
+          <rect class="n-box" x="560" y="232" width="200" height="62" rx="8"/>
+          <text class="n-title" x="574" y="257">WebView2 widget</text>
+          <text class="n-sub" x="574" y="275">host object, no network</text>
+          <path class="edge" d="M484,263 L556,263" marker-end="url(#ah)"/>
+
+          <path class="edge edge--live" d="M374,120 L374,228" marker-end="url(#ah-flow)" marker-start="url(#ah-flow)"/>
+          <text class="edge-label" x="388" y="164">CreateProcessAsUser on WTS_SESSION_LOGON</text>
+          <text class="edge-label" x="388" y="180">GetConfig · ReportHealth · LogEvent</text>
+          <text class="edge-label" x="388" y="196">DACL: SYSTEM full, users read+write. No Everyone.</text>
+
+          <text class="n-lane" x="820" y="46">RELAUNCH BACKOFF</text>
+          <g id="sup-ladder"></g>
+
+          <text class="n-tiny" x="820" y="336" id="sup-ladder-note">a healthy 120 s run resets to 1 s</text>
+        </svg>
+      </div>
+      <figcaption class="fig__note" id="sup-note">
+        The agent holds a session-local named mutex, so a relaunch that races an agent still
+        shutting down exits quietly rather than counting as a crash. Restart counts ride along in
+        the heartbeat: an endpoint whose agent is being killed repeatedly shows up server-side as
+        tamper, not as silence.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== 04 -->
+  <section id="detect">
+    <div class="sec-head">
+      <span class="sec-head__no">04 — DETECTION</span>
+      <h2>Deciding that a call is happening</h2>
+    </div>
+    <p>
+      There is no dialer integration to ask. The agent watches the softphone's audio session and
+      the two audio streams, and runs the state machine below. The thresholds are the real ones
+      from <code>VadConfig::default()</code>. <strong>Nothing is uploaded until speech is
+      confirmed</strong> — an armed-but-silent session times out after 20 s and the buffer is
+      discarded, which is what stops a dialer parked on hold music from producing an endless
+      stream of empty calls.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">detector — live simulation at 6× speed</span>
+        <button class="btn" data-det="play" aria-pressed="false">Play</button>
+        <button class="btn" data-det="reset">Reset</button>
+        <span class="readout" data-det-readout>IDLE · 0.0 s</span>
+      </div>
+      <div class="fig__body">
+        <svg viewBox="0 0 1040 330" role="img" aria-label="The call detection state machine moving through IDLE, ARMED, IN_CALL, WRAP and FINALIZE as simulated audio energy rises and falls.">
+          <g id="det-states"></g>
+          <rect x="40" y="126" width="960" height="104" rx="6" fill="var(--ground)" stroke="var(--line-soft)"/>
+          <text class="n-tiny" x="46" y="120">SPEECH ENERGY · near (agent) and far (borrower)</text>
+          <g id="det-bars"></g>
+          <line id="det-cursor" x1="40" y1="126" x2="40" y2="230" stroke="var(--flow)" stroke-width="1.5"/>
+          <g id="det-meters"></g>
+        </svg>
+      </div>
+      <figcaption class="fig__note" id="det-note">
+        Press play. The bars are simulated frame energy; the state chips above are driven by the
+        same thresholds the Rust detector uses.
+      </figcaption>
+    </figure>
+
+    <div class="callout">
+      <p><strong>Why silence, not a hang-up event.</strong> The softphone's audio session can stay
+      active through a hold, a transfer and a wrap-up screen. Eight seconds of two-sided silence is
+      the signal that survives all three. It costs eight seconds of tail audio on every call, which
+      is the price of never truncating one.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== 05 -->
+  <section id="audio">
+    <div class="sec-head">
+      <span class="sec-head__no">05 — AUDIO PATH</span>
+      <h2>From a WASAPI buffer to a 34-byte header</h2>
+    </div>
+    <p>
+      The two channels are captured separately and <strong>never mixed</strong>: everything
+      downstream — per-speaker sentiment, "who said the threatening sentence", the conduct rules
+      that only apply to the agent — depends on knowing which side spoke. That is also why there is
+      no diarization step anywhere in the pipeline. The channels arrive separate and stay separate.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">audio.path — one second of one channel</span>
+        <button class="btn" data-aud="play" aria-pressed="false">Play</button>
+        <button class="btn" data-aud="reset">Reset</button>
+        <span class="readout" data-aud-readout>0 frames</span>
+      </div>
+      <div class="fig__body">
+        <svg viewBox="0 0 1040 320" role="img" aria-label="Audio pipeline stages: WASAPI capture, resample to 16 kHz mono, Opus encode at 20 milliseconds, 50 frames per one-second segment, a 34-byte record header, then the encrypted spool and the uplink.">
+          <g id="aud-stages"></g>
+          <g id="aud-token"></g>
+          <g id="aud-meter"></g>
+        </svg>
+      </div>
+      <figcaption class="fig__note" id="aud-note">
+        60 bytes per 20 ms frame per channel ⇒ about 3 KB/s per channel, 6 KB/s for both. The
+        34-byte header on each one-second segment is roughly 1% overhead. Two hundred concurrent
+        agents come to about 1.2 MB/s upstream in aggregate.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== 06 -->
+  <section id="wire">
+    <div class="sec-head">
+      <span class="sec-head__no">06 — PROTOCOL</span>
+      <h2>The ingest protocol, and what happens when the network drops</h2>
+    </div>
+    <p>
+      <code>WSS /v1/ingest</code> carries JSON control frames and binary media records over one
+      socket. The server acks a <strong>cumulative watermark</strong> per
+      <code>(call_id, channel)</code> at least every 2 s or every 100 segments, and the client
+      deletes a spool row <em>only</em> when it is covered by an ack. Reconnect replays from
+      <code>acked + 1</code> — so a dropped connection costs bandwidth, never audio.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">wire.md — call.start · media · ack · drop · resume</span>
+        <button class="btn" data-seq-play="wire" aria-pressed="false">Play</button>
+        <button class="btn" data-seq-step="wire">Step</button>
+        <button class="btn" data-seq-reset="wire">Reset</button>
+        <span class="readout" data-seq-readout="wire">0 / 0</span>
+      </div>
+      <div class="fig__body">
+        <svg data-seq="wire" role="img" aria-label="Sequence diagram of the ingest protocol, including a dropped connection and a resume that replays only the unacked segments."></svg>
+      </div>
+      <figcaption class="fig__note" data-seq-note="wire">Press play.</figcaption>
+    </figure>
+
+    <div class="callout">
+      <p><strong>An ack the server cannot honour is never sent.</strong> If the watermark write
+      fails, the ack is suppressed — the client keeps the segments and replays them. The
+      alternative, acking optimistically, deletes the only copy of audio that never landed.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== 07 -->
+  <section id="lifecycle">
+    <div class="sec-head">
+      <span class="sec-head__no">07 — END TO END</span>
+      <h2>One call, all the way through</h2>
+    </div>
+    <p>
+      Machine boot to compliance flag. Note where each of the two identities is established: the
+      <strong>device</strong> enrolls once, at install, and its private key is generated
+      non-exportably in CNG so it is never in a file or in process memory; the <strong>user</strong>
+      signs in per shift through the system browser with PKCE, and the agent holds only a refresh
+      token in DPAPI user scope.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">lifecycle — boot → enroll → sign in → call → flag</span>
+        <button class="btn" data-seq-play="life" aria-pressed="false">Play</button>
+        <button class="btn" data-seq-step="life">Step</button>
+        <button class="btn" data-seq-reset="life">Reset</button>
+        <span class="readout" data-seq-readout="life">0 / 0</span>
+      </div>
+      <div class="fig__body">
+        <svg data-seq="life" role="img" aria-label="End-to-end sequence diagram from machine boot and device enrollment through user sign-in, a captured call, ingest, finalization and the compliance pipeline, to the portal."></svg>
+      </div>
+      <figcaption class="fig__note" data-seq-note="life">Press play.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== 08 -->
+  <section id="isolation">
+    <div class="sec-head">
+      <span class="sec-head__no">08 — ISOLATION</span>
+      <h2>One query, six answers</h2>
+    </div>
+    <p>
+      Tenant isolation is the database's job, not the handler's. The gateway connects as
+      <code>sentinel_app</code>, a <code>NOBYPASSRLS</code> role, and sets three transaction-local
+      settings from the verified token. <strong>A query that forgets its tenant filter returns
+      nothing</strong> rather than another tenant's rows — and <code>/v1/calls</code> has no
+      capability gate in the handler at all, because a gate there would be a second, weaker copy of
+      a rule the database already enforces.
+    </p>
+
+    <figure class="fig">
+      <div class="fig__bar">
+        <span class="fig__title">rls — SELECT with no WHERE clause</span>
+        <div class="roles" id="rls-roles"></div>
+      </div>
+      <div class="fig__body">
+        <div class="rls-grid">
+          <div>
+<pre class="rls-sql"><span class="k">SET ROLE</span> sentinel_app;
+<span class="k">SET</span> sentinel.tenant_id = <span class="v set" id="rls-tenant">'acme'</span>;
+<span class="k">SET</span> sentinel.user_uid  = <span class="v set" id="rls-uid">'agent-a'</span>;
+<span class="k">SET</span> sentinel.role     = <span class="v set" id="rls-role">'agent'</span>;
+
+<span class="k">SELECT</span> * <span class="k">FROM</span> calls;</pre>
+            <p class="rls-count" id="rls-count"></p>
+          </div>
+          <div style="overflow-x:auto">
+            <table class="rows">
+              <thead>
+                <tr><th>Call</th><th>Tenant</th><th>Agent</th><th>Team</th><th>Flags</th></tr>
+              </thead>
+              <tbody id="rls-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <figcaption class="fig__note" id="rls-note"></figcaption>
+    </figure>
+
+    <div class="callout">
+      <p><strong>Three operations legitimately precede any tenant context</strong> — consuming an
+      enrollment token, registering the device, resolving a client certificate back to a device.
+      Rather than weakening the policies for them, migration 0005 exposes exactly those three as
+      <code>SECURITY DEFINER</code> functions, so the tenant-crossing surface of the whole system is
+      three greppable names.</p>
+    </div>
+  </section>
+
+  <footer class="page">
+    Built from the repository at <code>sapieonic/MagickSentinel</code>. Constants, close codes,
+    thresholds and file paths on this page were read out of the source, not from a design document —
+    where the code and the spec disagree, the code is what is drawn. Everything animated here is a
+    simulation running in your browser; no call data is involved.
+  </footer>
+
+</main>
+</div>
+
+<script src="diagrams.js"></script>
+</body>
+</html>
