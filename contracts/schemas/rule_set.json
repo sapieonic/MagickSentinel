@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.sentinel.magickvoice.com/schemas/rule_set.json",
+  "title": "Compliance rule set",
+  "description": "Stored in rule_sets.definition. Versioned per tenant; publishing creates a new version and never mutates an existing one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules"],
+  "properties": {
+    "call_hours": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" },
+        "end": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" },
+        "timezone": { "type": "string", "default": "Asia/Kolkata" }
+      }
+    },
+    "judge_sample_pct": { "type": "number", "minimum": 0, "maximum": 100, "default": 5 },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "enabled", "severity"],
+        "properties": {
+          "rule_id": {
+            "type": "string",
+            "enum": ["abusive_language", "threat_of_violence", "false_legal_threat",
+                     "false_seizure_threat", "third_party_disclosure", "outside_call_hours",
+                     "missing_identification", "no_purpose_disclosure",
+                     "excessive_interruption", "repeat_contact"]
+          },
+          "enabled": { "type": "boolean" },
+          "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+          "judge": {
+            "type": "boolean",
+            "default": false,
+            "description": "Escalate a tier-1 hit on this rule to the tier-2 judge."
+          },
+          "params": {
+            "type": "object",
+            "description": "Rule-specific. Term lists are keyed by ISO language code.",
+            "additionalProperties": true,
+            "properties": {
+              "terms": {
+                "type": "object",
+                "additionalProperties": { "type": "array", "items": { "type": "string" } }
+              },
+              "patterns": { "type": "array", "items": { "type": "string" } },
+              "window_ms": { "type": "integer", "minimum": 0 },
+              "threshold": { "type": "number" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

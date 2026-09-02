@@ -1,0 +1,61 @@
+[package]
+name = "sentinel-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SYSTEM-level Windows service: watchdog, config sync, update staging, crash-dump shipping and the named-pipe host."
+
+# The crate is both a library and a binary. The library half holds everything that is
+# platform-neutral — above all the IPC codec, which `sentinel-agent` links against so
+# there is exactly one definition of the wire format between the two processes.
+[lib]
+name = "sentinel_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "SentinelService"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+
+# Deliberately NOT a dependency: `sentinel-capture`. A SYSTEM service runs in session
+# 0 and cannot reach a user's audio session, so any audio code here would be dead at
+# best and a security-review problem at worst. `no_audio_dependencies` in
+# `tests/manifest.rs` keeps that true.
+
+[target.'cfg(windows)'.dependencies]
+# `windows-core` is a direct dependency because the `#[implement]` macro expands to
+# paths rooted at that crate, not at `windows::core`.
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Shutdown",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true

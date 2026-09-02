@@ -1,0 +1,124 @@
+/* Widget chrome. The window is small, frameless and always-on-top, so every rule
+   here is about fitting a usable card into roughly 320×420 px. */
+
+html, body, #root { height: 100%; }
+
+body {
+  /* The native shell handles dragging; the page must not select text when the agent
+     grabs the widget to move it. */
+  user-select: none;
+  overflow: hidden;
+}
+
+.wg-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 260px;
+  background: var(--sx-surface);
+  border: 1px solid var(--sx-border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.wg-devbanner {
+  background: var(--sx-warn);
+  color: #000;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  padding: 2px;
+}
+
+.wg-tabs { display: flex; border-bottom: 1px solid var(--sx-border); }
+
+.wg-tab {
+  flex: 1;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 7px;
+  color: var(--sx-text-dim);
+}
+
+.wg-tab--on { color: var(--sx-text); box-shadow: inset 0 -2px 0 var(--sx-accent); }
+
+.wg-panel { display: flex; flex-direction: column; gap: 10px; padding: 12px; }
+
+.wg-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+.wg-block { width: 100%; }
+
+.wg-signed-out { align-items: center; text-align: center; padding-top: 28px; }
+.wg-lock { font-size: 28px; }
+.wg-signed-out__text { margin: 0; color: var(--sx-text-dim); }
+
+.wg-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.wg-pill__dot { width: 8px; height: 8px; border-radius: 50%; background: var(--sx-ok); }
+.wg-pill__coverage { margin-left: auto; color: var(--sx-text-dim); }
+
+.wg-armed__text { font-weight: 600; }
+
+.wg-timer { font-size: 22px; font-weight: 600; }
+.wg-sparks { display: flex; flex-direction: column; gap: 4px; }
+.wg-spark-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+.wg-wrap { align-items: center; }
+
+.wg-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--sx-border);
+  border-top-color: var(--sx-accent);
+  border-radius: 50%;
+  animation: wg-spin 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wg-spinner { animation-duration: 3s; }
+}
+
+@keyframes wg-spin { to { transform: rotate(360deg); } }
+
+.wg-card { overflow-y: auto; user-select: text; }
+.wg-card__summary { min-height: 34px; font-size: 12px; }
+.wg-card__summary p { margin: 0; }
+.wg-card__actions { margin-top: 4px; }
+.wg-card__ended { margin: 0; font-size: 11px; }
+.wg-extracted { margin: 0; font-size: 11px; }
+
+.wg-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--sx-text-dim); }
+.wg-field input, .wg-field select { color: var(--sx-text); }
+.wg-check { display: flex; align-items: center; gap: 6px; }
+.wg-ptp-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+.wg-error__body, .wg-error__detail { margin: 6px 0 0; font-size: 11px; }
+
+.wg-history { list-style: none; margin: 0; padding: 0; overflow-y: auto; user-select: text; }
+.wg-history__msg { padding: 12px; }
+.wg-history__item { border-bottom: 1px solid var(--sx-border); }
+
+.wg-history__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 7px 10px;
+  text-align: left;
+  font-size: 11px;
+}
+
+.wg-history__row:hover { background: var(--sx-surface-2); }
+.wg-history__time { color: var(--sx-text-dim); }
+.wg-history__ref { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wg-history__detail { padding: 0 10px 10px; font-size: 11px; }
+.wg-history__detail p { margin: 0 0 6px; }

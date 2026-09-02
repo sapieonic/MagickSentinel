@@ -1,0 +1,29 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Go
+server/gateway/bin/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local
+.env
+.env.local
+*.log
+spool.db
+client/target/
+.venv-dev/
+web/node_modules/
+web/*/dist/

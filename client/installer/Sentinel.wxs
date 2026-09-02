@@ -1,0 +1,437 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MagickVoice Sentinel — per-machine MSI (spec section 5: WiX v4, required for
+  SCCM / Intune deployment).
+
+  What this package is responsible for:
+
+    1. Refusing to install on a tier C machine (spec section 3). This is the single
+       most important thing in the file: a tier C install produces a service that
+       runs, reports healthy, and never captures a call.
+    2. Installing SentinelService.exe as Automatic (Delayed Start) under LocalSystem,
+       with the recovery actions from spec 6.1.
+    3. Creating %PROGRAMDATA%\MagickVoice\Sentinel with an ACL the spool can be
+       written through.
+    4. Getting the WebView2 runtime onto Windows 10, which does not ship with one.
+
+  It deliberately does NOT create a Run key for SentinelAgent.exe. The agent is
+  launched by the service's session-change notification; a Run key is trivially
+  removed by the user, which is exactly the tampering spec 6.8 is about.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <?define ProductName = "MagickVoice Sentinel" ?>
+  <?define Manufacturer = "MagickVoice Technologies Private Limited" ?>
+  <?define ServiceName = "MagickVoiceSentinel" ?>
+  <!-- Stable for the life of the product line. Changing it makes every installed
+       copy invisible to the upgrade logic, so upgrades stop working silently. -->
+  <?define UpgradeCode = "6C0F1B4E-6D2A-4B0E-9E9B-7C1F5A2D4E31" ?>
+
+  <Package Name="$(ProductName)"
+           Manufacturer="$(Manufacturer)"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="$(var.UpgradeCode)"
+           Language="1033"
+           Codepage="1252"
+           Scope="perMachine"
+           Compressed="yes"
+           InstallerVersion="500">
+
+    <!-- x64 only. An x64 package is refused by Windows on an x86 machine with a clear
+         message of its own, which covers half of tier C before any condition runs. -->
+    <SummaryInformation Description="$(ProductName) endpoint agent"
+                        Manufacturer="$(Manufacturer)" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Upgrades replace in place. `Schedule="afterInstallInitialize"` so the old
+         service is stopped and removed before the new binaries land; the default
+         (afterInstallExecute) leaves both versions' files present at once, and the
+         SCM then has a service pointing at a half-replaced executable. -->
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of $(ProductName) is already installed. Remove it before installing this one." />
+
+    <!-- ============================================================ tier gate ==
+         Spec section 3. Tier C is Windows 8.1, Windows 10 before 1903 (build
+         18362), x86 and ARM64, and the installer MUST block all of them.
+
+         The build number is checked with a FileSearch against kernel32.dll's version
+         resource rather than by reading CurrentBuildNumber from the registry. That is
+         not an aesthetic choice:
+
+           * `VersionNT` is useless here. Windows 10 and 11 both report 603 to an
+             unmanifested MSI, so every version condition written against it passes on
+             Windows 8.1 and on Windows 11 alike.
+           * `CurrentBuildNumber` is a REG_SZ. MSI compares a string property to an
+             unquoted integer as always-false, and to a quoted one lexically — under
+             which "9600" >= "18362" is TRUE. A registry-based build check is either
+             dead or backwards, and both failure modes are silent.
+           * `FileSearch/@MinVersion` performs a real four-part numeric version
+             comparison against the file's version resource. On Windows 10 and 11
+             kernel32.dll is versioned 10.0.<build>.<ubr>, so this is a direct,
+             correct build-number test.
+
+         `[System64Folder]` and not `[SystemFolder]`: the package is x64, so the two
+         agree today, but naming the 64-bit folder explicitly means a future 32-bit
+         component cannot silently redirect the search into SysWOW64.
+    -->
+    <Property Id="SENTINELMINBUILD">
+      <DirectorySearch Id="Sys64ForMinBuild" Path="[System64Folder]" Depth="0">
+        <FileSearch Id="Kernel32MinBuild" Name="kernel32.dll" MinVersion="10.0.18362.0" />
+      </DirectorySearch>
+    </Property>
+
+    <!-- Tier A on a client: Windows 11, build 22000 or later. -->
+    <Property Id="SENTINELCLIENT22000">
+      <DirectorySearch Id="Sys64ForClientTierA" Path="[System64Folder]" Depth="0">
+        <FileSearch Id="Kernel32ClientTierA" Name="kernel32.dll" MinVersion="10.0.22000.0" />
+      </DirectorySearch>
+    </Property>
+
+    <!-- Tier A on a server: Server 2022, build 20348 or later. 20348 is a *server*
+         build number; using it as a client threshold would report every Windows 10
+         desktop on the floor as tier A, and process loopback would then fail to
+         activate on all of them. See client/sentinel-capture/src/tier.rs, which is
+         the authority for this matrix. -->
+    <Property Id="SENTINELSERVER20348">
+      <DirectorySearch Id="Sys64ForServerTierA" Path="[System64Folder]" Depth="0">
+        <FileSearch Id="Kernel32ServerTierA" Name="kernel32.dll" MinVersion="10.0.20348.0" />
+      </DirectorySearch>
+    </Property>
+
+    <!-- ARM64 runs x64 binaries under emulation, so the package would otherwise
+         install and then capture nothing: WASAPI process loopback is not available to
+         an emulated process. MsiNTProductType is 1 for a workstation. -->
+    <Property Id="SENTINELPROCARCH">
+      <RegistrySearch Id="ProcArch"
+                      Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+                      Name="PROCESSOR_ARCHITECTURE"
+                      Type="raw" />
+    </Property>
+
+    <Launch Condition="VersionNT64"
+            Message="$(ProductName) requires 64-bit Windows. This machine is not supported (capture tier C)." />
+
+    <Launch Condition="NOT SENTINELPROCARCH = &quot;ARM64&quot;"
+            Message="$(ProductName) does not support ARM64 Windows: the audio capture APIs it relies on are not available to an emulated process. This machine is not supported (capture tier C)." />
+
+    <Launch Condition="SENTINELMINBUILD"
+            Message="$(ProductName) requires Windows 10 version 1903 (build 18362) or later, or Windows Server 2022 or later. Windows 8.1 and earlier Windows 10 builds cannot capture call audio and are not supported (capture tier C)." />
+
+    <!-- Recorded for the fleet view and for support. The service re-detects the tier
+         on every start — an in-place upgrade changes the answer, and the value written
+         here would then be stale — so this is a deployment record, not the source of
+         truth. -->
+    <!-- Tier B is the default; the launch condition above has already refused
+         anything below build 18362, so a machine that gets this far is A or B. Two
+         `SetProperty` elements with the same Id would generate the same custom-action
+         name and collide, hence the default-plus-override shape. -->
+    <Property Id="SENTINELTIER" Value="B" />
+    <SetProperty Id="SENTINELTIER" Value="A" After="AppSearch"
+                 Sequence="both"
+                 Condition="SENTINELCLIENT22000 OR (SENTINELSERVER20348 AND NOT MsiNTProductType = 1)" />
+
+    <!-- ============================================== enrollment token (7.2) ==
+         A single-use, tenant-scoped token minted in the portal, valid 24 h. Passed on
+         the command line by the deployment tool:
+
+             msiexec /i Sentinel.msi ENROLLMENTTOKEN=... APIBASEURL=... /qn
+
+         Marked Secure so it survives the elevation boundary into the deferred
+         sequence, and deliberately NOT logged: MsiHiddenProperties keeps it out of
+         the verbose log an administrator will inevitably attach to a support ticket.
+    -->
+    <Property Id="ENROLLMENTTOKEN" Secure="yes" />
+    <Property Id="APIBASEURL" Secure="yes" Value="https://api.sentinel.magickvoice.com" />
+    <Property Id="TENANTHINT" Secure="yes" />
+    <Property Id="MsiHiddenProperties" Value="ENROLLMENTTOKEN" />
+
+    <!-- ==================================================== WebView2 runtime ==
+         Windows 11 ships the runtime; Windows 10 does not (spec section 3). The
+         Evergreen bootstrapper is a ~2 MB stub that downloads and installs the
+         current runtime.
+
+         OPEN-5 — NOT DECIDED. The air-gapped case is unresolved: whether to bundle
+         the ~150 MB fixed-version runtime for floors with no egress, or to require
+         the Evergreen bootstrapper's download. Do not resolve it here. What is below
+         installs the Evergreen bootstrapper only; on an air-gapped machine it will
+         fail, the failure is tolerated (the install continues, the widget will not
+         render, and the heartbeat still reports the device), and an operator has to
+         act. When OPEN-5 is decided, either:
+           (a) Evergreen is accepted — delete this note and document the egress
+               requirement in the deployment guide; or
+           (b) fixed-version is required — add the runtime's CAB as a payload,
+               extract it under [INSTALLFOLDER]\WebView2, and set
+               WEBVIEW2_BROWSER_EXECUTABLE_FOLDER for the agent process.
+         Until then the fixed-version path is a placeholder, not an omission.
+    -->
+    <Property Id="SENTINELWEBVIEW2">
+      <!-- The Evergreen runtime records itself here per-machine. HKLM only: a
+           per-user runtime installed by one agent is not available to the next
+           shift. -->
+      <RegistrySearch Id="WebView2Client"
+                      Root="HKLM"
+                      Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+                      Name="pv"
+                      Type="raw" />
+    </Property>
+
+    <!-- ======================================================= directories ==== -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="COMPANYFOLDER" Name="MagickVoice">
+        <Directory Id="INSTALLFOLDER" Name="Sentinel" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATACOMPANYFOLDER" Name="MagickVoice">
+        <Directory Id="DATAFOLDER" Name="Sentinel">
+          <Directory Id="DUMPSFOLDER" Name="dumps" />
+          <Directory Id="DEVICEFOLDER" Name="device" />
+          <Directory Id="STAGINGFOLDER" Name="staging" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- ======================================================== components ==== -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+
+      <!-- The SYSTEM service. -->
+      <Component Id="ServiceExe" Guid="1E4B9F02-2A77-4F1D-9E4B-8C2B0D5A7F11" Bitness="always64">
+        <File Id="SentinelServiceExe"
+              Name="SentinelService.exe"
+              Source="$(var.BinDir)\SentinelService.exe"
+              KeyPath="yes" />
+
+        <ServiceInstall Id="SentinelServiceInstall"
+                        Name="$(var.ServiceName)"
+                        DisplayName="$(ProductName)"
+                        Description="Captures and uploads call audio for compliance monitoring, and supervises the per-user Sentinel agent."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Vital="yes">
+          <!-- Automatic (Delayed Start), spec 6.1. Delayed start matters: the
+               service's first act is to detect the capture tier and reach the API,
+               and doing that while Windows is still bringing up the network stack
+               produces a spurious offline state on every boot. -->
+          <ServiceConfig DelayedAutoStart="yes" OnInstall="yes" OnReinstall="yes" />
+
+          <!-- Recovery: restart after the 1st, 2nd and subsequent failures, with the
+               count reset daily (spec 6.1). ResetPeriodInDays is DAYS; the underlying
+               dwResetPeriod is seconds, and WiX does the conversion — passing 86400
+               here would ask for a reset period of 236 years, i.e. never. -->
+          <util:ServiceConfig
+              FirstFailureActionType="restart"
+              SecondFailureActionType="restart"
+              ThirdFailureActionType="restart"
+              RestartServiceDelayInSeconds="60"
+              ResetPeriodInDays="1" />
+        </ServiceInstall>
+
+        <!-- Stop and remove on uninstall as well as install: leaving a service entry
+             pointing at a deleted binary makes every subsequent install fail with a
+             "service marked for deletion" error that looks like a packaging bug. -->
+        <ServiceControl Id="SentinelServiceControl"
+                        Name="$(var.ServiceName)"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <!-- The user-session agent. Installed, never auto-started from here: the
+           service launches it on WTS_SESSION_LOGON. A Run key would be removed by the
+           first agent who looked for it. -->
+      <Component Id="AgentExe" Guid="2F5C0A13-3B88-4E2C-8F5A-9D3C1E6B8022" Bitness="always64">
+        <File Id="SentinelAgentExe"
+              Name="SentinelAgent.exe"
+              Source="$(var.BinDir)\SentinelAgent.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <!-- The widget's web bundle, loaded by WebView2 from disk. -->
+      <Component Id="WidgetBundle" Guid="3A6D1B24-4C99-4F3D-9061-AE4D2F7C9133" Bitness="always64">
+        <File Id="WidgetIndex"
+              Name="widget.html"
+              Source="$(var.WebDir)\widget.html"
+              KeyPath="yes" />
+      </Component>
+
+      <!-- Machine-scoped configuration the service reads at start. Written as a
+           component so an uninstall removes it and a repair restores it. -->
+      <Component Id="MachineConfig" Guid="4B7E2C35-5DAA-4A4E-A172-BF5E3A8DA244" Bitness="always64">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\MagickVoice\Sentinel">
+          <RegistryValue Name="ApiBaseUrl" Type="string" Value="[APIBASEURL]" KeyPath="yes" />
+          <RegistryValue Name="TenantHint" Type="string" Value="[TENANTHINT]" />
+          <RegistryValue Name="InstalledVersion" Type="string" Value="$(var.ProductVersion)" />
+          <!-- Deployment-time tier record. The service re-detects on every start. -->
+          <RegistryValue Name="InstalledCaptureTier" Type="string" Value="[SENTINELTIER]" />
+          <RegistryValue Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" />
+          <RegistryValue Name="DataFolder" Type="string" Value="[DATAFOLDER]" />
+        </RegistryKey>
+      </Component>
+
+      <!-- Windows Error Reporting local dumps for our two binaries, so
+           `crashdump::scan` has something to find. Scoped to our executables by name:
+           enabling LocalDumps globally would collect crash dumps from every
+           application on the desktop, which is a privacy problem of its own. -->
+      <Component Id="CrashDumpPolicy" Guid="5C8F3D46-6EBB-4B5F-B283-C06F4B9EB355" Bitness="always64">
+        <RegistryKey Root="HKLM"
+                     Key="SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\SentinelService.exe">
+          <RegistryValue Name="DumpFolder" Type="expandable" Value="[DATAFOLDER]dumps" KeyPath="yes" />
+          <RegistryValue Name="DumpCount" Type="integer" Value="10" />
+          <!-- 1 = mini dump. A full dump of the agent would contain decoded audio and
+               any scraped account reference; a mini dump carries stacks and loaded
+               modules, which is what symbolication needs. -->
+          <RegistryValue Name="DumpType" Type="integer" Value="1" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM"
+                     Key="SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\SentinelAgent.exe">
+          <RegistryValue Name="DumpFolder" Type="expandable" Value="[DATAFOLDER]dumps" />
+          <RegistryValue Name="DumpCount" Type="integer" Value="10" />
+          <RegistryValue Name="DumpType" Type="integer" Value="1" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+
+    <!-- ====================================================== data directory ==
+         %PROGRAMDATA%\MagickVoice\Sentinel holds the SQLCipher spool, the device
+         certificate, staged updates and crash dumps.
+
+         The ACL is the interesting part. SYSTEM and Administrators get full control.
+         `BUILTIN\Users` gets *modify* — not read — because the spool is written by
+         SentinelAgent.exe, which runs as the signed-in user, while the service that
+         reads and manages the same directory runs as LocalSystem. That is the whole
+         reason the spool key is DPAPI machine scope (spec 6.5): two principals share
+         this directory.
+
+         Modify for Users does mean an agent can delete their own spooled audio. That
+         is a deliberate, spec-level trade (6.8: "detect tampering and report it; do
+         not fight EDR or the user") — deletion shows up as a coverage gap against the
+         dialer CDR, which is a management conversation rather than an arms race. The
+         alternative, having the SYSTEM service own the spool, would require piping
+         every audio segment through the named pipe into session 0, which is a great
+         deal of machinery to make one deletion slightly harder.
+
+         `Inheritable="yes"` so the spool database, the WAL file and the staged files
+         created later inherit these permissions rather than the default
+         %PROGRAMDATA% ACL, under which a user can create a file but not modify one
+         another user created — which across a shift change is precisely the spool.
+    -->
+    <ComponentGroup Id="DataComponents">
+      <Component Id="DataFolderPerms" Directory="DATAFOLDER"
+                 Guid="6D9A4E57-7FCC-4C60-93A4-D1704CAFC466" Bitness="always64">
+        <CreateFolder>
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" Inheritable="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" Inheritable="yes" />
+          <util:PermissionEx User="Users"
+                             GenericRead="yes"
+                             GenericWrite="yes"
+                             GenericExecute="yes"
+                             Delete="yes"
+                             ReadAttributes="yes"
+                             WriteAttributes="yes"
+                             ReadExtendedAttributes="yes"
+                             WriteExtendedAttributes="yes"
+                             Inheritable="yes" />
+        </CreateFolder>
+        <!-- `RemoveFolder` removes the directory only if it is empty, which is the
+             behaviour we want: an uninstall on a machine that still holds unacked
+             audio leaves the spool in place rather than destroying evidence nobody
+             asked it to destroy. The deployment guide says to flush before
+             decommissioning; the directory is then empty and this removes it. -->
+        <RemoveFolder Id="RemoveDataFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\MagickVoice\Sentinel"
+                       Name="DataFolderAcl" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="DumpsFolder" Directory="DUMPSFOLDER"
+                 Guid="7EAB5F68-80DD-4D71-A4B5-E2815BD0D577" Bitness="always64">
+        <CreateFolder />
+        <RemoveFolder Id="RemoveDumpsFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\MagickVoice\Sentinel"
+                       Name="DumpsFolder" Type="string" Value="[DUMPSFOLDER]" KeyPath="yes" />
+      </Component>
+
+      <!-- The device certificate and its identity record. Users get read only: the
+           certificate is machine identity, renewed by the service, and an agent has
+           no reason to write it. The private key is not here at all — it is generated
+           non-exportably in CNG (spec 7.2) and never touches the filesystem. -->
+      <Component Id="DeviceFolder" Directory="DEVICEFOLDER"
+                 Guid="8FBC6079-91EE-4E82-B5C6-F3926CE1E688" Bitness="always64">
+        <CreateFolder>
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" Inheritable="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" Inheritable="yes" />
+          <util:PermissionEx User="Users" GenericRead="yes" GenericExecute="yes" Inheritable="yes" />
+        </CreateFolder>
+        <RemoveFolder Id="RemoveDeviceFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\MagickVoice\Sentinel"
+                       Name="DeviceFolder" Type="string" Value="[DEVICEFOLDER]" KeyPath="yes" />
+      </Component>
+
+      <!-- Staged MSIs, written and executed by the SYSTEM service. Users get nothing:
+           a directory a user can write and LocalSystem later executes from is a local
+           privilege escalation, and it is the first thing a security review looks
+           for. -->
+      <Component Id="StagingFolder" Directory="STAGINGFOLDER"
+                 Guid="90CD718A-A2FF-4F93-C6D7-04A37DF2F799" Bitness="always64">
+        <CreateFolder>
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" Inheritable="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" Inheritable="yes" />
+        </CreateFolder>
+        <RemoveFolder Id="RemoveStagingFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\MagickVoice\Sentinel"
+                       Name="StagingFolder" Type="string" Value="[STAGINGFOLDER]" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- =============================================== WebView2 bootstrapper ==
+         Installed only when the runtime is absent. `Impersonate="no"` because the
+         runtime is installed per machine and the deferred sequence runs as SYSTEM;
+         impersonating the installing user would produce a per-user runtime that the
+         next shift cannot see.
+
+         `Return="ignore"`: an air-gapped machine cannot reach the download and the
+         bootstrapper fails. Failing the whole install there would leave the floor
+         with no capture at all rather than with capture and no widget — a much worse
+         outcome for a compliance product. The failure is visible in the MSI log and,
+         once the service starts, in the heartbeat. See OPEN-5.
+    -->
+    <ComponentGroup Id="WebView2Components" Directory="INSTALLFOLDER">
+      <Component Id="WebView2Bootstrapper" Guid="A1DE829B-B300-40A4-D7E8-15B48E03089A" Bitness="always64">
+        <File Id="MicrosoftEdgeWebview2Setup"
+              Name="MicrosoftEdgeWebview2Setup.exe"
+              Source="$(var.RedistDir)\MicrosoftEdgeWebview2Setup.exe"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <CustomAction Id="InstallWebView2"
+                  FileRef="MicrosoftEdgeWebview2Setup"
+                  ExeCommand="/silent /install"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="InstallWebView2"
+              Before="InstallFinalize"
+              Condition="NOT SENTINELWEBVIEW2 AND NOT Installed" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="$(ProductName)" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="DataComponents" />
+      <ComponentGroupRef Id="WebView2Components" />
+    </Feature>
+
+    <!-- No UI: this package is deployed by SCCM or Intune, always silently. A UI
+         sequence would be dead weight and one more thing to localise. -->
+    <UIRef Id="WixUI_ErrorProgressText" />
+  </Package>
+</Wix>

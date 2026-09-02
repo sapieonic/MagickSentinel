@@ -1,0 +1,91 @@
+{
+  "$comment": "Cross-language conformance vectors for contracts/wire.md v1. Both the Rust client (client/sentinel-core/src/protocol.rs) and the Go gateway (server/gateway/internal/wire) encode and decode these exact bytes. If a change to either side does not also change this file, one of them has drifted.",
+  "media_records": [
+    {
+      "name": "far channel, first segment, no flags",
+      "record": {
+        "channel": 0,
+        "flags": {
+          "foreign": false,
+          "silence_inserted": false
+        },
+        "seq": 0,
+        "timestamp_ms": 0,
+        "call_id_hex": "0192a4b0c1d2e3f405162738495a6b7c",
+        "payload_hex": "0102030405"
+      },
+      "encoded_hex": "010000000000000000000000000000000192a4b0c1d2e3f405162738495a6b7c05000102030405"
+    },
+    {
+      "name": "near channel, foreign flag, large sequence and timestamp",
+      "record": {
+        "channel": 1,
+        "flags": {
+          "foreign": true,
+          "silence_inserted": false
+        },
+        "seq": 842,
+        "timestamp_ms": 842000,
+        "call_id_hex": "0192a4b0c1d2e3f405162738495a6b7c",
+        "payload_hex": "ff"
+      },
+      "encoded_hex": "010101004a03000010d90c00000000000192a4b0c1d2e3f405162738495a6b7c0100ff"
+    },
+    {
+      "name": "silence inserted over a glitch gap, empty payload",
+      "record": {
+        "channel": 0,
+        "flags": {
+          "foreign": false,
+          "silence_inserted": true
+        },
+        "seq": 4294967295,
+        "timestamp_ms": 1099511627775,
+        "call_id_hex": "ffffffffffffffffffffffffffffffff",
+        "payload_hex": ""
+      },
+      "encoded_hex": "01000200ffffffffffffffffff000000ffffffffffffffffffffffffffffffff0000"
+    }
+  ],
+  "segment_payload": {
+    "$comment": "50 length-delimited Opus packets; a zero length marks a frame dropped by a glitch, which the decoder replaces with 20 ms of silence.",
+    "frames_hex": [
+      "aabb",
+      "",
+      "cc"
+    ],
+    "packed_hex": "0200aabb00000100cc"
+  },
+  "invalid": [
+    {
+      "name": "unknown version",
+      "hex": "02000000000000000000000000000000000000000000000000000000000000000000",
+      "error": "version"
+    },
+    {
+      "name": "reserved flag bit set",
+      "hex": "01008000000000000000000000000000000000000000000000000000000000000000",
+      "error": "reserved_flags"
+    },
+    {
+      "name": "reserved byte non-zero",
+      "hex": "01000009000000000000000000000000000000000000000000000000000000000000",
+      "error": "reserved_byte"
+    },
+    {
+      "name": "channel out of range",
+      "hex": "01020000000000000000000000000000000000000000000000000000000000000000",
+      "error": "channel"
+    },
+    {
+      "name": "truncated header",
+      "hex": "010000000000",
+      "error": "truncated"
+    },
+    {
+      "name": "payload shorter than declared length",
+      "hex": "0100000000000000000000000000000000000000000000000000000000000000ff00aa",
+      "error": "truncated"
+    }
+  ]
+}

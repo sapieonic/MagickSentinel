@@ -1,0 +1,9 @@
+# Build output.
+out/
+obj/
+bin/
+
+# Third-party payloads are fetched and verified per release; see redist/README.md.
+redist/*.exe
+redist/*.cab
+redist/*.msi

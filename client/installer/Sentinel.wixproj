@@ -1,0 +1,30 @@
+<Project Sdk="WixToolset.Sdk/4.0.5">
+  <PropertyGroup>
+    <OutputName>Sentinel</OutputName>
+    <OutputType>Package</OutputType>
+    <!-- x64 only. Tier C includes x86, and an x64 package is refused by Windows on an
+         x86 machine before any launch condition runs. -->
+    <Platform>x64</Platform>
+    <!-- Treat WiX warnings as errors: an ICE warning about a component rule or a
+         missing permission is exactly the kind of thing that ships and then fails on
+         one machine in fifty. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <SuppressValidation>false</SuppressValidation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="4.0.5" />
+    <PackageReference Include="WixToolset.UI.wixext" Version="4.0.5" />
+  </ItemGroup>
+
+  <!-- Supplied by build.ps1:
+         ProductVersion  three-part MSI version, from Cargo.toml
+         BinDir          the directory holding the two signed .exe files
+         WebDir          the built widget bundle
+         RedistDir       the directory holding MicrosoftEdgeWebview2Setup.exe -->
+  <PropertyGroup>
+    <DefineConstants>
+      ProductVersion=$(ProductVersion);BinDir=$(BinDir);WebDir=$(WebDir);RedistDir=$(RedistDir)
+    </DefineConstants>
+  </PropertyGroup>
+</Project>

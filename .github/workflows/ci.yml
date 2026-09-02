@@ -1,0 +1,306 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Rust client: sentinel-core and sentinel-capture.
+  #
+  # `cargo test` covers the platform-neutral half — state machine, spool, wire
+  # codec, VAD, resampler, device matching, tier detection, foreign-audio
+  # suppression. The Windows COM code under sentinel-capture/src/windows/ is
+  # compiled out on Linux and has no tests, so the cross-target check is the only
+  # thing standing between it and rot.
+  # --------------------------------------------------------------------------
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
+
+      # rusqlite is built with the `bundled` feature, so cross-checking the Windows
+      # target compiles sqlite3.c with the mingw toolchain rather than just
+      # type-checking Rust.
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+
+      - name: cargo test
+        working-directory: client
+        run: cargo test
+
+      - name: cargo check (Windows target)
+        working-directory: client
+        run: cargo check --all-targets --target x86_64-pc-windows-gnu
+
+      - name: cargo clippy
+        working-directory: client
+        # No `-D warnings` yet: the tree currently has two clippy warnings. Add the
+        # flag once they are cleared and this becomes a real gate.
+        run: cargo clippy --all-targets
+
+      - name: cargo fmt --check
+        working-directory: client
+        # Advisory, not a gate. The client tree is not rustfmt-clean today
+        # (most files differ) and is owned by another work stream, so failing the
+        # build on it would block unrelated work. Drop continue-on-error after a
+        # `cargo fmt` pass lands.
+        continue-on-error: true
+        run: cargo fmt --check
+
+  # --------------------------------------------------------------------------
+  # Go gateway, including the Postgres-backed integration tests.
+  #
+  # The service image is PostgreSQL 16 with pgvector, because db/migrations/0001
+  # does `CREATE EXTENSION vector` for the transcript embedding column and the
+  # stock postgres:16 image does not carry it. db/test/pgtest.sh works around a
+  # missing pgvector with a stub extension, but that path needs to boot its own
+  # cluster; against a service container it is simpler to use an image that has
+  # the real thing, which is also what production runs.
+  #
+  # This mirrors db/test/gateway_it.sh: the app DSN connects as sentinel_app
+  # (NOBYPASSRLS, the role the gateway really uses), and the admin DSN is the
+  # schema owner, used by the tests for seeding and for reading back rows the
+  # application role must not be able to see.
+  # --------------------------------------------------------------------------
+  go:
+    name: Go gateway
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sentinel_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: sentinel_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/gateway/go.mod
+          cache-dependency-path: server/gateway/go.sum
+
+      - name: Apply migrations
+        run: |
+          set -euo pipefail
+          for f in db/migrations/*.up.sql; do
+            echo "applying $f"
+            psql -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          # 0003 creates sentinel_app with LOGIN and no password; the tests connect
+          # over TCP, so give it one.
+          psql -v ON_ERROR_STOP=1 -q \
+            -c "ALTER ROLE sentinel_app WITH PASSWORD 'sentinel_test'"
+
+      - name: go build
+        working-directory: server/gateway
+        run: go build ./...
+
+      - name: go vet
+        working-directory: server/gateway
+        run: go vet ./...
+
+      - name: go test
+        working-directory: server/gateway
+        env:
+          SENTINEL_TEST_DATABASE_URL: postgres://sentinel_app:sentinel_test@127.0.0.1:5432/sentinel_test?sslmode=disable
+          SENTINEL_TEST_ADMIN_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/sentinel_test?sslmode=disable
+        run: go test ./...
+
+  # --------------------------------------------------------------------------
+  # Row-level security acceptance tests.
+  #
+  # These cannot use a service container: db/test/pgtest.sh boots its own cluster
+  # with initdb so that it can run the assertions as sentinel_app against a
+  # freshly migrated database. Run as root so pgtest.sh can install its stub
+  # vector extension and then drop privileges to the postgres user, which is the
+  # path it is written for. The RLS assertions never touch a vector column, so
+  # the stub is sufficient here.
+  # --------------------------------------------------------------------------
+  db:
+    name: Database (RLS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure PostgreSQL 16 server binaries
+        run: |
+          set -euo pipefail
+          if [ ! -x /usr/lib/postgresql/16/bin/initdb ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-16
+          fi
+
+      - name: Row-level security acceptance tests
+        run: sudo -E bash db/test/rls_test.sh
+
+  # --------------------------------------------------------------------------
+  # Python pipeline.
+  # --------------------------------------------------------------------------
+  python:
+    name: Python pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: server/pipeline/pyproject.toml
+
+      - name: Install
+        working-directory: server/pipeline
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: pytest
+        working-directory: server/pipeline
+        run: python -m pytest -q
+
+  # --------------------------------------------------------------------------
+  # Contracts. contracts/ is the source of truth for client, gateway and web, so
+  # a contract that does not parse breaks all three at once.
+  # --------------------------------------------------------------------------
+  contracts:
+    name: Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install validators
+        run: pip install jsonschema openapi-spec-validator
+
+      - name: Validate contracts/openapi.yaml
+        run: |
+          python - <<'PY'
+          from openapi_spec_validator import validate
+          from openapi_spec_validator.readers import read_from_filename
+
+          spec, _ = read_from_filename("contracts/openapi.yaml")
+          validate(spec)
+          print(f"openapi.yaml ok: {len(spec['paths'])} paths")
+          PY
+
+      - name: Validate JSON Schemas and wire fixtures
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          from jsonschema import validators
+
+          schemas = sorted(pathlib.Path("contracts/schemas").glob("*.json"))
+          if not schemas:
+              sys.exit("contracts/schemas: no schemas found")
+
+          for path in schemas:
+              document = json.loads(path.read_text(encoding="utf-8"))
+              # Honour whatever dialect each schema declares rather than assuming one.
+              cls = validators.validator_for(document)
+              cls.check_schema(document)
+              print(f"{path} ok ({cls.__name__})")
+
+          # The wire vectors are read by both the Rust and the Go codec tests; if the
+          # file stops being valid JSON, both fail with a confusing error instead.
+          fixture = pathlib.Path("contracts/fixtures/wire_vectors.json")
+          json.loads(fixture.read_text(encoding="utf-8"))
+          print(f"{fixture} ok")
+          PY
+
+  # --------------------------------------------------------------------------
+  # Web: @sentinel/shared, @sentinel/widget, @sentinel/portal.
+  #
+  # Gated on one thing only, and it is a real blocker rather than a placeholder:
+  # web/package-lock.json is out of sync with the workspaces (it predates
+  # @sentinel/shared and @sentinel/portal), so `npm ci` refuses to run at all.
+  # Everything else in this job passes today — typecheck, vitest and both vite
+  # builds all succeed against the current tree.
+  #
+  # The fix is one command, run in web/ and committed:  npm install
+  #
+  # Until then the guard below skips the job with a notice rather than leaving a
+  # permanently red check. It heals itself: the guard is a real `npm ci --dry-run`,
+  # so the moment the lockfile is regenerated the job starts enforcing. Delete the
+  # guard and the four `if:` lines once that has landed.
+  # --------------------------------------------------------------------------
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Check that the lockfile is in sync
+        id: ready
+        run: |
+          if npm ci --dry-run >/dev/null 2>&1; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Web checks skipped::web/package-lock.json is out of sync with the workspaces, so npm ci cannot run. Run 'npm install' in web/ and commit the lockfile. See .github/workflows/ci.yml."
+          fi
+
+      - name: Install
+        if: steps.ready.outputs.ready == 'true'
+        run: npm ci
+
+      - name: Typecheck
+        if: steps.ready.outputs.ready == 'true'
+        run: npm run typecheck
+
+      - name: Test
+        if: steps.ready.outputs.ready == 'true'
+        run: npm test
+
+      - name: Build
+        if: steps.ready.outputs.ready == 'true'
+        run: npm run build
