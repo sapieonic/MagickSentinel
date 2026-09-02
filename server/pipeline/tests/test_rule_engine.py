@@ -249,6 +249,106 @@ def test_one_finding_per_rule_not_one_per_synonym(engine):
 def test_normalisation_makes_matching_script_and_punctuation_insensitive():
     assert normalise("Police  Case!!") == normalise("police case")
     assert normalise("गिरफ्तार,") == normalise("गिरफ्तार")
+    # The two assertions above both passed while normalise() was deleting every
+    # Devanagari matra, because it deleted them from both sides. Comparing against
+    # the literal is what actually pins the property.
+    assert normalise("गिरफ्तार,") == "गिरफ्तार"
+
+
+# -------------------------------------------------------- indian languages
+#
+# The rule set ships each non-English term in both its native script and a
+# romanisation, because ASR output for one Hinglish call is not consistently in one
+# script. These pin the folds that make one list entry cover both, and the price
+# paid for them.
+
+
+def test_normalise_keeps_the_combining_marks_devanagari_is_written_with():
+    # The regression that motivated all of this: a punctuation strip written as
+    # [^\w\s] deletes combining marks, because \w does not match category Mn.
+    # कमीने became "कम न" and no Hindi term could ever match.
+    assert normalise("कमीने") == "कमीने"
+    assert normalise("तुम कमीने हो!") == "तुम कमीने हो"
+    assert normalise("बदतमीज़") == "बदतमीज़", "the nukta is a combining mark too"
+    assert normalise("முட்டாள்") == "முட்டாள்"
+    assert normalise("సిగ్గు లేని") == "సిగ్గు లేని"
+
+
+def test_zero_width_joiners_do_not_split_a_word_in_two():
+    # ZWNJ is a format character and appears inside Devanagari words. Replacing it
+    # with a space would turn one word into two and break a single-word term.
+    assert normalise("क\u200dमीने") == "कमीने"
+
+
+def test_devanagari_abuse_fires_the_same_rule_as_its_romanisation(engine):
+    near = channel(Channel.NEAR, (0, COMPLIANT_OPENING), (50_000, "तुम कमीने हो"))
+    assert "abusive_language" in rule_ids(engine.evaluate(call(near=near)))
+
+
+@pytest.mark.parametrize("form", ["kamine", "kaminey", "kameene", "kamina", "kaminon"])
+def test_romanised_inflections_all_match_one_list_entry(engine, form):
+    # Hindi inflects where English does not, and its romanisation is not
+    # standardised. Without the fold each of these needs its own list entry, and
+    # whichever one nobody thought of is a silent miss.
+    near = channel(Channel.NEAR, (0, COMPLIANT_OPENING), (50_000, f"tum {form} ho"))
+    assert "abusive_language" in rule_ids(engine.evaluate(call(near=near)))
+
+
+@pytest.mark.parametrize("form", ["कमीने", "कमीना", "कमीनों", "कुत्ते", "कुत्ता", "कुत्तों"])
+def test_devanagari_case_endings_all_match_one_list_entry(engine, form):
+    near = channel(Channel.NEAR, (0, COMPLIANT_OPENING), (50_000, f"तुम {form} हो"))
+    assert "abusive_language" in rule_ids(engine.evaluate(call(near=near)))
+
+
+def test_tamil_and_telugu_fire_in_their_own_scripts(engine):
+    for text in ("நீ முட்டாள்", "నువ్వు దొంగోడు"):
+        near = channel(Channel.NEAR, (0, COMPLIANT_OPENING), (50_000, text))
+        assert "abusive_language" in rule_ids(engine.evaluate(call(near=near))), text
+
+
+def test_hindi_threats_fire_in_devanagari(engine):
+    near = channel(Channel.NEAR, (0, COMPLIANT_OPENING), (30_000, "हम तुम्हें जेल भेज देंगे"))
+    assert "false_legal_threat" in rule_ids(engine.evaluate(call(near=near)))
+
+
+def test_a_devanagari_opening_is_a_compliant_identification(engine):
+    # The mirror of the rules above: the folds must also let an agent who did the
+    # right thing in Hindi off the hook, or the queue fills with correct calls.
+    near = channel(
+        Channel.NEAR,
+        (0, "नमस्ते मेरा नाम रवि है मैं एक्मे रिकवरी की तरफ से बोल रहा हूँ "
+            "आपके लोन के बारे में बात करनी है"),
+    )
+    fired = rule_ids(engine.evaluate(call(near=near)))
+    assert "no_purpose_disclosure" not in fired
+
+
+def test_the_loose_fold_is_not_applied_to_english_terms(engine):
+    # English is not inflected the way Hindi is and gains nothing from the stem,
+    # while an over-eager fold there costs precision on the language most of the
+    # list is written in. "cheats" must not match the entry "cheat".
+    near = channel(Channel.NEAR, (0, COMPLIANT_OPENING), (50_000, "The lender cheats nobody."))
+    assert "abusive_language" not in rule_ids(engine.evaluate(call(near=near)))
+
+
+def test_the_romanised_fold_costs_precision_and_the_judge_is_why_that_is_affordable(engine):
+    # A known, accepted collision: "chore" folds to the same stem as the Hindi
+    # "chor". It is pinned rather than hidden — every rule that uses the loose fold
+    # on a conduct term carries judge:true, so tier 2 sees this one and dismisses
+    # it. If the fold is ever tightened, this test is the record of what changed.
+    near = channel(Channel.NEAR, (0, COMPLIANT_OPENING), (50_000, "That is not my chore."))
+    assert "abusive_language" in rule_ids(engine.evaluate(call(near=near)))
+
+
+def test_the_folds_do_not_fire_on_an_ordinary_english_collections_call(engine):
+    near = channel(
+        Channel.NEAR,
+        (0, COMPLIANT_OPENING),
+        (40_000, "Your outstanding balance is fifteen thousand rupees and the payment "
+                 "was due on the second. Can you transfer it this week?"),
+    )
+    far = channel(Channel.FAR, (60_000, "Yes, I will transfer it on Friday."))
+    assert rule_ids(engine.evaluate(call(near=near, far=far))) == set()
 
 
 def test_hindi_terms_match_even_when_the_asr_labelled_the_call_english(engine):

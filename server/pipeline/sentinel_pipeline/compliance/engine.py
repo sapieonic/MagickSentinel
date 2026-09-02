@@ -107,29 +107,120 @@ def load_default_rule_set(path: Path | None = None) -> RuleSet:
 
 
 def normalise(text: str) -> str:
-    """Fold a transcript to a comparable form.
+    """Fold text to a comparable form, without destroying non-Latin scripts.
 
-    Devanagari and Latin transcripts of the same Hinglish call differ in
-    punctuation, casing and combining marks. NFKC plus casefold plus punctuation
-    stripping gets term matching to behave the same either way, which matters
-    because ASR output for one language mix is not consistently in one script.
+    Strip by Unicode category rather than by ``\\w``: ``\\w`` excludes combining
+    marks, so a punctuation strip written against it deletes every Devanagari matra
+    and turns ``कमीने`` into ``कम न``. Every Indic script on the support list is
+    written with combining marks, so that one character class silently disabled
+    native-script matching for four of the five languages the rule set covers.
+
+    Format characters (ZWJ, ZWNJ) are dropped rather than replaced with a space:
+    they appear inside Devanagari words and substituting a space would split one
+    word into two.
     """
     folded = unicodedata.normalize("NFKC", text).casefold()
-    folded = re.sub(r"[^\w\s]+", " ", folded, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", folded).strip()
+    kept: list[str] = []
+    for ch in folded:
+        category = unicodedata.category(ch)
+        if ch.isspace() or category[0] in "LNM":
+            kept.append(ch)
+        elif category != "Cf":
+            kept.append(" ")
+    return re.sub(r"\s+", " ", "".join(kept)).strip()
 
 
-def _terms(params: dict, key: str = "terms") -> list[str]:
-    """Flatten the per-language term lists into one list.
+# Romanisation variance that carries no meaning: vowel length is not written
+# consistently by any ASR, and z/j, v/w, q/k are the usual transliteration splits.
+_ROMAN_DIGRAPHS = (("ee", "i"), ("oo", "u"), ("ii", "i"), ("uu", "u"), ("aa", "a"))
+_ROMAN_LETTERS = str.maketrans({"z": "j", "w": "v", "q": "k"})
+
+
+def romanised(text: str) -> str:
+    """Fold romanised Indic text to a stem, so inflections match one list entry.
+
+    Hindi inflects where English does not — ``kamine``, ``kamina`` and ``kaminon``
+    are one word — and its romanisation is not standardised, so an exact-match term
+    list needs five entries per word to reach the recall one entry gets in English.
+    This collapses the variance that carries no meaning: vowel length, z/j and v/w,
+    doubled letters, and the oblique and plural endings.
+
+    It does **not** try to be a transliterator or a phonetic algorithm. Genuinely
+    different spellings — ``bhikhari`` and ``bhikari``, aspirated or not — stay
+    different and belong in the term list as separate entries. Fold handles
+    inflection; the list handles spelling.
+    """
+    out: list[str] = []
+    for word in normalise(text).split(" "):
+        for src, dst in _ROMAN_DIGRAPHS:
+            word = word.replace(src, dst)
+        word = word.translate(_ROMAN_LETTERS)
+        word = re.sub(r"(.)\1+", r"\1", word)
+        word = re.sub(r"(?:ey|ay)$", "e", word)
+        word = re.sub(r"(?:on|en|o)$", "", word) or word
+        word = re.sub(r"s$", "", word) or word
+        word = re.sub(r"[aeiou]+$", "", word) or word
+        out.append(word)
+    return " ".join(out)
+
+
+def indic(text: str) -> str:
+    """Strip trailing combining marks, the native-script analogue of `romanised`.
+
+    ``कमीने``/``कमीना``/``कमीनों`` differ only in the vowel sign they end on, so
+    dropping trailing marks collapses them to one stem the way the romanised fold
+    collapses their transliterations. Applied to both sides of the comparison, so a
+    term list carries the base form and matches every case ending.
+    """
+    out: list[str] = []
+    for word in normalise(text).split(" "):
+        stripped = word
+        while stripped and unicodedata.category(stripped[-1]) in ("Mn", "Mc"):
+            stripped = stripped[:-1]
+        out.append(stripped or word)
+    return " ".join(out)
+
+
+def _is_latin(text: str) -> bool:
+    for ch in text:
+        if ch.isalpha():
+            return "LATIN" in unicodedata.name(ch, "")
+    return True
+
+
+@dataclass(frozen=True)
+class Term:
+    """One entry of a term list, and the fold that should match it.
+
+    The fold is chosen from the term's own script rather than from the language key
+    it was filed under. Rule sets are tenant-editable, so a convention that says
+    "put Devanagari in `hi` and romanised Hindi in `hi-Latn`" is a convention
+    somebody will break; the script of the string itself cannot be got wrong.
+    """
+
+    text: str
+    language: str
+
+    @property
+    def fold(self) -> Callable[[str], str]:
+        if not _is_latin(self.text):
+            return indic
+        # English is not inflected the way Hindi is and gains nothing from the
+        # romanised fold, while an over-eager stem there costs precision.
+        return normalise if self.language == "en" else romanised
+
+
+def _terms(params: dict, key: str = "terms") -> list[Term]:
+    """Flatten the per-language term lists, keeping the language each came from.
 
     Language detection on code-mixed Hinglish is unreliable, and a Hindi threat in a
     call the ASR labelled English must still fire. Matching against every language's
     list costs a little precision and buys back the recall that actually matters.
     """
     by_language = params.get(key) or {}
-    out: list[str] = []
-    for terms in by_language.values():
-        out.extend(terms)
+    out: list[Term] = []
+    for language, terms in by_language.items():
+        out.extend(Term(text=term, language=language) for term in terms)
     return out
 
 
@@ -140,11 +231,13 @@ class _Hit:
     text: str
 
 
-def _find_terms(t: ChannelTranscript, terms: Iterable[str], window: tuple[int, int] | None = None) -> list[_Hit]:
+def _find_terms(t: ChannelTranscript, terms: Iterable[Term], window: tuple[int, int] | None = None) -> list[_Hit]:
     """Locate each term in a channel, returning spans in call time.
 
-    Matching happens over the normalised word stream rather than the raw text so a
-    multi-word term still resolves to real timestamps.
+    Matching happens over the folded word stream rather than the raw text so a
+    multi-word term still resolves to real timestamps. Each term brings its own fold
+    (see :class:`Term`), and the haystack is folded the same way, so a romanised
+    Hindi term never has to match against text that was folded for English.
     """
     if not t:
         return []
@@ -153,20 +246,26 @@ def _find_terms(t: ChannelTranscript, terms: Iterable[str], window: tuple[int, i
         # No word timings: fall back to whole-text matching and report the whole
         # channel as the span. Less useful evidence, but better than dropping the
         # finding, and the ASR adapters all supply timings in practice.
-        haystack = normalise(t.text)
         hits = []
         for term in terms:
-            needle = normalise(term)
-            if needle and needle in haystack:
-                hits.append(_Hit(0, 0, term))
+            fold = term.fold
+            needle = fold(term.text)
+            if needle and needle in fold(t.text):
+                hits.append(_Hit(0, 0, term.text))
         return hits
 
-    normalised = [normalise(w.text) for w in words]
+    folded: dict[Callable[[str], str], list[str]] = {}
     hits: list[_Hit] = []
     for term in terms:
-        needle = normalise(term)
+        fold = term.fold
+        needle = fold(term.text)
         if not needle:
             continue
+        # One pass per distinct fold, not per term: three folds over a channel
+        # instead of one per entry in a term list that runs to dozens.
+        normalised = folded.get(fold)
+        if normalised is None:
+            normalised = folded[fold] = [fold(w.text) for w in words]
         parts = needle.split(" ")
         n = len(parts)
         for i in range(len(normalised) - n + 1):
@@ -376,7 +475,9 @@ class RuleEngine:
         if not opening.strip():
             return []
         agency_terms = _terms(rule.params, "agency_terms")
-        said_agency = any(normalise(term) in normalise(opening) for term in agency_terms)
+        said_agency = any(
+            term.fold(term.text) in term.fold(opening) for term in agency_terms
+        )
         # A name is any capitalised token that is not a sentence opener; ASR output
         # is unreliable about casing, so this is a weak signal and is only used to
         # avoid flagging a call that clearly did introduce someone.
