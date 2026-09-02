@@ -5,7 +5,8 @@
 # Two accommodations for container images:
 #
 #   * initdb refuses to run as root, so when we are root we re-exec the *calling*
-#     script as an unprivileged user (default `postgres`).
+#     script as an unprivileged user -- $SUDO_USER if we got here through `sudo`,
+#     otherwise `postgres`. See the probe below for why the choice is not free.
 #   * pgvector is not in every dev image. When it is missing we install a stub
 #     extension so the schema still applies; embedding columns then behave as opaque
 #     text and vector-search tests skip. Production images MUST carry the real one.
@@ -40,17 +41,41 @@ CREATE TYPE vector (
 SQL
   fi
 
-  PGTEST_USER=${PGTEST_USER:-postgres}
-  if id "$PGTEST_USER" >/dev/null 2>&1; then
-    workdir=$(mktemp -d)
-    chown -R "$PGTEST_USER" "$workdir"
-    exec setpriv --reuid "$PGTEST_USER" --regid "$(id -g "$PGTEST_USER")" --init-groups \
-      env PGTEST_DROPPED_PRIV=1 HOME="$workdir" PGDATA="$workdir/pgdata" \
-          PGHOST="$workdir" PGTEST_ENTRY="$PGTEST_ENTRY" PATH="$PATH" \
-      bash "$PGTEST_ENTRY"
+  # Choosing who to become is not just "any non-root user": that account also has
+  # to be able to *read* the checkout. $SUDO_USER is tried first because under
+  # `sudo` it owns the checkout by construction. `postgres` is the fallback for a
+  # plain root shell, and it is the one that bites: on a GitHub Actions runner
+  # /home/runner is not world-traversable, so `bash /home/runner/work/.../x.sh`
+  # dies with a bare "Permission denied" and exit 126 — no mention of which
+  # directory refused, or that a uid change was involved at all. So probe for
+  # readability before committing to a user, and say so plainly if none works.
+  if [ -n "${PGTEST_USER:-}" ]; then
+    candidates=("$PGTEST_USER")
+  else
+    candidates=(${SUDO_USER:+"$SUDO_USER"} postgres)
   fi
-  echo "pgtest: running as root and no unprivileged user available; skipping" >&2
-  exit 77
+
+  target=
+  for candidate in "${candidates[@]}"; do
+    id -u "$candidate" >/dev/null 2>&1 || continue
+    [ "$(id -u "$candidate")" != 0 ] || continue
+    setpriv --reuid "$candidate" --regid "$(id -g "$candidate")" --init-groups \
+      test -r "$PGTEST_ENTRY" 2>/dev/null || continue
+    target=$candidate
+    break
+  done
+
+  if [ -z "$target" ]; then
+    echo "pgtest: no unprivileged user can read $PGTEST_ENTRY (tried: ${candidates[*]})" >&2
+    exit 1
+  fi
+
+  workdir=$(mktemp -d)
+  chown -R "$target" "$workdir"
+  exec setpriv --reuid "$target" --regid "$(id -g "$target")" --init-groups \
+    env PGTEST_DROPPED_PRIV=1 HOME="$workdir" PGDATA="$workdir/pgdata" \
+        PGHOST="$workdir" PGTEST_ENTRY="$PGTEST_ENTRY" PATH="$PATH" \
+    bash "$PGTEST_ENTRY"
 fi
 
 export PGDATA=${PGDATA:-$(mktemp -d)/pgdata}
