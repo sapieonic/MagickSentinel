@@ -45,7 +45,7 @@
 #     Win32 OpenSSL installer provide — ships an IMPORT library. Linking it makes
 #     SentinelAgent.exe and SentinelService.exe depend on `libcrypto-3-x64.dll` at
 #     runtime.
-#   * A STATIC OpenSSL — vcpkg's `x64-windows-static-md` triplet — ships a full static
+#   * A STATIC OpenSSL — vcpkg's `x64-windows-static` triplet — ships a full static
 #     library. libcrypto is linked into the executables and there is no DLL.
 #
 # The first is unacceptable for this product, for three reasons that compound:
@@ -64,10 +64,20 @@
 #     "a directory a user can write and LocalSystem later executes from" as a local
 #     privilege escalation.
 #
-# `-static-md` rather than plain `-static`: `-md` means statically linked OpenSSL
-# against the DYNAMIC MSVC runtime, which is what rustc's default MSVC target uses.
-# Mixing CRT linkage produces a duplicate-symbol link error that is even less legible
-# than the missing-library one.
+# Plain `-static`, NOT `-static-md`. The two differ only in which MSVC runtime
+# OpenSSL is linked against -- `-md` is the dynamic one -- and everything in the final
+# binary has to agree, or the link fails with duplicate symbols rather than a legible
+# diagnostic.
+#
+# This used to be `-static-md`, correctly, because rustc's default MSVC target uses
+# the dynamic CRT. That default is no longer in force: `client/.cargo/config.toml`
+# sets `-C target-feature=+crt-static`, because the dynamic CRT left the shipping
+# binaries importing `vcruntime140.dll`, which is redistributable and absent from a
+# clean Windows 10 image -- an MSI that installs onto a machine where the service can
+# never start. So the static-CRT triplet is now the matching half.
+#
+# The two must be changed together. If the cargo config's flag is ever dropped, this
+# has to go back to `-static-md` in the same commit.
 #
 # The cost is a vcpkg build on a cold cache, which is minutes. `Swatinem/rust-cache`
 # does not cache it (it is outside the cargo directories), so it is paid per run until
@@ -93,7 +103,7 @@ inputs:
       runtime, which is what rustc's MSVC target uses and what keeps the shipped
       binaries free of an OpenSSL DLL dependency.
     required: false
-    default: x64-windows-static-md
+    default: x64-windows-static
 
 outputs:
   openssl-dir:
