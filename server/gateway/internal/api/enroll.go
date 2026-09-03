@@ -41,24 +41,33 @@ type enrollRequest struct {
 // the token is consumed atomically before the certificate is signed, so a retry with
 // the same token fails even if the response was lost.
 func (s *Server) enrollDevice(w http.ResponseWriter, r *http.Request) {
-	var body enrollRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
-		httpx.WriteError(w, r, http.StatusBadRequest, "bad_request", "malformed enrollment request")
-		return
-	}
+	// The CA is checked before anything else is parsed. Main refuses to start
+	// without one, so reaching this branch means either a development build or a
+	// deployment that lost its secret mount — and in both cases the operator wants
+	// to hear "no CA" rather than "malformed request", which is what a body check
+	// first would have said for a request that was fine.
 	if s.CA == nil {
+		s.Metrics.Enrollment(r.Context(), "no_ca")
 		httpx.WriteError(w, r, http.StatusServiceUnavailable, "no_ca",
 			"no certificate authority is configured")
 		return
 	}
+	var body enrollRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
+		s.Metrics.Enrollment(r.Context(), "bad_request")
+		httpx.WriteError(w, r, http.StatusBadRequest, "bad_request", "malformed enrollment request")
+		return
+	}
 	if body.EnrollmentToken == "" || body.CSRPEM == "" || body.MachineGUID == "" ||
 		body.HWFingerprint == "" {
+		s.Metrics.Enrollment(r.Context(), "bad_request")
 		httpx.WriteError(w, r, http.StatusBadRequest, "bad_request", "missing required fields")
 		return
 	}
 	if body.CaptureTier != "A" && body.CaptureTier != "B" {
 		// Tier C machines are meant to be blocked by the installer; if one reaches
 		// here the installer was bypassed and it must not be enrolled.
+		s.Metrics.Enrollment(r.Context(), "unsupported_tier")
 		httpx.WriteError(w, r, http.StatusBadRequest, "unsupported_tier",
 			"this OS build does not support audio capture")
 		return
@@ -66,6 +75,7 @@ func (s *Server) enrollDevice(w http.ResponseWriter, r *http.Request) {
 
 	csr, err := parseAndVerifyCSR(body.CSRPEM)
 	if err != nil {
+		s.Metrics.Enrollment(r.Context(), "bad_csr")
 		httpx.WriteError(w, r, http.StatusBadRequest, "bad_csr", err.Error())
 		return
 	}
@@ -73,11 +83,13 @@ func (s *Server) enrollDevice(w http.ResponseWriter, r *http.Request) {
 	now := s.now()
 	tenantID, err := s.Store.ConsumeEnrollmentToken(r.Context(), body.EnrollmentToken, now)
 	if errors.Is(err, store.ErrTokenUnusable) {
+		s.Metrics.Enrollment(r.Context(), "token_unusable")
 		httpx.WriteError(w, r, http.StatusUnauthorized, "token_unusable",
 			"enrollment token is invalid, expired, or already used")
 		return
 	}
 	if err != nil {
+		s.Metrics.Enrollment(r.Context(), "internal")
 		s.fail(w, r, err)
 		return
 	}
@@ -86,6 +98,13 @@ func (s *Server) enrollDevice(w http.ResponseWriter, r *http.Request) {
 	deviceID := newDeviceID()
 	certPEM, chainPEM, err := s.CA.Sign(csr, tenantID, deviceID, notAfter)
 	if err != nil {
+		// The enrollment token has already been consumed at this point, and that
+		// ordering is deliberate — it is what stops a retry minting a second
+		// certificate — so a signing failure costs the operator a token. That is
+		// the right trade, and it is also why the CA validates everything it can
+		// at load time (internal/ca): a misconfigured intermediate should fail the
+		// deploy, not burn a token per desktop during a floor rollout.
+		s.Metrics.Enrollment(r.Context(), "sign_failed")
 		s.Log.Error("enroll: sign certificate", "error", err)
 		httpx.WriteError(w, r, http.StatusInternalServerError, "internal", "could not issue a certificate")
 		return
@@ -93,15 +112,18 @@ func (s *Server) enrollDevice(w http.ResponseWriter, r *http.Request) {
 
 	fingerprint, err := fingerprintOfPEM(certPEM)
 	if err != nil {
+		s.Metrics.Enrollment(r.Context(), "internal")
 		s.fail(w, r, err)
 		return
 	}
 	realID, err := s.Store.RegisterDevice(r.Context(), tenantID, body.MachineGUID,
 		body.HWFingerprint, fingerprint, body.OSBuild, body.CaptureTier, body.AgentVersion, notAfter)
 	if err != nil {
+		s.Metrics.Enrollment(r.Context(), "internal")
 		s.fail(w, r, err)
 		return
 	}
+	s.Metrics.Enrollment(r.Context(), "issued")
 
 	_ = s.Store.Audit(r.Context(), &auth.Identity{
 		TenantID: tenantID, UserUID: "system", Role: auth.RoleAdmin,

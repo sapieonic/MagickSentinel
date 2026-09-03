@@ -1,0 +1,124 @@
+# Makes `cargo build --features sentinel-core/sqlcipher` work on a Windows runner.
+#
+# WHY THIS EXISTS AT ALL, because the failure it prevents is thoroughly misleading.
+#
+# `sentinel-core`'s `sqlcipher` feature switches rusqlite from `bundled` to
+# `bundled-sqlcipher`. That change is smaller than it sounds and larger than it
+# looks: rusqlite vendors SQLCipher's C amalgamation, so there is no SQLCipher to
+# install — but SQLCipher's crypto provider is OpenSSL's libcrypto, and rusqlite
+# links that from the *system* rather than vendoring it. (The rusqlite feature that
+# also vendors OpenSSL is `bundled-sqlcipher-vendored-openssl`; the workspace does
+# not use it, and picking the feature set is `client/`'s decision, not CI's.)
+#
+# So on a machine with no discoverable OpenSSL the build fails inside `openssl-sys`'s
+# build script with a wall of text about `OPENSSL_DIR`, several hundred lines into a
+# `cargo build` whose visible subject is a Rust crate. Someone reading that log
+# concludes the sqlcipher feature is broken. It is not; the runner is missing a native
+# library.
+#
+# WHAT THIS DOES. Probes the locations a GitHub-hosted windows runner is known to put
+# OpenSSL, and falls back to vcpkg — which is preinstalled on those images — if none
+# of them is present. Then it exports OPENSSL_DIR so `openssl-sys` finds it without
+# guessing.
+#
+# WHY `x64-windows-static-md` in the vcpkg fallback and not `x64-windows`:
+# `-static-md` means a statically linked OpenSSL against the *dynamic* MSVC runtime,
+# which is what rustc's default MSVC target uses. Mixing CRT linkage produces a link
+# error about duplicate symbols that is even less legible than the missing-library
+# one, and `x64-windows` (dynamic OpenSSL) would additionally mean shipping
+# libcrypto-3-x64.dll next to the binaries — one more unsigned DLL for EDR to object
+# to, which docs/deployment.md is explicit about wanting to avoid.
+#
+# This action deliberately FAILS rather than continuing when it cannot produce a
+# usable OpenSSL. A soft failure here becomes a build that quietly drops the
+# sqlcipher feature, and a build that quietly drops the sqlcipher feature is a build
+# that ships borrower call audio unencrypted on the endpoint.
+
+name: Provide OpenSSL for rusqlite/bundled-sqlcipher
+description: >-
+  Locates or installs an MSVC-compatible OpenSSL and exports OPENSSL_DIR, so that
+  rusqlite's bundled-sqlcipher feature can link libcrypto on a Windows runner.
+
+outputs:
+  openssl-dir:
+    description: The directory exported as OPENSSL_DIR.
+    value: ${{ steps.locate.outputs.dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: locate
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        Set-StrictMode -Version Latest
+
+        # An OpenSSL installation is usable if it has both the headers and an import
+        # library. Checking only for the directory finds shells of installations —
+        # a runner image that carries the `openssl.exe` tool but not the SDK, for
+        # instance — and then fails later, in openssl-sys, having wasted the probe.
+        function Test-OpenSslRoot([string] $root) {
+          if (-not $root -or -not (Test-Path $root)) { return $false }
+          $header = Join-Path $root "include\openssl\opensslv.h"
+          if (-not (Test-Path $header)) { return $false }
+          $libs = Get-ChildItem -Path $root -Recurse -Filter "libcrypto*.lib" -ErrorAction SilentlyContinue
+          return ($null -ne $libs -and $libs.Count -gt 0)
+        }
+
+        # Ordered by preference: an image-provided OpenSSL costs nothing, a vcpkg
+        # build costs several minutes. Strawberry Perl's copy is last because it
+        # tracks Perl's release cadence rather than OpenSSL's.
+        $candidates = @(
+          $env:OPENSSL_DIR,
+          "C:\Program Files\OpenSSL",
+          "C:\Program Files\OpenSSL-Win64",
+          "C:\OpenSSL-Win64",
+          "C:\Strawberry\c"
+        ) | Where-Object { $_ }
+
+        $found = $null
+        foreach ($c in $candidates) {
+          if (Test-OpenSslRoot $c) { $found = $c; break }
+          Write-Host "openssl: not usable at $c"
+        }
+
+        if (-not $found) {
+          Write-Host "openssl: no usable installation found; building via vcpkg"
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg -or -not (Test-Path (Join-Path $vcpkg "vcpkg.exe"))) {
+            # Note on style: this and the other long messages in these workflows are
+            # built as string arrays rather than PowerShell here-strings. A
+            # here-string's closing "@ has to sit at column 0, which ends the YAML
+            # block scalar the script is embedded in and makes the whole workflow
+            # unparseable. Standalone .ps1 files under .github/scripts use
+            # here-strings freely; anything inlined in YAML cannot.
+            throw (@(
+              'No usable OpenSSL was found and vcpkg is not available on this runner.'
+              ''
+              "rusqlite's bundled-sqlcipher feature vendors SQLCipher but links libcrypto"
+              'from the system, so the build cannot proceed. Either install OpenSSL on the'
+              'runner and set OPENSSL_DIR, or change client/sentinel-core/Cargo.toml to use'
+              "rusqlite's bundled-sqlcipher-vendored-openssl feature instead - which is a"
+              'decision for the client work stream, not for CI.'
+              ''
+              'Do NOT work around this by dropping the sqlcipher feature. An unencrypted'
+              'spool on a customer desktop fails spec 6.5 and 12.3, and it fails silently:'
+              'the agent works, the spool works, and borrower call audio sits in plain'
+              'SQLite on the endpoint where anyone with the file can read it.'
+            ) -join [Environment]::NewLine)
+          }
+          & (Join-Path $vcpkg "vcpkg.exe") install "openssl:x64-windows-static-md"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install openssl:x64-windows-static-md failed" }
+          $found = Join-Path $vcpkg "installed\x64-windows-static-md"
+          # `OPENSSL_STATIC` tells openssl-sys to link the static libraries vcpkg
+          # just produced rather than looking for import libraries for DLLs that do
+          # not exist in a `-static-md` triplet.
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not (Test-OpenSslRoot $found)) {
+            throw "vcpkg reported success but $found does not look like an OpenSSL installation"
+          }
+        }
+
+        Write-Host "openssl: using $found"
+        "OPENSSL_DIR=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "dir=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8

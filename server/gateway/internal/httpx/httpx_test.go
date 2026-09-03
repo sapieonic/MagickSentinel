@@ -11,13 +11,25 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/magickvoice/sentinel/server/gateway/internal/httpx"
 )
 
+// chain is the middleware stack api.Server.Routes builds, in the same order and
+// including the OpenTelemetry wrapper.
+//
+// The otelhttp wrapper is here rather than only in the api package because it is
+// another ResponseWriter wrapper, and a ResponseWriter wrapper is exactly what the
+// comment in httpx.go warns about: hiding Flusher breaks the SSE floor view, hiding
+// Hijacker breaks the WebSocket upgrade on /v1/ingest, and both fail invisibly in
+// production while every test that mounts a handler on its own keeps passing. Having
+// it in this chain means a version bump that regressed it fails the build.
 func chain(h http.Handler) http.Handler {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return httpx.WithRequestID(httpx.Recover(log, httpx.LogRequests(log, h)))
+	return otelhttp.NewHandler(
+		httpx.WithRequestID(httpx.Recover(log, httpx.LogRequests(log, h))),
+		"test")
 }
 
 // The two long-lived endpoints this service exists for both need capabilities that a

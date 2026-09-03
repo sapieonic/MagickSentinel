@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Error struct {
@@ -103,6 +105,16 @@ func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 //
 // It deliberately logs the route pattern rather than the raw path: a raw path can
 // carry an account reference in a query string, and this is a compliance product.
+//
+// It also carries the trace and span ids when a trace is in progress, which is what
+// makes logs and traces the same investigation rather than two. Grafana's Loki-to-
+// Tempo correlation is driven off exactly these two fields: an operator reading this
+// line about a 500 on /v1/ingest clicks through to the span tree that produced it,
+// and from a slow span back to the line. Without the ids in the log, the two are
+// joined by hand on a timestamp, which does not work on a floor doing three shifts.
+//
+// The ids are absent — not empty strings — when no exporter is configured, so a
+// deployment with telemetry off gets the same log line it always had.
 func LogRequests(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -112,13 +124,41 @@ func LogRequests(log *slog.Logger, next http.Handler) http.Handler {
 		if pattern == "" {
 			pattern = "unmatched"
 		}
-		log.Info("request",
+
+		attrs := []any{
 			"method", r.Method,
 			"route", pattern,
 			"status", rec.status,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"request_id", RequestID(r.Context()),
-		)
+		}
+
+		// The span is renamed here rather than by otelhttp's span-name formatter
+		// because the matched route pattern does not exist until the mux has
+		// routed, which is inside this middleware. Naming the span after the
+		// pattern rather than the path is the same decision as logging the
+		// pattern: /v1/calls/{id} is one operation, whereas one span name per
+		// call id is the unbounded-cardinality mistake described on
+		// telemetry.Metrics, applied to traces.
+		span := trace.SpanFromContext(r.Context())
+		if sc := span.SpanContext(); sc.IsValid() {
+			attrs = append(attrs,
+				"trace_id", sc.TraceID().String(),
+				"span_id", sc.SpanID().String())
+		}
+		if span.IsRecording() {
+			span.SetName(r.Method + " " + pattern)
+			// http.route is the semantic-convention key a backend groups by, and
+			// the request id ties the span to the log line and to the error body
+			// the caller was given. Neither is a route parameter: no call id, no
+			// account reference — see the attribute rule on telemetry.Metrics.
+			span.SetAttributes(
+				attribute.String("http.route", pattern),
+				attribute.String("sentinel.request_id", RequestID(r.Context())),
+			)
+		}
+
+		log.Info("request", attrs...)
 	})
 }
 

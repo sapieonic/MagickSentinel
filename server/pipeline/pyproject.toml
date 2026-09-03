@@ -9,9 +9,18 @@ dependencies = [
     "jsonschema>=4.21",
     "pydantic>=2.6",
     "nats-py>=2.7",
-    "asyncpg>=0.29",
+    # psycopg 3, with the connection pool. The pipeline connects as
+    # `sentinel_pipeline` (NOBYPASSRLS) and sets the RLS context per transaction; see
+    # sentinel_pipeline/db.py for why pooling and SET LOCAL have to agree.
+    "psycopg[binary,pool]>=3.1",
     "boto3>=1.34",
     "structlog>=24.1",
+    # Telemetry is off unless a collector is configured, and every import of it is
+    # inside sentinel_pipeline/telemetry.py, so a deployment with no OTLP endpoint
+    # never loads any of this.
+    "opentelemetry-api>=1.24",
+    "opentelemetry-sdk>=1.24",
+    "opentelemetry-exporter-otlp-proto-http>=1.24",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +33,18 @@ anthropic = ["anthropic>=0.25"]
 openai = ["openai>=1.20"]
 google = ["google-genai>=2.3"]
 whisper = ["faster-whisper>=1.0"]
+# libopus, for decoding stored segments. Optional for the same reason: a development
+# deployment reading PCM fixtures out of SENTINEL_BLOB_DIR does not need it, and the
+# test suite exercises the framing and the foreign-audio filter without it.
+opus = ["opuslib>=3.0.1"]
+# The gRPC OTLP exporter, for a collector that only speaks gRPC. The HTTP exporter is
+# a base dependency because it is the default protocol.
+otlp-grpc = ["opentelemetry-exporter-otlp-proto-grpc>=1.24"]
+
+# The service entrypoint: `sentinel-pipeline consume | retention | coverage | check`.
+# What a systemd unit or a container entrypoint should call.
+[project.scripts]
+sentinel-pipeline = "sentinel_pipeline.__main__:main"
 
 [build-system]
 requires = ["setuptools>=69"]

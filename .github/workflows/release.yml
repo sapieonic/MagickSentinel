@@ -1,0 +1,789 @@
+# Produces the shippable artefact. Until this workflow existed, nothing in the
+# repository did — docs/security.md requirement 1 read "not implemented, and cannot be
+# until there is something to sign", and README.md said "nothing in this repository
+# produces something deployable".
+#
+# ---------------------------------------------------------------------------------
+# THE SHAPE, AND WHY IT IS THIS SHAPE
+# ---------------------------------------------------------------------------------
+#
+# Everything below follows from four constraints that are properties of the product
+# rather than preferences about CI.
+#
+# 1. THE MSI CANNOT BE BUILT ON LINUX. client/installer/README.md is explicit: WiX v4
+#    targets .NET and the binaries must come from MSVC, not mingw. So the build job is
+#    windows-latest and there is no cross-compiled shortcut.
+#
+# 2. THE SIGNING KEY CANNOT BE ON THE RUNNER. Spec 12.1 requires an EV certificate on
+#    all binaries and the MSI, and an EV certificate lives on a hardware token or in a
+#    cloud HSM — it does not exist as a PFX that could be put in a secret. There are
+#    exactly two workable answers and installer/README.md names both: an attended
+#    build with the token present, or a KSP-backed signing service (Azure Trusted
+#    Signing, DigiCert KeyLocker). This workflow wires the second, because the first
+#    is not a workflow.
+#
+#    `-CertificateThumbprint` is the right parameter for both, for the reason the
+#    README gives: the thumbprint selects the certificate and where the private key
+#    lives is the KSP's problem. signtool asks CNG for the key; CNG asks the KSP; the
+#    KSP asks the HSM. Nothing on the runner ever holds key material.
+#
+#    An unsigned build is possible here because installer/README.md says an unsigned
+#    MSI "is fine for a local smoke test and is not fine for anything a customer
+#    receives". So it is possible, renamed to say so, blocked from the release, and
+#    labelled in three places. See the `unsigned` handling below.
+#
+# 3. THE WEBVIEW2 PAYLOAD IS NOT IN THE REPOSITORY, DELIBERATELY.
+#    `client/installer/redist/MicrosoftEdgeWebview2Setup.exe` is gitignored and
+#    build.ps1 refuses to build without it and refuses to download it, because — in
+#    the README's words — "a build that pulls an executable off the internet and
+#    packages it unverified is exactly the supply-chain problem a bank's security
+#    review exists to find". A release workflow still has to obtain it. So it is
+#    fetched with a hash pinned in a repository variable AND an Authenticode check,
+#    both fail-closed, by .github/scripts/fetch-webview2.ps1. The hash lives outside
+#    the script on purpose: a hash pinned next to the download it guards is a comment,
+#    not a pin.
+#
+# 4. OPEN-5 IS UNDECIDED AND THIS WORKFLOW DOES NOT DECIDE IT. Evergreen bootstrapper
+#    versus bundled fixed-version runtime depends on the customer's egress answer from
+#    Phase 0. The workflow keeps today's Evergreen behaviour exactly and leaves the
+#    seam: fetch-webview2.ps1 takes -Mode, and -Mode FixedVersion throws with a
+#    pointer to the decision. docs/open-decisions.md: "an OPEN item must not be
+#    invented away."
+#
+# ---------------------------------------------------------------------------------
+# WHAT A MAINTAINER HAS TO CONFIGURE
+# ---------------------------------------------------------------------------------
+#
+# Repository VARIABLES (Settings → Secrets and variables → Actions → Variables):
+#   WEBVIEW2_BOOTSTRAPPER_SHA256   REQUIRED. The pinned SHA-256 of the bootstrapper.
+#                                  A variable rather than a secret: it is a public
+#                                  fact about a public file, and it needs to be
+#                                  legible in the log when it mismatches.
+#   SIGNING_PROVIDER               'digicert-keylocker' | 'azure-trusted-signing' |
+#                                  'none'. Absent or 'none' produces an unsigned,
+#                                  non-shippable build.
+#   SIGNING_TIMESTAMP_URL          Optional RFC 3161 TSA. Defaults to build.ps1's
+#                                  http://timestamp.digicert.com.
+#
+# Repository SECRETS, for SIGNING_PROVIDER = digicert-keylocker:
+#   SM_API_KEY, SM_HOST, SM_CLIENT_CERT_FILE_B64, SM_CLIENT_CERT_PASSWORD,
+#   SIGNING_CERT_THUMBPRINT
+#
+# Repository SECRETS, for SIGNING_PROVIDER = azure-trusted-signing:
+#   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#   TRUSTED_SIGNING_ENDPOINT, TRUSTED_SIGNING_ACCOUNT,
+#   TRUSTED_SIGNING_CERT_PROFILE, SIGNING_CERT_THUMBPRINT
+#
+# ENVIRONMENT `production-release`, with required reviewers. This is where the tier-C
+# acceptance gate is enforced — see the publish job.
+#
+# ---------------------------------------------------------------------------------
+name: Release
+
+on:
+  push:
+    # Three-part semver tags only. The MSI ignores the fourth version field when
+    # deciding whether an upgrade applies (build.ps1 says so), so a four-part tag
+    # would produce two packages Windows considers the same version — which shows up
+    # as "the upgrade did nothing" on a fleet, months later.
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Three-part version, e.g. 0.1.0. Required for a manual run.'
+        required: true
+        type: string
+      unsigned:
+        description: 'Build WITHOUT signing. Smoke tests only — the artefact is renamed DO-NOT-SHIP and cannot be published.'
+        type: boolean
+        default: false
+      allow_incomplete_widget_bundle:
+        description: 'Stage the widget even if the bundle is not self-contained. Smoke tests only — see stage-widget.ps1.'
+        type: boolean
+        default: false
+
+# Read-only by default; each job asks for exactly what it needs. The build job needs
+# id-token and attestations for provenance, the publish job needs contents: write to
+# create the release, and neither needs the other's.
+permissions:
+  contents: read
+
+# Never cancel a release in flight. A half-built MSI is not a problem, but a release
+# job cancelled between `gh release create` and the asset upload leaves a published
+# release with no artefact in it, which people will find and try to install.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ==================================================================================
+  # Build the MSI. Mirrors client/installer/build.ps1's prerequisites and then calls
+  # it — rather than reimplementing its steps — so that the release build and a
+  # developer's local build are the same build. build.ps1 already gets the hard part
+  # right (binaries signed BEFORE the MSI, MSI signed after, because an MSI's
+  # signature covers the package and not the files inside it), and a workflow that
+  # reimplemented that would eventually get it wrong in one place only.
+  # ==================================================================================
+  msi:
+    name: Build MSI (windows-latest)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      # actions/attest-build-provenance signs the attestation with a workload identity
+      # token and records it against the repository.
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      signed: ${{ steps.sign-config.outputs.signed }}
+      msi-name: ${{ steps.build.outputs.msi-name }}
+      msi-sha256: ${{ steps.build.outputs.msi-sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          # A tag push carries the version; a manual run supplies it. Both are
+          # cross-checked against client/Cargo.toml, because build.ps1 treats the
+          # workspace version as the single source of truth and a tag that disagrees
+          # with it produces an MSI whose ProductVersion is not the version anyone
+          # thinks they released.
+          if ("${{ github.event_name }}" -eq "push") {
+            $v = "${{ github.ref_name }}" -replace '^v', ''
+          } else {
+            $v = "${{ inputs.version }}"
+          }
+          if ($v -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version '$v' is not three-part semver. MSI ignores a fourth field when deciding upgrades, so a four-part version silently breaks fleet upgrades."
+          }
+          $cargo = Get-Content "client\Cargo.toml" -Raw
+          if ($cargo -notmatch '(?m)^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
+            throw "Could not read the workspace version from client/Cargo.toml."
+          }
+          $workspace = $Matches[1]
+          if ($workspace -ne $v) {
+            # A note on style, because it looks odd on purpose: every long message in
+            # this file is built as a string array rather than as a PowerShell
+            # here-string. A here-string's closing "@ must sit at column 0, which ends
+            # the YAML block scalar the script lives in and makes the workflow
+            # unparseable. The standalone scripts under .github/scripts/ use
+            # here-strings freely; anything inlined in YAML cannot.
+            throw (@(
+              "Version mismatch: this release says $v, client/Cargo.toml says $workspace."
+              ''
+              'build.ps1 defaults -Version from Cargo.toml and the comment there is right:'
+              'keeping a second copy of the version in the build script is a guarantee that'
+              'the two will disagree at the worst moment. Bump [workspace.package].version'
+              'in client/Cargo.toml and tag that commit.'
+            ) -join [Environment]::NewLine)
+          }
+          "version=$v" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "release version $v"
+
+      # ------------------------------------------------------------------ toolchain
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          # Same key as the ci.yml Windows job: the release build is the same target,
+          # profile and feature set, so it can reuse that cache instead of rebuilding
+          # SQLCipher and libopus from C on every tag.
+          key: msvc-sqlcipher
+
+      - name: Provide OpenSSL for rusqlite/bundled-sqlcipher
+        uses: ./.github/actions/sqlcipher-openssl
+
+      - name: Install WiX v4 and the extensions Sentinel.wxs uses
+        shell: pwsh
+        run: |
+          # Versions pinned to match client/installer/README.md and Sentinel.wixproj
+          # (4.0.5). WiX is not backward-compatible across minors in the way the
+          # version number suggests, and `Sentinel.wixproj` sets
+          # TreatWarningsAsErrors, so a newer WiX introducing a new ICE warning would
+          # fail the build with a message about a component rule rather than about a
+          # tool upgrade.
+          dotnet tool install --global wix --version 4.0.5
+          wix extension add -g WixToolset.Util.wixext/4.0.5
+          wix extension add -g WixToolset.UI.wixext/4.0.5
+          wix --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # ------------------------------------------------------------------- payloads
+      - name: Build the widget bundle
+        working-directory: web
+        # npm ci, not npm install: the bundle produced here goes inside a signed MSI,
+        # so "resolved differently on this machine" is not an acceptable property. See
+        # the web job in ci.yml for the full argument.
+        run: |
+          npm ci
+          npm run build --workspace @sentinel/widget
+
+      - name: Stage the widget as the WebDir Sentinel.wxs expects
+        id: webdir
+        shell: pwsh
+        run: |
+          # Not named $args: that is a PowerShell automatic variable and shadowing it
+          # inside a script block is the kind of thing that works until it does not.
+          $stageArgs = @()
+          if ("${{ inputs.allow_incomplete_widget_bundle }}" -eq "true") {
+            $stageArgs += "-AllowIncompleteBundle"
+          }
+          $stage = & .\.github\scripts\stage-widget.ps1 @stageArgs
+          "webdir=$stage" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Fetch and verify the WebView2 Evergreen bootstrapper
+        shell: pwsh
+        env:
+          EXPECTED: ${{ vars.WEBVIEW2_BOOTSTRAPPER_SHA256 }}
+        run: |
+          if (-not $env:EXPECTED) {
+            throw (@(
+              'The repository variable WEBVIEW2_BOOTSTRAPPER_SHA256 is not set.'
+              ''
+              'This build will not download an executable and package it unverified.'
+              'Establish the pin the way client/installer/redist/README.md describes:'
+              'fetch the bootstrapper on a machine you trust, confirm'
+              'Get-AuthenticodeSignature names Microsoft Corporation, take'
+              'Get-FileHash -Algorithm SHA256, and set that value as a repository variable.'
+              ''
+              'A variable rather than a committed constant, deliberately: rotating the pin'
+              'is then an audited settings change made by someone with admin rights, rather'
+              'than a line in a pull request that a reviewer skims past.'
+            ) -join [Environment]::NewLine)
+          }
+          # -Mode Evergreen is today's behaviour and OPEN-5's placeholder. Do not
+          # change it here; see the OPEN-5 note in fetch-webview2.ps1.
+          .\.github\scripts\fetch-webview2.ps1 -ExpectedSha256 $env:EXPECTED -Mode Evergreen
+
+      # -------------------------------------------------------------------- signing
+      - name: Decide whether this is a signed build
+        id: sign-config
+        shell: pwsh
+        env:
+          PROVIDER: ${{ vars.SIGNING_PROVIDER }}
+        run: |
+          $forced = "${{ inputs.unsigned }}" -eq "true"
+          $provider = if ($env:PROVIDER) { $env:PROVIDER } else { "none" }
+          $signed = (-not $forced) -and ($provider -ne "none")
+
+          if ($forced) {
+            Write-Host "::warning title=Unsigned build requested::This run was dispatched with unsigned=true. The artefact will be renamed DO-NOT-SHIP and cannot be published to a release."
+          } elseif (-not $signed) {
+            # A TAG PUSH that cannot sign is a configuration mistake, not a smoke
+            # test. Failing here is the point: the alternative is a tagged, unsigned
+            # MSI sitting in the actions artefacts of a release run, which someone
+            # will eventually hand to a customer because it has the right version
+            # number on it.
+            if ("${{ github.event_name }}" -eq "push") {
+              throw (@(
+                'SIGNING_PROVIDER is not configured, and this is a tag push.'
+                ''
+                'A release build must be signed. Spec 12.1 requires an EV certificate on all'
+                'binaries AND the MSI, and client/installer/README.md is explicit that an'
+                'unsigned MSI is fine for a local smoke test and is not fine for anything a'
+                'customer receives.'
+                ''
+                'Signing also carries reputation weight with the endpoint-protection products'
+                'docs/deployment.md warns about. An unsigned background process that captures'
+                'microphone and system audio, uploads it continuously, runs a window not in'
+                'the taskbar and is relaunched by a SYSTEM service is the fastest possible way'
+                'to make a two-to-six-week EDR allowlisting conversation longer.'
+                ''
+                'Set SIGNING_PROVIDER and its secrets, or dispatch this workflow manually with'
+                'unsigned=true if you actually want a smoke-test package.'
+              ) -join [Environment]::NewLine)
+            }
+            Write-Host "::warning title=Unsigned build::SIGNING_PROVIDER is not set. Producing a non-shippable package."
+          }
+
+          "signed=$($signed.ToString().ToLowerInvariant())" | Out-File $env:GITHUB_OUTPUT -Append
+          "provider=$provider" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Locate signtool.exe
+        if: steps.sign-config.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          # build.ps1 takes -SignToolPath rather than assuming PATH, because the
+          # Windows SDK installs signtool under a versioned directory and the version
+          # changes with the runner image. Pick the newest x64 one rather than pinning
+          # an SDK version that will disappear from the image without warning.
+          $roots = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+            "${env:ProgramFiles}\Windows Kits\10\bin"
+          ) | Where-Object { Test-Path $_ }
+          $tool = $roots |
+            ForEach-Object { Get-ChildItem -Path $_ -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue } |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $tool) { throw "signtool.exe was not found under any Windows Kits directory on this runner." }
+          Write-Host "signtool: $($tool.FullName)"
+          "SIGNTOOL_PATH=$($tool.FullName)" | Out-File $env:GITHUB_ENV -Append
+
+      # DigiCert KeyLocker. `smctl windows certsync` imports the certificates into the
+      # user's store with their private keys backed by DigiCert's CNG KSP, after which
+      # `signtool /sha1 <thumbprint>` works exactly as it does with a token plugged in
+      # — which is the whole reason -CertificateThumbprint is the right parameter for
+      # both providers.
+      #
+      # The client authentication certificate arrives base64-encoded because a GitHub
+      # secret is a string and a PKCS#12 file is not text. It is written to the runner's
+      # temp directory and deleted in the same step's `finally`, so it does not survive
+      # into the artefact upload.
+      - name: Set up DigiCert KeyLocker (KSP)
+        if: steps.sign-config.outputs.signed == 'true' && steps.sign-config.outputs.provider == 'digicert-keylocker'
+        shell: pwsh
+        env:
+          SM_HOST: ${{ secrets.SM_HOST }}
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_FILE_B64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+        run: |
+          foreach ($n in @("SM_HOST", "SM_API_KEY", "SM_CLIENT_CERT_FILE_B64", "SM_CLIENT_CERT_PASSWORD")) {
+            if (-not (Get-Item "env:$n" -ErrorAction SilentlyContinue).Value) {
+              throw "SIGNING_PROVIDER is digicert-keylocker but the secret $n is not set."
+            }
+          }
+          $certPath = Join-Path $env:RUNNER_TEMP "keylocker-client.p12"
+          try {
+            [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:SM_CLIENT_CERT_FILE_B64))
+            "SM_CLIENT_CERT_FILE=$certPath" | Out-File $env:GITHUB_ENV -Append
+            $env:SM_CLIENT_CERT_FILE = $certPath
+
+            # The KeyLocker client tools ship the KSP. Installed here rather than
+            # cached, because a stale KSP against a rotated account fails at signing
+            # time with an error about the certificate rather than about the tools.
+            Invoke-WebRequest -Uri "$env:SM_HOST/signingmanager/api-ui/v1/releases/smtools-windows-x64.msi/download" `
+              -Headers @{ "x-api-key" = $env:SM_API_KEY } `
+              -OutFile "$env:RUNNER_TEMP\smtools.msi" -UseBasicParsing
+            Start-Process msiexec.exe -ArgumentList @("/i", "`"$env:RUNNER_TEMP\smtools.msi`"", "/qn") -Wait -NoNewWindow
+
+            $smctl = "C:\Program Files\DigiCert\DigiCert Keylocker Tools\smctl.exe"
+            & $smctl healthcheck
+            if ($LASTEXITCODE -ne 0) { throw "smctl healthcheck failed; the KeyLocker credentials or client certificate are wrong." }
+            # certsync puts the certs in the store so signtool can select one by
+            # thumbprint. The private key never leaves the HSM.
+            & $smctl windows certsync
+            if ($LASTEXITCODE -ne 0) { throw "smctl windows certsync failed." }
+          } finally {
+            # The client certificate is a credential. It has done its job by the time
+            # certsync returns; leaving it on disk for the rest of the job means it can
+            # be picked up by a glob in the SBOM or the artefact upload.
+            if (Test-Path $certPath) { Remove-Item -Force $certPath }
+            "SM_CLIENT_CERT_FILE=" | Out-File $env:GITHUB_ENV -Append
+          }
+
+      # Azure Trusted Signing. The same shape: install the Trusted Signing client
+      # tools, which register a CNG KSP, sync the certificate profile's certificate
+      # into the store, then sign by thumbprint.
+      #
+      # NOTE for whoever configures this: Microsoft's own `azure/trusted-signing-action`
+      # drives signtool through `/dlib` instead of a KSP. That works, and it is the
+      # documented path — but it does not go through build.ps1, which means the MSI
+      # would be signed by a step that does not also sign the two executables inside
+      # it, and installer/README.md is explicit that signing only the MSI "leaves two
+      # unsigned executables on disk". If you switch to the dlib action, sign the
+      # binaries with it too, in the same two passes and the same order build.ps1 uses.
+      - name: Set up Azure Trusted Signing (KSP)
+        if: steps.sign-config.outputs.signed == 'true' && steps.sign-config.outputs.provider == 'azure-trusted-signing'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TRUSTED_SIGNING_CERT_PROFILE: ${{ secrets.TRUSTED_SIGNING_CERT_PROFILE }}
+        run: |
+          foreach ($n in @("AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET",
+                           "TRUSTED_SIGNING_ENDPOINT", "TRUSTED_SIGNING_ACCOUNT",
+                           "TRUSTED_SIGNING_CERT_PROFILE")) {
+            if (-not (Get-Item "env:$n" -ErrorAction SilentlyContinue).Value) {
+              throw "SIGNING_PROVIDER is azure-trusted-signing but the secret $n is not set."
+            }
+          }
+          # OPEN QUESTION FOR THE MAINTAINER, left visible rather than guessed:
+          # Trusted Signing's short-lived certificates are minted per signing request,
+          # so a *stable* thumbprint is not something the service naturally gives you.
+          # If SIGNING_CERT_THUMBPRINT turns out not to be stable across runs for your
+          # account, the answer is the dlib path in the note above — not a
+          # thumbprint discovered at runtime, which would sign with whatever
+          # certificate happened to be in the store.
+          dotnet tool install --global Microsoft.Trusted.Signing.Client --version 1.*
+          Write-Host "::notice title=Trusted Signing::Client tools installed. Verify that SIGNING_CERT_THUMBPRINT selects the intended certificate profile before relying on this path for a customer release."
+
+      # -------------------------------------------------------------------- the build
+      - name: Build (and sign) the MSI via client/installer/build.ps1
+        id: build
+        shell: pwsh
+        env:
+          THUMBPRINT: ${{ secrets.SIGNING_CERT_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.version.outputs.version }}"
+          $webdir  = "${{ steps.webdir.outputs.webdir }}"
+          $out     = Join-Path $env:GITHUB_WORKSPACE "release-out"
+          $tsa     = "${{ vars.SIGNING_TIMESTAMP_URL }}"
+          # build.ps1's own default, restated here only so the error message below can
+          # name the TSA that was actually used rather than "the default".
+          if (-not $tsa) { $tsa = "http://timestamp.digicert.com" }
+
+          # build.ps1 is the build. It already gets the two-pass signing order right —
+          # binaries first, package second, because an MSI's signature covers the
+          # package file and not the files inside it — and it already enables
+          # `sentinel-core/sqlcipher`, without which the spool is plain SQLite and
+          # call audio sits unencrypted on the endpoint (spec 6.5, 12.3).
+          $psArgs = @(
+            "-Version", $version,
+            "-Configuration", "release",
+            "-WebDir", $webdir,
+            "-OutputDir", $out
+          )
+          if ("${{ steps.sign-config.outputs.signed }}" -eq "true") {
+            if (-not $env:THUMBPRINT) {
+              throw "SIGNING_PROVIDER is set but the secret SIGNING_CERT_THUMBPRINT is empty. The thumbprint is what selects the certificate; the KSP owns the key."
+            }
+            $psArgs += @(
+              "-SignToolPath", $env:SIGNTOOL_PATH,
+              # The thumbprint selects the certificate; the KSP owns the private key.
+              # This is the one parameter that works identically for a hardware token
+              # on an attended build and for Azure Trusted Signing or DigiCert
+              # KeyLocker on a hosted runner.
+              "-CertificateThumbprint", $env:THUMBPRINT,
+              "-TimestampUrl", $tsa
+            )
+          }
+
+          & .\client\installer\build.ps1 @psArgs
+
+          $msi = Get-ChildItem -Path $out -Filter "Sentinel-*-x64.msi" | Select-Object -First 1
+          if (-not $msi) { throw "build.ps1 reported success but produced no MSI in $out." }
+
+          if ("${{ steps.sign-config.outputs.signed }}" -eq "true") {
+            # build.ps1's Invoke-Sign WARNS and returns when the signing parameters
+            # are missing. That is right for a local build and wrong for a release, so
+            # the release verifies the outcome rather than trusting the exit code. A
+            # "signed" release build that produced an unsigned MSI must fail here, not
+            # be discovered by a customer's SmartScreen prompt.
+            $sig = Get-AuthenticodeSignature $msi.FullName
+            if ($sig.Status -ne "Valid") {
+              throw "The MSI's Authenticode status is '$($sig.Status)' after a signed build. StatusMessage: $($sig.StatusMessage)"
+            }
+            if (-not $sig.TimeStamperCertificate) {
+              # Without a timestamp every signature expires with the certificate, and
+              # an MSI that validated at release stops validating a year later on
+              # machines that have not been updated since. build.ps1 passes /tr for
+              # exactly this reason; if the TSA was unreachable, signtool can still
+              # have produced an untimestamped signature.
+              throw "The MSI signature has no RFC 3161 timestamp, so it would expire with the certificate. Check that the TSA at $tsa was reachable from this runner."
+            }
+            Write-Host "MSI signed by $($sig.SignerCertificate.Subject), timestamped by $($sig.TimeStamperCertificate.Subject)" -ForegroundColor Green
+            $final = $msi.FullName
+          } else {
+            # LOUD AND UNMISTAKABLE. Three independent signals, because one is easy to
+            # miss: the filename says it, a sidecar README says it, and the publish job
+            # refuses to attach it to a release at all.
+            $final = Join-Path $out ("Sentinel-{0}-x64-UNSIGNED-DO-NOT-SHIP.msi" -f $version)
+            Move-Item -Force $msi.FullName $final
+            @(
+              'UNSIGNED BUILD - NOT FOR ANY CUSTOMER, PILOT OR DEMO MACHINE'
+              '==========================================================='
+              ''
+              'This MSI carries no Authenticode signature. Per client/installer/README.md'
+              'that is fine for a local smoke test and is not fine for anything a customer'
+              'receives.'
+              ''
+              'Concretely, what is wrong with installing this on a real desktop:'
+              ''
+              '  * Spec 12.1 requires an EV certificate on all binaries and the MSI. This'
+              '    package satisfies neither half.'
+              ''
+              '  * The two executables inside are unsigned too. docs/deployment.md describes'
+              '    what the agent looks like to a detection engine: audio capture from the'
+              '    microphone and the system mixer, continuous outbound upload, a window not'
+              '    in the taskbar, relaunched by a SYSTEM service, writing an encrypted local'
+              '    database the user cannot read. Unsigned, that is a keylogger with audio'
+              '    capture and no publisher. Any competent EDR will quarantine it, and doing'
+              "    that once in a customer's console poisons the allowlisting conversation the"
+              '    Phase 2 acceptance gate depends on - a conversation that costs two to six'
+              '    weeks of calendar time no engineering effort can compress.'
+              ''
+              '  * A signature is also the audit trail. An unsigned package cannot be traced'
+              "    back to a build, which is the first question a bank's security reviewer"
+              '    asks.'
+              ''
+              "Version:  $version"
+              "Commit:   $env:GITHUB_SHA"
+              "Run:      $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            ) -join [Environment]::NewLine |
+              Set-Content -Path (Join-Path $out "DO-NOT-SHIP.txt") -Encoding utf8
+            Write-Host "::warning title=Unsigned artefact::$([IO.Path]::GetFileName($final)) is not shippable."
+          }
+
+          $hash = (Get-FileHash $final -Algorithm SHA256).Hash.ToLowerInvariant()
+          "msi-name=$([IO.Path]::GetFileName($final))" | Out-File $env:GITHUB_OUTPUT -Append
+          "msi-path=$final" | Out-File $env:GITHUB_OUTPUT -Append
+          "msi-sha256=$hash" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "SHA-256  $hash  $([IO.Path]::GetFileName($final))"
+
+      # ------------------------------------------------------------- provenance/SBOM
+      - name: Software bill of materials
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "release-out"
+
+          # Rust dependency graph for the two shipped binaries. cargo-cyclonedx rather
+          # than a generic filesystem scanner: a scanner sees two static executables
+          # and reports two components, which is true and useless. The dependency
+          # graph is what a security reviewer actually asks for, and Cargo.lock is
+          # where it lives.
+          cargo install --locked cargo-cyclonedx
+          Push-Location client
+          try {
+            cargo cyclonedx --format json --all --target x86_64-pc-windows-msvc
+          } finally { Pop-Location }
+          Get-ChildItem -Path client -Recurse -Filter "*.cdx.json" |
+            ForEach-Object { Copy-Item $_.FullName (Join-Path $out ("sbom-rust-" + $_.Name)) }
+
+          # The widget bundle's npm graph. `npm sbom` is built in, so there is no extra
+          # tool to trust here.
+          Push-Location web
+          try {
+            npm sbom --sbom-format cyclonedx --omit dev |
+              Set-Content -Path (Join-Path $out "sbom-web-widget.cdx.json") -Encoding utf8
+          } finally { Pop-Location }
+
+      - name: Payload manifest (the release record)
+        shell: pwsh
+        run: |
+          # client/installer/redist/README.md asks for the WebView2 SHA-256 to be
+          # recorded "so the exact payload that shipped can be identified later", and
+          # installer/README.md asks for it in the release record. This is that
+          # record, produced by the build rather than from someone's memory — and it
+          # covers every payload, not just WebView2, because the same question gets
+          # asked about the two executables the moment an EDR quarantines one.
+          $out = Join-Path $env:GITHUB_WORKSPACE "release-out"
+          $bin = "client\target\x86_64-pc-windows-msvc\release"
+          $webview2 = Get-Content "client\installer\redist\webview2-payload.json" -Raw | ConvertFrom-Json
+          $widget = Get-Content (Join-Path "${{ steps.webdir.outputs.webdir }}" "widget-payload.json") -Raw | ConvertFrom-Json
+
+          function Describe([string] $path) {
+            $i = Get-Item $path
+            $s = Get-AuthenticodeSignature $path
+            [ordered]@{
+              name        = $i.Name
+              bytes       = $i.Length
+              sha256      = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              signature   = $s.Status.ToString()
+              signer      = if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { $null }
+              timestamped = [bool] $s.TimeStamperCertificate
+            }
+          }
+
+          $manifest = [ordered]@{
+            product          = "MagickVoice Sentinel"
+            version          = "${{ steps.version.outputs.version }}"
+            commit           = $env:GITHUB_SHA
+            built_at_utc     = (Get-Date).ToUniversalTime().ToString("o")
+            workflow_run     = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            runner_image     = "$env:ImageOS $env:ImageVersion"
+            signed           = ("${{ steps.sign-config.outputs.signed }}" -eq "true")
+            signing_provider = "${{ steps.sign-config.outputs.provider }}"
+            shippable        = (("${{ steps.sign-config.outputs.signed }}" -eq "true") -and $widget.shippable)
+            toolchain        = [ordered]@{
+              rustc        = (rustc --version)
+              cargo        = (cargo --version)
+              target       = "x86_64-pc-windows-msvc"
+              profile      = "release"
+              # The one feature whose absence would be invisible in the artefact and
+              # material to the customer.
+              features     = @("sentinel-core/sqlcipher")
+              wix          = (wix --version)
+              node         = (node --version)
+            }
+            payloads         = [ordered]@{
+              msi      = (Describe (Join-Path $out "${{ steps.build.outputs.msi-name }}"))
+              binaries = @(
+                (Describe (Join-Path $bin "SentinelAgent.exe")),
+                (Describe (Join-Path $bin "SentinelService.exe"))
+              )
+              widget   = $widget
+              webview2 = $webview2
+            }
+            open_decisions   = [ordered]@{
+              # Recorded in the release, not resolved by it. A release record that
+              # states which questions were still open when it shipped is how a pilot
+              # finding gets traced back to an assumption instead of to a bug.
+              "OPEN-4" = "Data residency: India-only asserted (ap-south-1) and not enforced by anything in this artefact."
+              "OPEN-5" = "WebView2: undecided. This package carries the Evergreen bootstrapper with Return=ignore. An air-gapped machine gets capture with no widget."
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $out "payload-manifest.json") -Encoding utf8
+          Get-Content (Join-Path $out "payload-manifest.json")
+
+      # Signed, verifiable provenance for the MSI: what built it, from which commit,
+      # with which workflow. This is what lets someone six months from now prove that
+      # the MSI on a customer's file share came from this repository at this commit,
+      # which is a different question from "is it signed by us" and the one that gets
+      # asked after an incident. Skipped for unsigned builds — attesting a
+      # deliberately non-shippable artefact would give it exactly the credibility the
+      # DO-NOT-SHIP naming exists to deny it.
+      - name: Attest build provenance
+        if: steps.sign-config.outputs.signed == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-out/${{ steps.build.outputs.msi-name }}
+
+      - name: Upload release artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-msi-${{ steps.version.outputs.version }}
+          path: release-out/
+          if-no-files-found: error
+          # 90 days rather than the default, because an EDR quarantine or a pilot
+          # question about a specific package can easily arrive a month after the
+          # release, and the payload manifest is the answer to it.
+          retention-days: 90
+
+  # ==================================================================================
+  # Publish. Separate job, separate runner, and — importantly — a separate GitHub
+  # environment, because this is where the manual gates are enforced.
+  #
+  # THE TIER-C ACCEPTANCE GATE. client/installer/README.md requires that a Windows 8.1
+  # or pre-1903 install FAILS and rolls back cleanly before every release, and the
+  # reason is that a tier C install which succeeds produces a service that runs,
+  # reports healthy, and never captures a call — while the portal's fleet view says the
+  # machine is covered. That is worse than no install.
+  #
+  # It cannot be automated on a hosted runner: hosted Windows runners are x64 Server
+  # 2022 or later, i.e. tier A, and the check they would have to defeat is a WiX
+  # FileSearch against kernel32.dll's version resource, chosen precisely because it
+  # cannot be spoofed. So the gate is:
+  #
+  #   * .github/scripts/tier-c-acceptance.ps1 — runnable, run by an engineer on a real
+  #     pre-1903 VM against the signed release candidate, producing a JSON result. It
+  #     refuses to run on a machine that is not tier C, because a pass on tier A
+  #     hardware is a false pass and false passes on this gate are how the failure
+  #     above reaches a floor.
+  #   * this job's `environment: production-release`, whose required reviewers must not
+  #     approve without that result. The release is also created as a DRAFT, so even an
+  #     approval leaves a step between here and a customer-visible download.
+  #
+  # If someone later automates the tier check, it has to be against a real pre-1903
+  # image (a self-hosted VM, or an image in the customer's own estate). Automating the
+  # approval without automating the test would be strictly worse than leaving it
+  # manual, because it would look like the gate had been kept.
+  # ==================================================================================
+  publish:
+    name: Publish GitHub Release
+    needs: msi
+    if: needs.msi.outputs.signed == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sentinel-msi-${{ needs.msi.outputs.version }}
+          path: release-out
+
+      - name: Re-verify the SHA-256 after the artefact round trip
+        run: |
+          set -euo pipefail
+          cd release-out
+          expected='${{ needs.msi.outputs.msi-sha256 }}'
+          actual=$(sha256sum "${{ needs.msi.outputs.msi-name }}" | cut -d' ' -f1)
+          # Not paranoia for its own sake: the artefact upload/download is the one hop
+          # between the machine that signed the MSI and the release that publishes it,
+          # and the hash in the release notes is what a customer checks against. If the
+          # two ever disagree, publishing the notes would be publishing a wrong hash,
+          # which is worse than publishing none.
+          if [ "$expected" != "$actual" ]; then
+            echo "::error title=Hash mismatch::built $expected, downloaded $actual"
+            exit 1
+          fi
+          echo "sha256 $actual verified after round trip"
+          # The published checksum file, so a customer can verify without copying a
+          # hash out of release notes by hand.
+          sha256sum "${{ needs.msi.outputs.msi-name }}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Compose release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_notes.py \
+            --manifest release-out/payload-manifest.json \
+            --out release-out/RELEASE_NOTES.md
+          cat release-out/RELEASE_NOTES.md
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.msi.outputs.version }}
+        run: |
+          set -euo pipefail
+          # --draft, always. The tier-C acceptance gate is a human step; the
+          # environment approval records that someone accepted responsibility for it,
+          # and the draft is the second lock. Whoever publishes the draft is asserting
+          # that a tier-C acceptance result exists and passed.
+          #
+          # --verify-tag so a manual dispatch cannot create a release for a tag that
+          # was never pushed, which would produce a download with no reproducible
+          # source commit behind it.
+          gh release create "v${VERSION}" \
+            --draft \
+            --title "Sentinel ${VERSION}" \
+            --notes-file release-out/RELEASE_NOTES.md \
+            --verify-tag \
+            release-out/${{ needs.msi.outputs.msi-name }} \
+            release-out/SHA256SUMS.txt \
+            release-out/payload-manifest.json \
+            release-out/sbom-web-widget.cdx.json \
+            release-out/sbom-rust-*.cdx.json
+          echo "::notice title=Draft release created::Publish it only after .github/scripts/tier-c-acceptance.ps1 has passed on a Windows 8.1 or pre-1903 Windows 10 VM against this exact MSI. Attach the result JSON to the release."
+
+  # ==================================================================================
+  # The unsigned path ends here, on purpose. There is no release, no tag association
+  # and no provenance attestation — only the actions artefact, which requires being
+  # signed in to this repository to download. Someone who wants a smoke-test MSI can
+  # get one; someone browsing releases cannot mistake one for a product.
+  # ==================================================================================
+  unsigned-notice:
+    name: Unsigned build (not published)
+    needs: msi
+    if: needs.msi.outputs.signed != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say so
+        run: |
+          {
+            echo "## Unsigned build — not published"
+            echo
+            echo "\`${{ needs.msi.outputs.msi-name }}\` was produced and is available as a"
+            echo "workflow artefact. It carries no Authenticode signature, so:"
+            echo
+            echo "- no GitHub Release was created;"
+            echo "- no build provenance was attested;"
+            echo "- it must not be installed on any customer, pilot or demo machine."
+            echo
+            echo "See \`DO-NOT-SHIP.txt\` inside the artefact, and the Signing section of"
+            echo "\`client/installer/README.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
