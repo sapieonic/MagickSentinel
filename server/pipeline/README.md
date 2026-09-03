@@ -13,6 +13,7 @@ change stay distinguishable.
 |---|---|
 | `models.py` | Domain types. No database session, so the rule engine is testable against a fixture corpus. |
 | `asr/` | `BatchASR` and `StreamingASR` interfaces, plus WER and **numeric-entity error rate** metrics. |
+| `providers/registry.py` | The one place a batch ASR provider is chosen. Default is `gemini-3.5-transcribe`; refuses a floor language the chosen provider cannot read. |
 | `analysis/` | One LLM call per finalized call, validated against `contracts/schemas/analysis.json`. |
 | `compliance/engine.py` | Tier 1: deterministic rules over the transcript and metadata. Runs on 100% of calls. |
 | `compliance/judge.py` | Tier 2: LLM judge over flagged calls plus a deterministic sample. |

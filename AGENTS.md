@@ -86,6 +86,16 @@ ASR failure stops the call; **analysis failure must not stop compliance** (tier-
 the transcript); judge failure leaves tier-1 findings standing unreviewed. Do not collapse these
 into one try/except.
 
+**A transcriber that cannot read the floor's language must not start.** The default
+batch ASR provider is `gemini-3.5-transcribe`, chosen in
+[server/pipeline/sentinel_pipeline/providers/registry.py](server/pipeline/sentinel_pipeline/providers/registry.py),
+and it has **no Tamil at all**. A Tamil floor pointed at it would not fail — it would
+transcribe Tamil audio as something else and hand a bank a clean-looking transcript
+with no flags on it. So `registry.validate` raises on a configured language the chosen
+provider does not support, and `build_batch_asr` never falls back to a different
+provider silently. Do not soften either into a warning, and when you add an adapter,
+declare its coverage in `CAPABILITIES` in the same commit.
+
 **No PII in logs.** Structured logging only, on every tier.
 
 ## Language conventions

@@ -6,12 +6,33 @@ This document records what the candidate providers actually offer as of **Septem
 2026**, what that costs at floor scale, and which ones survive the product's hard
 constraints.
 
-It is a shortlist, not a decision. `sentinel_pipeline/asr/__init__.py` already states
-the exit criterion and it has not changed: **200 hand-labelled real calls per
-language**, scored on WER *and* on the numeric-entity error rate that
-`sentinel_pipeline/asr/evaluate.py` tracks separately. Nothing below substitutes for
-that measurement. What it does is stop us from measuring providers that cannot ship
-regardless of how they score.
+## Decision
+
+**`gemini-3.5-transcribe` is the default batch ASR provider**, selected in
+`sentinel_pipeline/providers/registry.py`. Tamil floors route to Sarvam, because the
+default model has no Tamil at all.
+
+Two things about that decision are worth stating plainly rather than leaving to be
+discovered.
+
+**It is ahead of the measurement.** `sentinel_pipeline/asr/__init__.py` states the exit
+criterion and it has not changed: **200 hand-labelled real calls per language**, scored
+on WER *and* on the numeric-entity error rate that `sentinel_pipeline/asr/evaluate.py`
+tracks separately. That measurement does not exist yet. This default was chosen on
+capability — per-word timings and code-switching are the two features the product
+cannot work without — not on measured accuracy on our own calls. It is the best
+available default, not a validated one, and the measurement can still overturn it.
+Sarvam's own benchmark claims `saaras:v4` beats Gemini on Indian languages; if that
+holds up here, the answer changes.
+
+**It takes a position on OPEN-4.** The Gemini API endpoint
+(`generativelanguage.googleapis.com`) is global, not India-resident. Making it the
+default means borrower audio leaves India by default. That is the commitment OPEN-4
+exists to get in writing from the bank, and it is now assumed rather than confirmed.
+Two exits if the bank says no: route everything to Sarvam (India-hosted, and the
+registry already supports it as a whole-floor provider) or to self-hosted IndicWhisper
+on Indian infrastructure. Both cost a capability — see the table below — and neither is
+a code change, which is the point of the registry.
 
 ## The three constraints that eliminate candidates before accuracy
 
@@ -40,7 +61,7 @@ this is a real advantage rather than a neutral fact.
 
 ## What each candidate actually does
 
-### Google, option A: `gemini-3.5-transcribe` — the recommended Google candidate
+### Google, option A: `gemini-3.5-transcribe` — the default
 
 A speech-to-text model built on Gemini's audio understanding, GA, latest update August
 2026. It is the only Google model that satisfies all three constraints at once.
@@ -105,10 +126,17 @@ Batch at a flat $0.003/min**. Dynamic Batch fulfils within 24 hours, which for a
 product whose value proposition is same-day 100% monitoring is a separate problem on
 top of the residency one.
 
-### Sarvam AI: `saaras:v4` — the strongest non-Google candidate
+### Sarvam AI: `saaras:v4` — the Tamil route, and the residency exit
 
 Indian, Indic-specialised, and the incumbent adapter in this repo
-(`providers/sarvam.py`, currently pinned to the older `saarika:v2`).
+(`providers/sarvam.py`).
+
+Two defects in that adapter had to be fixed before Sarvam could be relied on as the
+Tamil route, and both would have failed on the first live call rather than degrading:
+it was pinned to `saarika:v2`, which is no longer in the API's model enum at all, and
+it parsed `timestamps.words` as a list of word objects when the response carries three
+parallel arrays (`words`, `start_time_seconds`, `end_time_seconds`) that line up by
+index. It now targets `saaras:v4` and reads the documented shape.
 
 | | |
 |---|---|
@@ -180,26 +208,55 @@ Latency, for completeness: Gemini Transcribe is a synchronous request, so a 5-mi
 call comes back in seconds and the "call.end → portal" path stays same-minute. Cloud
 STT Dynamic Batch is up to 24 hours. Self-hosted latency is whatever we provision for.
 
-## Recommendation
+## How the default is configured
 
-1. **Add `gemini-3.5-transcribe` as the Google candidate in the Phase 3 evaluation,
-   and drop Chirp from consideration entirely.** It is the only Google model with
-   usable word timestamps, and the `asia-south1` finding above means Cloud STT cannot
-   be squared with OPEN-4 at all.
-2. **Measure it head-to-head with Sarvam `saaras:v4` and IndicWhisper** on the 200
-   hand-labelled calls per language, reporting WER and numeric-entity error rate
-   separately, as `evaluate.py` already does. Configure Gemini Transcribe with
-   `language_hints=()` for the Hinglish set so the measurement reflects the
-   code-switching path we would actually run.
+`providers/registry.py` is the only place a provider is chosen. Nothing selects one
+per call site, so a swap is configuration:
+
+```sh
+SENTINEL_GOOGLE_API_KEY=...            # or GEMINI_API_KEY
+SENTINEL_ASR_LANGUAGES=hi-IN,mr-IN     # the floor's languages
+```
+
+A Hindi/Marathi/Telugu floor needs nothing else. Two configurations the registry
+refuses to start with, both deliberately:
+
+```sh
+# Rejected: the default model has no Tamil, and transcribing Tamil audio as something
+# else would hand a bank a clean-looking transcript with no flags on it.
+SENTINEL_ASR_LANGUAGES=hi-IN,ta-IN
+
+# Accepted: Tamil goes where Tamil works.
+SENTINEL_ASR_LANGUAGES=hi-IN,ta-IN
+SENTINEL_ASR_ROUTES=ta-IN=sarvam
+SENTINEL_SARVAM_API_KEY=...
+```
+
+Whole-floor alternatives, for the OPEN-4 exits above:
+
+```sh
+SENTINEL_ASR_PROVIDER=sarvam           # India-hosted; coarser evidence spans
+SENTINEL_ASR_PROVIDER=whisper          # self-hosted; no third party in the path
+```
+
+A language hint is passed to the model **only when the floor runs exactly one
+language**. With several, the model's own detection plus code-switching is the
+behaviour we want, and pinning one locale would suppress it mid-sentence.
+
+## Still outstanding
+
+1. **Run the measurement.** 200 hand-labelled calls per language against Gemini
+   Transcribe, Sarvam `saaras:v4` and IndicWhisper, reporting WER and numeric-entity
+   error rate separately. Configure Gemini with `language_hints=()` for the Hinglish
+   set so the measurement reflects the code-switching path production runs.
+2. **Get OPEN-4 answered in writing.** The default now assumes the answer.
 3. **Ask Sarvam for per-word offsets.** It is the one change that would make the
-   strongest candidate on coverage and residency also viable for compliance evidence.
-4. **Expect a per-language provider map, not one winner.** Tamil already cannot come
-   from Google. The `BatchASR` protocol supports this; nothing else in the pipeline
-   needs to change to allow it.
-5. **Do not treat any of this as settled before the measurement.** Sarvam's claim to
-   beat Gemini on Indic accuracy is vendor-reported and specifically contradicts the
-   direction this recommendation points; if it holds up on our own calls, the answer
-   changes to "Sarvam everywhere, as soon as it can emit word timings".
+   strongest candidate on coverage and residency also viable as the compliance
+   transcript everywhere, Tamil included.
+4. **Decide whether the timestamps-versus-vocabulary trade is the right way round.**
+   We currently take timestamps. If the measurement shows the numeric-entity error
+   rate is what fails, custom vocabulary is the lever we gave up to get spans, and
+   that is worth revisiting with the numbers in hand.
 
 ## Sources
 

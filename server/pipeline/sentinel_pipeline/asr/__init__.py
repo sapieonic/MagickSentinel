@@ -15,6 +15,13 @@ audio, dense with amounts and dates that have to be exact. A promise to pay of
 :mod:`sentinel_pipeline.asr.evaluate` tracks a numeric-entity error rate separately
 from WER: overall WER can look fine while the amounts are wrong.
 
+The batch provider is chosen in :mod:`sentinel_pipeline.providers.registry` and
+defaults to ``gemini-3.5-transcribe``. That default was picked on capability — it is
+the only candidate with both per-word timings and mid-sentence code-switching, and
+neither is optional here — and **not** on the 200-calls-per-language measurement below,
+which does not exist yet. It is the best available default rather than a validated one;
+``docs/asr-provider-selection.md`` records what it cannot do, Tamil included.
+
 Because the two channels were captured separately there is **no diarization step**,
 and there must not be one.
 """

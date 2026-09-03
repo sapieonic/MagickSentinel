@@ -98,6 +98,21 @@ stays in an India region, and that cross-region replication requires their prior
 approval. Written, from the bank, not from the BPO's understanding of the bank's
 position.
 
+**Since raised, the ASR default has taken a position on this.** The batch ASR provider
+selected in `server/pipeline/sentinel_pipeline/providers/registry.py` is
+`gemini-3.5-transcribe`, reached through the global Gemini API endpoint
+(`generativelanguage.googleapis.com`). That is *processing*, not storage, but it is
+borrower audio leaving India, and it is now the default rather than an option someone
+opted into. Google Cloud Speech-to-Text was not the escape hatch it looks like:
+`asia-south1` supports exactly one language/model combination, `en-US` with
+`telephony_short`, so Cloud STT cannot transcribe Indian-language calls in India
+either. If the bank's answer is India-only in the strict sense, the exits are
+`SENTINEL_ASR_PROVIDER=sarvam` (India-hosted, at the cost of per-word evidence spans)
+or `SENTINEL_ASR_PROVIDER=whisper` (self-hosted, at the cost of running it ourselves).
+Both are configuration rather than code, which is why the registry exists — but the
+question is now more urgent than when it was raised, not less.
+See `docs/asr-provider-selection.md`.
+
 ---
 
 ## OPEN-5 — Air-gapped WebView2 install path
@@ -204,7 +219,7 @@ a way that only shows up when capture silently never arms.
 | OPEN-1 | Rust or C# for the native agent | Phase 1 start | Settled: Rust, in `client/` |
 | OPEN-2 | Does the customer run Entra ID | Phase 1 | None; token verification is provider-agnostic |
 | OPEN-3 | Agent replay of own call audio | Phase 4 | Per-tenant flag, defaults to off |
-| OPEN-4 | Data residency | Phase 1 infra | India only, asserted in the OpenAPI server list; no infrastructure yet |
+| OPEN-4 | Data residency | Phase 1 infra | India only, asserted in the OpenAPI server list; no infrastructure yet — **but the ASR default now sends audio to a global Google endpoint** |
 | OPEN-5 | Air-gapped WebView2 path | Phase 1 MSI | None; `client/installer/` is empty |
 | OPEN-6 | Audio and transcript retention | Phase 3 | Schema defaults of 30 and 365 days, explicitly placeholders; purge job written, unwired and untested |
 | OPEN-7 | Dialer CDR export | Phase 4 | No format assumed; reconciliation arithmetic written behind a `CdrSource` nothing implements |
