@@ -401,6 +401,11 @@ jobs:
   # (NOBYPASSRLS, the role the gateway really uses), and the admin DSN is the
   # schema owner, used by the tests for seeding and for reading back rows the
   # application role must not be able to see.
+  #
+  # sentinel_test is a *template*: `go test ./...` runs packages in parallel, so
+  # each database-backed package clones it into a database of its own through
+  # internal/testdb rather than sharing one. That needs nothing here beyond an
+  # admin role with CREATEDB, which postgres has.
   # --------------------------------------------------------------------------
   go:
     name: Go gateway

@@ -16,7 +16,6 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +26,7 @@ import (
 	"github.com/magickvoice/sentinel/server/gateway/internal/api"
 	"github.com/magickvoice/sentinel/server/gateway/internal/auth"
 	"github.com/magickvoice/sentinel/server/gateway/internal/store"
+	"github.com/magickvoice/sentinel/server/gateway/internal/testdb"
 )
 
 // These tests exercise the handlers against a real Postgres with the real row-level
@@ -64,28 +64,12 @@ func (s staticKeys) Key(context.Context, string) (*rsa.PublicKey, error) { retur
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	dsn := os.Getenv("SENTINEL_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("SENTINEL_TEST_DATABASE_URL not set; run via db/test/pgtest.sh")
-	}
-	adminDSN := os.Getenv("SENTINEL_TEST_ADMIN_DATABASE_URL")
-	if adminDSN == "" {
-		t.Skip("SENTINEL_TEST_ADMIN_DATABASE_URL not set; run via db/test/gateway_it.sh")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	if err := pool.Ping(ctx); err != nil {
-		t.Fatalf("ping: %v", err)
-	}
-	admin, err := pgxpool.New(ctx, adminDSN)
-	if err != nil {
-		t.Fatalf("connect as owner: %v", err)
-	}
-	t.Cleanup(admin.Close)
+	// This suite's own database, cloned from the migrated one in the DSN. The seed
+	// below truncates, and the truncate has to cascade — so it must not be able to
+	// reach another package's rows. See internal/testdb.
+	db := testdb.Open(t, "api")
+	pool, admin := db.App, db.Admin
 
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
