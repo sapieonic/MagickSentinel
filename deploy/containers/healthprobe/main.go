@@ -23,25 +23,29 @@
 // So: a few hundred lines of standard library, compiled in the same builder stage
 // from the same toolchain, copied into the final image, no dependencies.
 //
-// WHAT IT PROBES, AND THE ONE DELIBERATE TOLERANCE.
+// WHAT IT PROBES.
 //
-// `/healthz` exists today (server/gateway/internal/api/server.go) and answers
-// {"status":"ok","version":...} outside authentication, which is exactly what a probe
-// needs. It is required: a non-2xx or an unreachable port is unhealthy, full stop.
+// Both `/healthz` and `/readyz` exist in server/gateway/internal/api/server.go and both
+// are required by the gateway image's HEALTHCHECK. The distinction between them is the
+// point, and the gateway's own comment on `readyz` puts it well: liveness asks "is the
+// process wedged", readiness asks "can it actually do the job".
 //
-// `/readyz` is being added by another work stream and does not exist yet. A probe
-// that required it would report every gateway image unhealthy until that lands; a
-// probe that ignored it would still be ignoring it a year later. So: a 404 from an
-// optional path is treated as "not implemented yet" and passes, and any other
-// non-2xx — 500, 503, a timeout — fails. When /readyz lands, drop `-tolerate-404`
-// from the Dockerfile's HEALTHCHECK and the tolerance is gone.
+// For this product the second question is the one that matters, because the job
+// includes accepting ingest. A gateway that is up and cannot reach its object store
+// answers the WebSocket, takes the audio, fails the blob write and loses the call —
+// and that is silent from the desktop's point of view, because the segment simply goes
+// unacked and sits in the spool until the 72-hour bound evicts it. `/readyz` returns
+// 503 in that state and `/healthz` returns 200, so probing only liveness would report
+// a container that is destroying audio as healthy.
 //
-// The distinction matters more than it looks. /healthz says the process is up.
-// /readyz says it can reach its dependencies. A gateway that is up but cannot reach
-// Postgres accepts an ingest connection, buffers audio, and fails every write — and
-// the endpoint agent, which never deletes a segment until the server acks it, spools
-// until it hits the 2 GB / 72 h cap and starts evicting. Liveness alone cannot see
-// that; readiness can.
+// THE `-tolerate-404` FLAG is retained and NOT used by the gateway image any more. It
+// existed because /readyz was being written by another work stream while this probe
+// was: requiring an endpoint that did not exist yet would have reported every gateway
+// image unhealthy, and ignoring it would have meant still ignoring it a year later, so
+// a 404 from an optional path counted as "not implemented yet". /readyz has landed and
+// the flag is gone from the Dockerfile. It is kept here for the next endpoint in the
+// same position — and note that it tolerates 404 only: a 500, a 503 or a timeout on an
+// optional path is still unhealthy, because those mean "implemented and broken".
 package main
 
 import (

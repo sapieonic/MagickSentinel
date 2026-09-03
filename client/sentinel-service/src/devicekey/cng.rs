@@ -54,6 +54,7 @@ use windows::Win32::Security::Cryptography::{
     NCRYPT_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE,
     NCRYPT_SECURITY_DESCR_PROPERTY, NCRYPT_SILENT_FLAG,
 };
+use windows_core::Error as WinError;
 
 /// `NCRYPT_SECURITY_DESCR_FLAG`, which `windows-rs` 0.58 does not export.
 ///
@@ -164,7 +165,11 @@ impl CngDeviceKey {
         };
         match rc {
             Ok(()) => Ok(CngDeviceKey { key, _provider: provider }),
-            Err(e) if e.code() == NTE_BAD_KEYSET => Err(DeviceKeyError::NotFound),
+            // `NTE_BAD_KEYSET` is what the KSP returns for "no key by that name", and
+            // it is the only error that means "create one" rather than "something is
+            // wrong". Anything else is reported as a platform failure and is NOT
+            // followed by a fallback to a software key.
+            Err(e) if WinError::code(&e) == NTE_BAD_KEYSET => Err(DeviceKeyError::NotFound),
             Err(e) => Err(DeviceKeyError::Platform(format!("NCryptOpenKey: {e}"))),
         }
     }
@@ -214,7 +219,7 @@ impl CngDeviceKey {
         key.apply_security_descriptor()?;
 
         unsafe {
-            NCryptFinalizeKey(NCRYPT_HANDLE(key.key.0), NCRYPT_SILENT_FLAG)
+            NCryptFinalizeKey(key.key, NCRYPT_SILENT_FLAG)
                 .map_err(|e| DeviceKeyError::Platform(format!("NCryptFinalizeKey: {e}")))?;
         }
 
@@ -234,7 +239,7 @@ impl CngDeviceKey {
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
         use windows::Win32::Security::PSECURITY_DESCRIPTOR;
-        use windows::Win32::System::Memory::LocalFree;
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
 
         let sddl = HSTRING::from(SECURITY_DESCR_SDDL);
         let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -263,7 +268,7 @@ impl CngDeviceKey {
         };
         unsafe {
             // `LocalFree` and not `drop`: the descriptor was allocated by advapi32.
-            let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(sd.0)));
+            let _ = LocalFree(HLOCAL(sd.0));
         }
         result.map_err(|e| {
             DeviceKeyError::Platform(format!("NCryptSetProperty(security descriptor): {e}"))

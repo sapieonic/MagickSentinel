@@ -12,27 +12,20 @@
 # WHAT THIS STACK CAN AND CANNOT DO TODAY. Read this before concluding something is
 # broken.
 #
-# It stands up every dependency, migrates the database, verifies the pipeline's
-# configuration and connectivity, and serves the gateway's API. What it does NOT do is
-# process a call end to end, and the reasons are all recorded in the repository rather
-# than being defects in this file:
+# It stands up every dependency, migrates the database, and runs both services against
+# MinIO as a real S3 backend. What it still cannot do is complete a device enrolment,
+# and that is a property of the repository rather than a defect in this file:
 #
-#   * **The gateway writes audio to a filesystem volume, not to MinIO.**
-#     `server/gateway/internal/blob/blob.go` has a filesystem backend and an in-memory
-#     one and no S3 adapter, which is why `main.go` refuses to start without
-#     SENTINEL_BLOB_DIR. MinIO is in this stack anyway because it is what the S3
-#     adapter will be developed against, and because the pipeline's selftest exercises
-#     the bucket. The `gateway-blobs` volume is where borrower audio actually lands
-#     today.
-#   * **A production gateway answers `503 no_ca` to every enrollment.**
-#     `CertificateAuthority` in `internal/api/enroll.go` is an interface with no
-#     production implementation; only the integration test supplies a development CA.
-#     So no device can enrol against this stack.
-#   * **The pipeline runs in `selftest` mode.** `worker.py`'s `Finalizer` is a pure
-#     function over `Protocol` interfaces and nothing implements the database-backed
-#     ones. See the long note at the top of
-#     deploy/containers/pipeline-entrypoint.py for why the container refuses to consume
-#     the queue rather than acking calls it cannot process.
+#   * **Device enrolment needs a certificate authority.** `main.go` requires
+#     SENTINEL_CA_CERT and SENTINEL_CA_KEY, and there is no development CA committed —
+#     only the gateway integration test supplies one. Without them the gateway either
+#     refuses to start or answers `503 no_ca` to every enrolment, so no agent can
+#     obtain the device certificate that `/v1/policy`, `/v1/heartbeat` and `/v1/ingest`
+#     all require. Generate a throwaway CA and mount it if you need to drive a real
+#     agent against this stack; `bash db/test/gateway_it.sh` is the faster route to
+#     seeing the API answer.
+#   * **Nothing produces load.** There is no synthetic agent in the repository, so the
+#     dashboards in deploy/observability stay empty until something emits.
 #
 # ==================================================================================
 # CREDENTIALS: WHY EVERY ONE OF THEM IS `${VAR:?...}`
@@ -69,10 +62,6 @@ volumes:
   postgres-data:
   nats-data:
   minio-data:
-  # Borrower call audio, on the filesystem backend, until the S3 adapter lands. A named
-  # volume rather than an anonymous one specifically so `docker compose down` does not
-  # silently discard recorded calls; removing it takes `down -v`, which is a decision.
-  gateway-blobs:
 
 services:
   # ================================================================== Postgres =====

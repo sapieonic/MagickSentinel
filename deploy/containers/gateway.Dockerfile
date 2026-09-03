@@ -33,13 +33,12 @@
 # swap for troubleshooting cannot silently promote the process to root, and so a
 # Kubernetes runAsUser can be matched to it.
 #
-# **No SENTINEL_BLOB_DIR volume declared.** `main.go` refuses to start without it,
-# because the object-store layer has a filesystem backend and an in-memory one and no
-# S3 adapter yet (docs/security.md, requirement 5). Whoever runs this image has to
-# choose and mount that directory knowingly. A VOLUME here would produce an anonymous
-# volume that looks like durable storage, holds borrower call audio, and is discarded
-# by `docker compose down -v` — and OPEN-4 (India-only residency) is unresolved, so
-# an anonymous volume is also a location nobody has approved.
+# **No VOLUME for object storage.** `main.go` requires either SENTINEL_S3_BUCKET (the
+# real backend) or SENTINEL_BLOB_DIR (the filesystem stand-in) and refuses to start with
+# neither. Whoever runs this image has to choose knowingly. A VOLUME here would produce
+# an anonymous volume that looks like durable storage, holds borrower call audio, and is
+# discarded by `docker compose down -v` — and OPEN-4 (India-only residency) is
+# unresolved, so an anonymous volume is also a storage location nobody has approved.
 #
 # **No HTTPS in the image's own healthcheck.** The gateway serves plaintext unless
 # SENTINEL_TLS_CERT is set, and the probe talks to 127.0.0.1 inside the container's
@@ -118,19 +117,27 @@ USER 65532:65532
 # publishes nothing — but it is what `docker ps` shows and what a reader checks first.
 EXPOSE 8080
 
-# /healthz is required and /readyz is optional-with-tolerance. See the long comment in
-# deploy/containers/healthprobe/main.go for exactly why /readyz is treated that way
-# and what to change when it lands: remove `-tolerate-404` and the tolerance is gone.
+# BOTH /healthz and /readyz are required, and requiring /readyz is the deliberate part.
 #
-# start-period is 20s rather than the default 0: `store.Open` establishes the pgx pool
-# before the HTTP listener starts, so a gateway pointed at a Postgres that is still
-# running its own initdb is legitimately not answering yet. Failing it during that
-# window would make compose restart it in a loop and mask the real dependency order.
-HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+# /healthz answers 200 as long as the process is alive. /readyz runs the dependency
+# probes — database, object store — and answers 503 when one is down. The gateway's own
+# comment on readyz explains why that difference matters here: a gateway that is up and
+# cannot reach its object store answers the ingest WebSocket, takes the audio, fails the
+# blob write and loses the call, silently from the desktop's point of view, because the
+# segment goes unacked and sits in the spool until the 72-hour bound evicts it.
+#
+# So a container in that state must report unhealthy. Probing only liveness would report
+# a container that is destroying audio as healthy — which is this product's
+# characteristic failure mode reached through a Dockerfile.
+#
+# start-period is 30s: `store.Open` establishes the pgx pool before the HTTP listener
+# starts, and the readiness probes then have to reach Postgres and the object store. A
+# gateway pointed at a Postgres still running initdb is legitimately not ready yet, and
+# failing it during that window would make compose report a dependency-order problem as
+# an application fault.
+HEALTHCHECK --interval=15s --timeout=8s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/healthprobe", \
          "-base", "http://127.0.0.1:8080", \
-         "-required", "/healthz", \
-         "-optional", "/readyz", \
-         "-tolerate-404"]
+         "-required", "/healthz,/readyz"]
 
 ENTRYPOINT ["/usr/local/bin/gateway"]

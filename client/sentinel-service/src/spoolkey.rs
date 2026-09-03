@@ -170,7 +170,7 @@ fn fill_random(out: &mut [u8]) {
 mod windows_dpapi {
     use super::{KeyWrapper, Result, SpoolKeyError, BLOB_DESCRIPTION};
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPT_INTEGER_BLOB,
     };
@@ -199,7 +199,7 @@ mod windows_dpapi {
                 // this process later writes a minidump on crash.
                 unsafe {
                     std::ptr::write_bytes(self.0.pbData, 0, self.0.cbData as usize);
-                    let _ = LocalFree(Some(HLOCAL(self.0.pbData as *mut _)));
+                    let _ = LocalFree(HLOCAL(self.0.pbData as *mut _));
                 }
             }
         }

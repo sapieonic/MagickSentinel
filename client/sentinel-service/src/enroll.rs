@@ -797,7 +797,7 @@ mod tests {
             ]),
             seen: RefCell::new(Vec::new()),
         };
-        ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, Some("tok")).clone();
+        ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, Some("tok"));
 
         // Ten days out: inside the 30-day window.
         let now = not_after_ms("2027-09-03T00:00:00Z").unwrap() - 10 * 24 * 3600 * 1000;

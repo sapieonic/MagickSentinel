@@ -779,6 +779,76 @@ mod tests {
     }
 
     #[test]
+    fn a_revoked_device_stops_reconnecting_but_keeps_its_spooled_audio() {
+        // wire.md: `4403` is terminal until an operator acts. A client that kept
+        // reconnecting would spend a revoked floor's uplink on handshakes the gateway
+        // is going to refuse. The spool is a separate question and the answer is that
+        // nothing is deleted: the audio uploads if the device is reinstated.
+        struct Counting(Arc<AtomicUsize>);
+        impl TransportFactory for Counting {
+            fn connect(&mut self) -> Result<Box<dyn Transport>, TransportError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::Connect("offline".into()))
+            }
+        }
+
+        let api = Arc::new(FakeApi::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (mut a, _auth, _store) = agent(api.clone());
+        a.uplink = Arc::new(Mutex::new(Uplink::new(
+            Spool::open_in_memory(SpoolLimits::default()).unwrap(),
+            Box::new(Counting(attempts.clone())),
+        )));
+        spool_a_segment(&a, "01J8ZQ8H2Q7X9K3M4N5P6R7S8T", 0);
+        let depth_before = a.uplink.lock().unwrap().stats().segments;
+        assert!(depth_before > 0);
+
+        a.tick(0, None).unwrap();
+        let before_revocation = attempts.load(Ordering::SeqCst);
+        assert!(before_revocation > 0, "the uplink tries while the device is good");
+
+        api.forbid.store(true, Ordering::SeqCst);
+        a.tick(30_000, None).unwrap();
+        let at_revocation = attempts.load(Ordering::SeqCst);
+
+        // Many ticks later, still no further connect attempts.
+        for t in 1..20 {
+            a.tick(30_000 + t * 1_000_000, None).unwrap();
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            at_revocation,
+            "a revoked device must stop reconnecting"
+        );
+        assert_eq!(
+            a.uplink.lock().unwrap().stats().segments,
+            depth_before,
+            "revocation is not a reason to delete captured audio"
+        );
+    }
+
+    #[test]
+    fn a_recorded_event_reaches_the_next_heartbeat() {
+        // How `main` reports the two start-up failures that block capture before a
+        // pipeline exists to report them: no spool key, and no device certificate.
+        // Both must be visible in the fleet view, because a machine that silently
+        // never records is this product's worst failure.
+        let api = Arc::new(FakeApi::default());
+        let (mut a, _auth, _store) = agent(api.clone());
+        a.record_event(
+            ClientEvent::new(sentinel_core::events::EventKind::CaptureError, 0)
+                .with_detail("spool_key_unavailable".into()),
+        );
+        a.tick(0, None).unwrap();
+
+        let sent = api.heartbeats.lock().unwrap();
+        let hb = sent.last().expect("a heartbeat was sent");
+        assert_eq!(hb.events.len(), 1);
+        assert_eq!(hb.events[0].kind, "capture_error");
+        assert_eq!(hb.events[0].detail.as_deref(), Some("spool_key_unavailable"));
+    }
+
+    #[test]
     fn capture_stops_when_the_offline_grace_window_expires() {
         // Spec 7.5. Never silently record with no verifiable identity attached.
         let api = Arc::new(FakeApi::default());
