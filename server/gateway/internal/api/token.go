@@ -2,12 +2,13 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/magickvoice/sentinel/server/gateway/internal/httpx"
 )
 
 // POST /v1/oauth/token — the desktop agent's token endpoint.
@@ -329,7 +330,7 @@ func (s *Server) finishToken(w http.ResponseWriter, r *http.Request, grant strin
 		// client/sentinel-agent/src/auth/mod.rs) is driven by a number we stated.
 		expires = 3600
 	}
-	httpxWriteJSON(w, http.StatusOK, tokenResponse{
+	httpx.WriteJSON(w, http.StatusOK, tokenResponse{
 		IDToken:      result.IDToken,
 		AccessToken:  result.AccessToken,
 		RefreshToken: result.RefreshToken,
@@ -351,7 +352,11 @@ func (s *Server) writeTokenError(w http.ResponseWriter, r *http.Request, grant s
 		// prompt for credentials.
 		w.Header().Set("WWW-Authenticate", `Bearer realm="sentinel"`)
 	}
-	httpxWriteJSON(w, status, map[string]string{
+	// httpx.WriteJSON rather than httpx.WriteError: the body here is the RFC 6749
+	// §5.2 shape, not this service's `code`/`message`/`request_id` envelope. The
+	// request id still reaches the caller in the X-Request-Id header, which
+	// httpx.WithRequestID set before this handler ran.
+	httpx.WriteJSON(w, status, map[string]string{
 		"error":             te.Code,
 		"error_description": te.Description,
 	})
@@ -421,13 +426,4 @@ func mediaType(ct string) string {
 		ct = ct[:i]
 	}
 	return strings.ToLower(strings.TrimSpace(ct))
-}
-
-// httpxWriteJSON is a local alias so this file's response writing reads the same as
-// the rest of the package while still emitting the OAuth shapes, which deliberately
-// are not the httpx.Error envelope.
-func httpxWriteJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }

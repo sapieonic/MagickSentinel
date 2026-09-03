@@ -76,6 +76,15 @@ func OpenS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	if region == "" {
 		region = DefaultRegion
 	}
+	// Everything that can be decided from the configuration alone is decided
+	// before the AWS SDK is asked for anything. LoadDefaultConfig consults the
+	// environment, the shared config files and, on an instance, the metadata
+	// service; a bad SSE setting should not be reported after a metadata timeout,
+	// and it makes these refusals testable without AWS.
+	sse, err := serverSideEncryption(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
 	if cfg.AccessKeyID != "" || cfg.SecretAccessKey != "" {
@@ -97,11 +106,6 @@ func OpenS3(ctx context.Context, cfg S3Config) (*S3, error) {
 			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true
 		})
-	}
-
-	sse, err := serverSideEncryption(cfg)
-	if err != nil {
-		return nil, err
 	}
 
 	return &S3{

@@ -1,7 +1,9 @@
 package httpx_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/magickvoice/sentinel/server/gateway/internal/httpx"
 )
@@ -145,5 +148,214 @@ func TestAPanicBecomesAFiveHundredWithTheRequestId(t *testing.T) {
 	}
 	if strings.Contains(string(body), "boom") {
 		t.Fatal("panic detail leaked to the caller")
+	}
+}
+
+// ------------------------------------------------------------- log/trace joins
+
+func TestTheRequestLineCarriesTheTraceIdWhenATraceIsInProgress(t *testing.T) {
+	// This is the whole payoff of the OpenTelemetry work: an operator reading the
+	// log line for a failed request can click through to the span tree, and back.
+	// Grafana's Loki-to-Tempo correlation is driven off exactly these two fields,
+	// so their absence is not cosmetic.
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	handler := otelhttp.NewHandler(
+		httpx.WithRequestID(httpx.LogRequests(log, http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))),
+		"test", otelhttp.WithTracerProvider(tp))
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var line map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+		t.Fatalf("log line is not JSON: %v (%s)", err, buf.String())
+	}
+	traceID, _ := line["trace_id"].(string)
+	spanID, _ := line["span_id"].(string)
+	if len(traceID) != 32 {
+		t.Errorf("trace_id %q is not a 16-byte hex id", traceID)
+	}
+	if len(spanID) != 16 {
+		t.Errorf("span_id %q is not an 8-byte hex id", spanID)
+	}
+	if line["request_id"] == "" || line["request_id"] == nil {
+		t.Error("the request id must still be there; it is what a customer quotes")
+	}
+}
+
+func TestTheRequestLineOmitsTraceIdsWhenTelemetryIsOff(t *testing.T) {
+	// A deployment with no collector gets the log line it always had. Empty
+	// trace_id fields would be worse than absent ones: they index in Loki and
+	// produce a facet full of zeroes.
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	srv := httptest.NewServer(httpx.WithRequestID(httpx.LogRequests(log,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))))
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var line map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := line["trace_id"]; ok {
+		t.Errorf("trace_id present with no tracer configured: %s", buf.String())
+	}
+}
+
+func TestTheRequestLineLogsTheRoutePatternNotTheRawPath(t *testing.T) {
+	// A raw path can carry an account reference in a query string, and this is a
+	// compliance product. The assertion is on the absence, because that is the
+	// property that matters.
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/calls/{id}", func(w http.ResponseWriter, r *http.Request) {})
+	srv := httptest.NewServer(httpx.WithRequestID(httpx.LogRequests(log, mux)))
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL + "/v1/calls/01J8ZQ8H2Q7X9K3M4N5P6R7S8T?account_ref=ACC-99887")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	out := buf.String()
+	if !strings.Contains(out, "/v1/calls/{id}") {
+		t.Fatalf("route pattern missing: %s", out)
+	}
+	if strings.Contains(out, "ACC-99887") || strings.Contains(out, "01J8ZQ8H2Q7X9K3M4N5P6R7S8T") {
+		t.Fatalf("the raw path leaked into the log: %s", out)
+	}
+}
+
+// ---------------------------------------------------------------- rate limiting
+
+func TestTheRateLimiterAllowsABurstThenRefills(t *testing.T) {
+	cases := []struct {
+		name string
+		rate float64
+		// requests to make back to back from one client.
+		burst float64
+		want  []bool
+	}{
+		{
+			name: "a burst of three admits exactly three",
+			rate: 1, burst: 3,
+			want: []bool{true, true, true, false, false},
+		},
+		{
+			name: "a burst below one is clamped to one, not to zero",
+			rate: 1, burst: 0,
+			want: []bool{true, false},
+		},
+		{
+			name: "a non-positive rate still admits the burst",
+			rate: 0, burst: 2,
+			want: []bool{true, true, false},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := httpx.NewRateLimiter(tc.rate, tc.burst)
+			for i, want := range tc.want {
+				if got := l.Allow("10.0.0.1"); got != want {
+					t.Fatalf("request %d: allowed=%v, want %v", i+1, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestTheRateLimiterIsPerClient(t *testing.T) {
+	// One abusive address must not lock out a floor of legitimate ones.
+	l := httpx.NewRateLimiter(1, 1)
+	if !l.Allow("10.0.0.1") || l.Allow("10.0.0.1") {
+		t.Fatal("the first client's bucket did not behave")
+	}
+	if !l.Allow("10.0.0.2") {
+		t.Fatal("a second client was refused because of the first")
+	}
+}
+
+func TestARateLimitedRequestGetsA429WithARetryAfter(t *testing.T) {
+	// The desktop agent distinguishes status codes rather than parsing bodies
+	// (client/sentinel-agent/src/api.rs), so the status is what carries the
+	// meaning; Retry-After is what stops it hammering.
+	srv := httptest.NewServer(httpx.WithRequestID(httpx.RateLimit(
+		httpx.NewRateLimiter(1, 1), 5*time.Second,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))))
+	defer srv.Close()
+
+	first, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusNoContent {
+		t.Fatalf("first request: %d", first.StatusCode)
+	}
+
+	second, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second request: %d, want 429", second.StatusCode)
+	}
+	if second.Header.Get("Retry-After") != "5" {
+		t.Fatalf("Retry-After %q", second.Header.Get("Retry-After"))
+	}
+	body, _ := io.ReadAll(second.Body)
+	if !strings.Contains(string(body), "rate_limited") {
+		t.Fatalf("body %s", body)
+	}
+}
+
+func TestARateLimitedRouteWithNoLimiterIsUnrestricted(t *testing.T) {
+	// Nil means no limit, which is how the tests mount the token endpoint. It must
+	// pass the handler through rather than wrapping it in something that refuses.
+	srv := httptest.NewServer(httpx.RateLimit(nil, time.Second,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})))
+	defer srv.Close()
+	for i := 0; i < 5; i++ {
+		resp, err := srv.Client().Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("request %d: %d", i+1, resp.StatusCode)
+		}
+	}
+}
+
+func TestTheClientKeyIgnoresForwardedForHeaders(t *testing.T) {
+	// X-Forwarded-For is set by the client, so honouring it would let anyone
+	// bypass the limit entirely by varying one string.
+	r := httptest.NewRequest(http.MethodPost, "/v1/oauth/token", nil)
+	r.RemoteAddr = "203.0.113.9:51234"
+	r.Header.Set("X-Forwarded-For", "10.1.1.1")
+	if got := httpx.ClientKey(r); got != "203.0.113.9" {
+		t.Fatalf("client key %q; the forwarded header must not be trusted", got)
 	}
 }

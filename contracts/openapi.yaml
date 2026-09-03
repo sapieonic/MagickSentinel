@@ -38,6 +38,11 @@ paths:
       operationId: health
       security: []
       summary: Liveness probe
+      description: |
+        Answers as long as the process is alive and deliberately checks nothing.
+        This is the liveness probe: a gateway whose database is down should be left
+        alone to recover rather than killed and restarted into the same dead
+        database. Use `/readyz` to decide whether to send it traffic.
       responses:
         '200':
           description: healthy
@@ -48,6 +53,124 @@ paths:
                 properties:
                   status: { type: string, const: ok }
                   version: { type: string }
+
+  /readyz:
+    get:
+      operationId: readiness
+      security: []
+      summary: Readiness probe — checks the database and the object store
+      description: |
+        Answers the question `/healthz` does not: should this instance be sent
+        traffic. It probes the dependencies rather than returning a constant,
+        because a gateway whose object store is unreachable still accepts the ingest
+        upgrade, still authenticates the device, and then fails every segment write.
+        Nothing about that is visible from the desktop, which keeps retrying, so the
+        audio sits in the spool until the 72-hour bound evicts it and the loss
+        surfaces weeks later as a coverage gap.
+
+        Each check reports only `ok` or `failed`. The endpoint is unauthenticated by
+        necessity — a kubelet cannot present a bearer token — and a database or S3
+        error message carries a hostname, a DSN or a role ARN. The detail goes to
+        the gateway's log, tied to this request by `X-Request-Id`.
+      responses:
+        '200':
+          description: every dependency is reachable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: at least one dependency is unreachable; stop routing to this instance
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /v1/oauth/token:
+    post:
+      operationId: oauthToken
+      tags: [session]
+      security: []
+      summary: OAuth 2.0 token endpoint for the desktop agent (RFC 6749)
+      description: |
+        The desktop agent's OIDC configuration points `token_endpoint` at this
+        route (`client/sentinel-agent/src/auth/pkce.rs`), and the gateway brokers
+        the exchange to Google Cloud Identity Platform server-side.
+
+        **Why the gateway is in this path.** An authorization-code exchange against
+        Google's OAuth endpoint wants a client secret, and turning the resulting
+        Google ID token into an Identity Platform ID token — the kind every other
+        route here verifies — wants the project's Web API key. Neither can be
+        shipped to 200 collections desktops: a key in an MSI is a published key,
+        rotating it is a fleet rollout through the customer's SCCM, and the machines
+        are ones agents have physical access to. This endpoint is where those
+        credentials can live. It is the same argument `docs/architecture.md` makes
+        for keeping model provider keys off the endpoint.
+
+        **The desktop is a public client** (RFC 8252 §8.4). It sends no client
+        secret and PKCE replaces one. A `client_secret` in the request is *refused*
+        rather than ignored, because its presence means either that a secret has
+        been distributed to the fleet and needs revoking, or that some other client
+        is calling this endpoint expecting confidential-client semantics it will not
+        get.
+
+        **PKCE is mandatory on the code grant.** A request without `code_verifier`
+        is refused rather than forwarded: forwarding it would let anyone holding an
+        intercepted authorization code redeem it here. `redirect_uri` must be a
+        literal loopback address with a port (`http://127.0.0.1:{port}/...` or
+        `http://[::1]:{port}/...`) per RFC 8252 §7.3 — not `localhost`, which the
+        agent never produces.
+
+        The route sits outside the authentication middleware, because there is no
+        token yet, and is rate-limited per client address for that reason. Errors
+        use the RFC 6749 §5.2 shape rather than this API's usual `Error` envelope;
+        `X-Request-Id` still carries the trace.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/TokenRequest' }
+      responses:
+        '200':
+          description: tokens issued
+          headers:
+            Cache-Control:
+              description: always `no-store` (RFC 6749 §5.1)
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '400':
+          description: |
+            `invalid_request` (malformed), `invalid_grant` (expired or already-used
+            code, dead refresh token, non-loopback redirect), or
+            `unsupported_grant_type`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
+        '401':
+          description: '`invalid_client` — a client secret was sent by a public client'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
+        '403':
+          description: '`unauthorized_client` — the account is suspended or unknown'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
+        '429':
+          description: rate limited; honour `Retry-After`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: '`server_error` — the identity provider could not be reached'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
+        '503':
+          description: '`temporarily_unavailable` — no identity provider is configured, or it is rate limiting us'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
 
   /v1/devices/enroll:
     post:
@@ -750,6 +873,98 @@ components:
         code: { type: string }
         message: { type: string }
         request_id: { type: string }
+
+    OAuthError:
+      type: object
+      description: |
+        RFC 6749 §5.2. Deliberately not the `Error` envelope above: the caller at
+        `/v1/oauth/token` is an OAuth client following a specification, and every
+        OAuth client library ever written parses this shape. The request id is still
+        returned in the `X-Request-Id` header.
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum: [invalid_request, invalid_client, invalid_grant, unauthorized_client,
+                 unsupported_grant_type, invalid_scope, server_error,
+                 temporarily_unavailable]
+        error_description: { type: string }
+
+    TokenRequest:
+      type: object
+      description: |
+        `application/x-www-form-urlencoded`. Which fields are required depends on
+        `grant_type`: `authorization_code` needs `code`, `code_verifier` and
+        `redirect_uri`; `refresh_token` needs `refresh_token`. `client_secret` is
+        refused outright — see the endpoint description.
+      required: [grant_type]
+      properties:
+        grant_type:
+          type: string
+          enum: [authorization_code, refresh_token]
+        code:
+          type: string
+          description: authorization_code grant — the code from the loopback callback
+        code_verifier:
+          type: string
+          minLength: 43
+          maxLength: 128
+          description: |
+            authorization_code grant, **required**. RFC 7636 §4.1: 43–128 characters
+            from `ALPHA / DIGIT / "-" / "." / "_" / "~"`. An exchange without one is
+            refused rather than forwarded.
+        redirect_uri:
+          type: string
+          description: |
+            authorization_code grant — the loopback address the agent bound, with
+            its port. RFC 8252 §7.3, and the literal address rather than `localhost`.
+          example: http://127.0.0.1:49712/callback
+        client_id:
+          type: string
+          description: checked against the deployment's configured client, not trusted
+        refresh_token:
+          type: string
+          description: refresh_token grant
+
+    TokenResponse:
+      type: object
+      description: |
+        The field set is fixed by `TokenResponse` in
+        `client/sentinel-agent/src/api.rs`, which prefers `id_token` and falls back
+        to `access_token`. `token_type` is present because RFC 6749 §5.1 requires
+        it. Nothing may be added here without changing the Rust client in the same
+        commit.
+      required: [id_token, expires_in, token_type]
+      properties:
+        id_token:
+          type: string
+          description: the Identity Platform ID token every other route verifies
+        access_token:
+          type: string
+          description: present only when the provider issued one distinct from the ID token
+        refresh_token:
+          type: string
+          description: |
+            omitted, not empty, on a refresh that did not rotate it — the previous
+            one stays valid
+        expires_in:
+          type: integer
+          description: ID token lifetime in seconds; always stated, defaulting to 3600
+        token_type: { type: string, const: Bearer }
+
+    Readiness:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        version: { type: string }
+        checks:
+          type: object
+          description: |
+            One entry per configured dependency — `database`, `object_store` — whose
+            value is `ok` or `failed`. Never an error message: this endpoint is
+            unauthenticated.
+          additionalProperties: { type: string, enum: [ok, failed] }
 
     Role:
       type: string
