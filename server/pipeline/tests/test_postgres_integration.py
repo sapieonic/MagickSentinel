@@ -26,6 +26,7 @@ owner and is used only to seed fixtures and to read back rows the pipeline role 
 not be able to see.
 """
 
+import importlib.util
 import os
 from datetime import date, datetime, timedelta, timezone
 
@@ -57,10 +58,18 @@ from sentinel_pipeline.persistence import (
 APP_DSN = os.environ.get("SENTINEL_PIPELINE_TEST_DATABASE_URL")
 ADMIN_DSN = os.environ.get("SENTINEL_PIPELINE_TEST_ADMIN_DATABASE_URL")
 
+# psycopg is an install-time extra, so a checkout with only `pytest` and
+# `jsonschema` -- the documented minimum the rest of this suite runs on -- has no
+# driver. Gate on the import as well as the DSNs: pg_integration.sh sets both
+# variables, so without this check a missing driver surfaces as nineteen errors
+# at fixture setup rather than as a skip, which reads as a broken tree.
+_HAVE_PSYCOPG = importlib.util.find_spec("psycopg") is not None
+
 pytestmark = pytest.mark.skipif(
-    not (APP_DSN and ADMIN_DSN),
+    not (APP_DSN and ADMIN_DSN and _HAVE_PSYCOPG),
     reason="set SENTINEL_PIPELINE_TEST_DATABASE_URL and "
-           "SENTINEL_PIPELINE_TEST_ADMIN_DATABASE_URL (see tests/pg_integration.sh)",
+           "SENTINEL_PIPELINE_TEST_ADMIN_DATABASE_URL, and install the psycopg "
+           "extra (see tests/pg_integration.sh)",
 )
 
 T1 = "11111111-1111-1111-1111-111111111111"
