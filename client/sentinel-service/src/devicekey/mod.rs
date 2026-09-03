@@ -186,7 +186,7 @@ pub fn open_or_create(dir: &std::path::Path) -> Result<Box<dyn DeviceKey>> {
     {
         let _ = dir;
         let key = cng::CngDeviceKey::open_or_create(KEY_NAME)?;
-        return Ok(Box::new(key));
+        Ok(Box::new(key))
     }
     #[cfg(not(windows))]
     {

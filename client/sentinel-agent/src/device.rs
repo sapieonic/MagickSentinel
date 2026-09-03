@@ -96,6 +96,36 @@ pub enum CredentialError {
 /// is what "enrolled" means, and a certificate file with no record beside it is
 /// treated as debris from an interrupted enrollment rather than as an identity.
 pub fn load(dir: &Path) -> Result<DeviceCredential, CredentialError> {
+    // `open_existing`, never `open_or_create`: the agent presents machine identity, it
+    // does not mint it. Under the installer's ACL it could not write `device\` anyway,
+    // but keeping the two entry points distinct means that stays true even where the
+    // ACL does not apply.
+    load_with(dir, || devicekey::open_existing(dir).map(Arc::from))
+}
+
+/// `load`, with the device key opened by the caller rather than by the platform.
+///
+/// This seam exists because of a real failure the Windows CI job found on its first
+/// run. Everything here is about the *credential* -- the identity record, the chain,
+/// the SPKI, the rustls signer -- and none of it depends on where the private key
+/// lives. But `devicekey::open_existing` dispatches per platform: off Windows it
+/// reads a software key out of `dir`, and on Windows it resolves the machine CNG key
+/// by name and never looks at `dir` at all.
+///
+/// So seven tests that wrote a software key into a temp directory and called `load`
+/// passed off Windows and failed on Windows with `Key(NotFound)`. They had only ever
+/// exercised the development fallback -- on the one platform that does not ship.
+/// Injecting the key exercises the plumbing on both.
+///
+/// The key is opened lazily, and that is load-bearing rather than tidy: the identity
+/// and chain checks must run first so that an unenrolled machine reports
+/// `NotEnrolled` and a damaged certificate reports `BadCertificate`, instead of both
+/// collapsing into "key is gone" -- which reads as tampering and is acted on
+/// differently. Taking an already-opened key here would reorder those errors.
+pub(crate) fn load_with<F>(dir: &Path, open_key: F) -> Result<DeviceCredential, CredentialError>
+where
+    F: FnOnce() -> Result<Arc<dyn DeviceKey>, devicekey::DeviceKeyError>,
+{
     let Some(identity) = sentinel_service::device::load_identity(dir)? else {
         return Err(CredentialError::NotEnrolled(dir.display().to_string()));
     };
@@ -105,11 +135,7 @@ pub fn load(dir: &Path) -> Result<DeviceCredential, CredentialError> {
         return Err(CredentialError::BadCertificate);
     }
 
-    // `open_existing`, never `open_or_create`: the agent presents machine identity, it
-    // does not mint it. Under the installer's ACL it could not write `device\` anyway,
-    // but keeping the two entry points distinct means that stays true even where the
-    // ACL does not apply.
-    let key: Arc<dyn DeviceKey> = Arc::from(devicekey::open_existing(dir)?);
+    let key = open_key()?;
     let key_kind = key.kind();
     let signing_key: Arc<dyn SigningKey> = Arc::new(DeviceSigningKey::new(key)?);
     let certified_key = Arc::new(CertifiedKey::new(chain, signing_key.clone()));
@@ -341,6 +367,20 @@ mod tests {
         MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtest\n\
         -----END CERTIFICATE-----\n";
 
+    /// `load`, forced onto the software key the test just wrote into `dir`.
+    ///
+    /// Never plain `load` for a test that expects a credential back: on Windows that
+    /// resolves the machine CNG key by name, ignores `dir`, and fails with
+    /// `Key(NotFound)` on a runner where no device has ever enrolled. Using this
+    /// keeps these assertions about the credential rather than about the platform's
+    /// key store -- see `load_with`.
+    fn load_enrolled(dir: &std::path::Path) -> Result<DeviceCredential, CredentialError> {
+        load_with(dir, || {
+            SoftwareDeviceKey::open(dir)
+                .map(|k| -> Arc<dyn DeviceKey> { Arc::new(k) })
+        })
+    }
+
     fn enrolled_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         SoftwareDeviceKey::generate(dir.path()).unwrap();
@@ -383,7 +423,7 @@ mod tests {
     #[test]
     fn an_enrolled_machine_loads_a_credential_that_knows_what_kind_of_key_it_has() {
         let dir = enrolled_dir();
-        let cred = load(dir.path()).unwrap();
+        let cred = load_enrolled(dir.path()).unwrap();
         assert_eq!(cred.device_id, "1b4e28ba-2fa1-11d2-883f-0016d3cca427");
         assert_eq!(cred.not_after, "2027-09-03T00:00:00Z");
         assert_eq!(cred.key_kind, KeyKind::Software);
@@ -399,7 +439,7 @@ mod tests {
     fn a_missing_certificate_file_is_an_error_rather_than_an_empty_chain() {
         let dir = enrolled_dir();
         std::fs::remove_file(dir.path().join(CERT_FILE)).unwrap();
-        assert!(matches!(load(dir.path()), Err(CredentialError::Io(_))));
+        assert!(matches!(load_enrolled(dir.path()), Err(CredentialError::Io(_))));
     }
 
     #[test]
@@ -407,7 +447,7 @@ mod tests {
         let dir = enrolled_dir();
         std::fs::write(dir.path().join(CERT_FILE), b"not a certificate").unwrap();
         std::fs::write(dir.path().join(CHAIN_FILE), b"").unwrap();
-        assert!(matches!(load(dir.path()), Err(CredentialError::BadCertificate)));
+        assert!(matches!(load_enrolled(dir.path()), Err(CredentialError::BadCertificate)));
     }
 
     #[test]
@@ -415,7 +455,7 @@ mod tests {
         // A gateway whose CA is directly trusted issues no intermediate.
         let dir = enrolled_dir();
         std::fs::remove_file(dir.path().join(CHAIN_FILE)).unwrap();
-        let cred = load(dir.path()).unwrap();
+        let cred = load_enrolled(dir.path()).unwrap();
         assert_eq!(cred.certified_key().cert.len(), 1);
     }
 
@@ -424,7 +464,7 @@ mod tests {
         // Ignoring the CA hint is deliberate: declining to present the certificate
         // would produce a 4403 that reads as a revocation.
         let dir = enrolled_dir();
-        let cred = load(dir.path()).unwrap();
+        let cred = load_enrolled(dir.path()).unwrap();
         let resolver = cred.resolver();
         assert!(resolver.has_certs());
         assert!(resolver.resolve(&[], &[]).is_some(), "even with no hints and no schemes");
@@ -437,7 +477,7 @@ mod tests {
     fn the_signer_offers_exactly_p256_and_signs_through_the_device_key() {
         use p256::ecdsa::signature::Verifier;
         let dir = enrolled_dir();
-        let cred = load(dir.path()).unwrap();
+        let cred = load_enrolled(dir.path()).unwrap();
         let certified = cred.certified_key();
         let signing_key = &certified.key;
 
@@ -464,7 +504,7 @@ mod tests {
     #[test]
     fn the_signing_key_publishes_an_spki_so_rustls_can_check_it_against_the_certificate() {
         let dir = enrolled_dir();
-        let cred = load(dir.path()).unwrap();
+        let cred = load_enrolled(dir.path()).unwrap();
         let certified = cred.certified_key();
         let spki = certified.key.public_key().expect("an SPKI is published");
         let key = SoftwareDeviceKey::open(dir.path()).unwrap();
@@ -478,7 +518,7 @@ mod tests {
         // being true the REST client silently loses its client certificate, and
         // device-scoped routes start answering 403.
         let dir = enrolled_dir();
-        let cred = load(dir.path()).unwrap();
+        let cred = load_enrolled(dir.path()).unwrap();
         let provider = cred.ureq_crypto_provider();
         let nonsense = PrivateKeyDer::Pkcs8(vec![0u8; 8].into());
         let loaded = provider.key_provider.load_private_key(nonsense).unwrap();
@@ -508,7 +548,7 @@ mod tests {
     #[test]
     fn debug_output_carries_no_key_or_certificate_bytes() {
         let dir = enrolled_dir();
-        let cred = load(dir.path()).unwrap();
+        let cred = load_enrolled(dir.path()).unwrap();
         let s = format!("{cred:?}");
         assert!(s.contains("1b4e28ba"));
         assert!(!s.contains("BEGIN"), "no PEM in a log line: {s}");
