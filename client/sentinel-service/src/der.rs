@@ -18,8 +18,6 @@
 pub mod tag {
     pub const INTEGER: u8 = 0x02;
     pub const BIT_STRING: u8 = 0x03;
-    pub const OCTET_STRING: u8 = 0x04;
-    pub const NULL: u8 = 0x05;
     pub const OID: u8 = 0x06;
     pub const UTF8_STRING: u8 = 0x0C;
     pub const SEQUENCE: u8 = 0x30;
@@ -151,16 +149,6 @@ fn base128(out: &mut Vec<u8>, mut v: u32) {
     out.push(digits[0]);
 }
 
-/// `NULL`, for an AlgorithmIdentifier that carries absent parameters explicitly.
-pub fn null() -> Vec<u8> {
-    tlv(tag::NULL, &[])
-}
-
-/// `OCTET STRING`.
-pub fn octet_string(bytes: &[u8]) -> Vec<u8> {
-    tlv(tag::OCTET_STRING, bytes)
-}
-
 /// Wrap DER in a PEM block.
 ///
 /// 64-character lines and `\n` endings. Not `\r\n`: the body is base64 and the
@@ -254,7 +242,7 @@ mod tests {
     fn nesting_composes_without_recomputing_lengths_by_hand() {
         let inner = sequence(&[small_integer(0), utf8_string("hi")]);
         assert_eq!(inner, vec![0x30, 0x07, 0x02, 0x01, 0x00, 0x0C, 0x02, b'h', b'i']);
-        let outer = sequence(&[inner.clone()]);
+        let outer = sequence(std::slice::from_ref(&inner));
         assert_eq!(outer[0], tag::SEQUENCE);
         assert_eq!(outer[1] as usize, inner.len());
     }

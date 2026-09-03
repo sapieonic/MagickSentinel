@@ -149,6 +149,41 @@
     <Property Id="TENANTHINT" Secure="yes" />
     <Property Id="MsiHiddenProperties" Value="ENROLLMENTTOKEN" />
 
+    <!-- ================================================= OIDC, per tenant (7.3) ==
+         The authorize endpoint, the OAuth client id and the Identity Platform tenant
+         are per customer, so they are deployment properties rather than constants in
+         the binary — a client id compiled into SentinelAgent.exe cannot sign in the
+         second BPO's agents, and changing one would be an MSI rollout to 200 desktops
+         instead of a config push.
+
+         Deliberately without defaults. `LocalConfig::oidc_problem` names whichever
+         one is empty, in the log and in the widget; a plausible-looking default would
+         instead fail at the IdP with an error about an unregistered redirect that
+         nobody traces back to here.
+
+         OPEN-2 (Identity Platform or Entra ID) is NOT resolved by these properties:
+         the RFC 8252 + PKCE flow is identical either way, OIDCTENANT is optional, and
+         nothing in the client names a provider.
+
+         OIDCTOKENENDPOINT is normally left unset, which means the gateway's
+         {APIBASEURL}/v1/oauth/token. Set it only against an IdP the endpoints talk to
+         directly.
+    -->
+    <Property Id="OIDCAUTHORIZEENDPOINT" Secure="yes" />
+    <Property Id="OIDCTOKENENDPOINT" Secure="yes" />
+    <Property Id="OIDCCLIENTID" Secure="yes" />
+    <Property Id="OIDCTENANT" Secure="yes" />
+
+    <!-- ======================================================= telemetry (off) ==
+         OTLP export is off unless a tenant asks for it, and when it is on it is
+         relayed by the gateway rather than sent to a collector: 200 desktops on a
+         bank's network with a route to our observability backend is a second egress
+         nobody asked us to justify. TELEMETRYENDPOINT exists for development and
+         opens exactly that second egress, which is why the client logs a warning
+         whenever it is set. -->
+    <Property Id="TELEMETRYENABLED" Secure="yes" Value="0" />
+    <Property Id="TELEMETRYENDPOINT" Secure="yes" />
+
     <!-- ==================================================== WebView2 runtime ==
          Windows 11 ships the runtime; Windows 10 does not (spec section 3). The
          Evergreen bootstrapper is a ~2 MB stub that downloads and installs the
@@ -273,6 +308,45 @@
           <RegistryValue Name="InstalledCaptureTier" Type="string" Value="[SENTINELTIER]" />
           <RegistryValue Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" />
           <RegistryValue Name="DataFolder" Type="string" Value="[DATAFOLDER]" />
+          <!-- Per-tenant OIDC. Readable by Users, and that is fine: an authorize
+               endpoint and a public OAuth client id are not secrets — RFC 8252 native
+               clients have no client secret, which is the whole reason PKCE is used. -->
+          <RegistryValue Name="OidcAuthorizeEndpoint" Type="string" Value="[OIDCAUTHORIZEENDPOINT]" />
+          <RegistryValue Name="OidcTokenEndpoint" Type="string" Value="[OIDCTOKENENDPOINT]" />
+          <RegistryValue Name="OidcClientId" Type="string" Value="[OIDCCLIENTID]" />
+          <RegistryValue Name="OidcTenant" Type="string" Value="[OIDCTENANT]" />
+          <RegistryValue Name="TelemetryEnabled" Type="string" Value="[TELEMETRYENABLED]" />
+          <RegistryValue Name="TelemetryEndpoint" Type="string" Value="[TELEMETRYENDPOINT]" />
+        </RegistryKey>
+      </Component>
+
+      <!-- ================================== the single-use enrollment token (7.2) ==
+           The token is written to its own registry key, ACLed to SYSTEM and
+           Administrators only, and the service deletes the value the moment the
+           exchange succeeds.
+
+           Not the main SOFTWARE\MagickVoice\Sentinel key: `Users` can read that one,
+           and for the window between install and first service start the token would
+           be readable by every agent on the floor. Not a custom action command line
+           either — `SentinelService.exe --enroll <token>` would put the token in the
+           process list, where any user can read it with `Get-CimInstance
+           Win32_Process` for as long as the action runs.
+
+           It is single-use server-side regardless: `enroll.go` consumes the token
+           atomically before it signs, so a leaked one buys a second certificate for
+           nobody. This is about the 24 hours before it is used, not after.
+
+           The component is unconditional so a repair restores the key and its ACL; the
+           value is empty when no token was supplied, which the service reads as "not
+           enrolled and nothing to enrol with" and says so in its log.
+      -->
+      <Component Id="EnrollmentSecret" Guid="B2EF93AC-C411-4AB5-E8F9-26C59F14190B" Bitness="always64">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\MagickVoice\Sentinel\Enrollment"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="Token" Type="string" Value="[ENROLLMENTTOKEN]" KeyPath="yes" />
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" />
+          <!-- No ACE for Users. The absence is the point. -->
         </RegistryKey>
       </Component>
 

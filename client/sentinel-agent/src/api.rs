@@ -208,6 +208,17 @@ impl Default for HttpTokenEndpoint {
 }
 
 impl HttpTokenEndpoint {
+    /// No device certificate, deliberately.
+    ///
+    /// The token exchange goes to the gateway (`{api_base}/v1/oauth/token`), which
+    /// would happily attribute it to a device if one were presented — and doing so was
+    /// considered and rejected. The gateway's listener is
+    /// `VerifyClientCertIfGiven`, so presenting a certificate it cannot verify fails
+    /// the *handshake*, not the request. That would mean an expired or damaged device
+    /// certificate stopped agents signing in, on top of stopping capture, and the
+    /// widget would show "sign in failed" for a problem that has nothing to do with
+    /// the user's credentials. Sign-in is the one thing that must keep working while
+    /// the machine's identity is being repaired.
     pub fn new() -> Self {
         HttpTokenEndpoint {
             agent: ureq::Agent::config_builder()

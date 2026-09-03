@@ -13,9 +13,8 @@ fn main() -> anyhow::Result<()> {
     // Configuration first, because whether telemetry is exported and where to is part
     // of it, and a `tracing` subscriber can only be installed once. The handle owns the
     // exporter thread; holding it in `main` keeps it alive for the life of the process.
-    let local = sentinel_service::config_sync::ConfigStore::open(&sentinel_service::data_dir())
-        .local()
-        .clone();
+    let config = sentinel_service::config_sync::ConfigStore::open(&sentinel_service::data_dir());
+    let local = config.local().clone();
     let _telemetry = init_logging(&local);
 
     if std::env::args().any(|a| a == "--console") {
@@ -140,8 +139,29 @@ mod win {
         pub fn new() -> Self {
             let dir = data_dir();
             let detection = sentinel_capture_tier();
+            let config = ConfigStore::open(&dir);
+            // First start after an install: the values came from the registry the MSI
+            // wrote, and writing them out makes `config.json` authoritative from here
+            // on, so a config sync can change them without the installer's component
+            // putting the originals back on the next repair.
+            if let Err(e) = config.persist_local() {
+                tracing::warn!(error = %e, "the machine config could not be cached");
+            }
+            // The tier decides whether this machine can capture at all, and it is
+            // re-detected on every start because an in-place OS upgrade changes the
+            // answer. A floor that quietly came out tier B — or tier C, which cannot
+            // capture — is a coverage problem somebody has to see before the calls are
+            // missed.
+            tracing::info!(
+                target: sentinel_service::telemetry::TARGET,
+                event = sentinel_service::telemetry::event::TIER_DETECTED,
+                capture_tier = detection.0.as_deref().unwrap_or("none"),
+                os_build = %detection.1,
+                supported = detection.0.is_some(),
+                "capture tier detected"
+            );
             ServiceState {
-                config: Mutex::new(ConfigStore::open(&dir)),
+                config: Mutex::new(config),
                 tier: Mutex::new(detection.0),
                 os_build: Mutex::new(detection.1),
                 restarts: AtomicU32::new(0),

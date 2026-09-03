@@ -140,7 +140,7 @@ pub fn machine_facts(capture_tier: Option<String>, os_build: String) -> crate::e
 /// ACL of SYSTEM and Administrators only, so that between the MSI writing it and the
 /// service consuming it the token is not readable by the agents on the floor.
 ///
-/// The value is deleted by [`take_enrollment_token`] the moment the exchange succeeds.
+/// The value is deleted by [`clear_enrollment_token`] the moment the exchange succeeds.
 /// It is single-use server-side anyway — `enroll.go` consumes it atomically before
 /// signing — so a leftover value is not a second certificate, but it is a credential
 /// sitting on disk for no reason.
@@ -163,4 +163,50 @@ pub fn clear_enrollment_token() {
         // result is ignored rather than logged.
         let _ = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, ENROLLMENT_KEY, w!("Token"));
     }
+}
+
+/// The main machine-configuration key the MSI writes.
+pub const CONFIG_KEY: PCWSTR = w!(r"SOFTWARE\MagickVoice\Sentinel");
+
+/// Build a [`LocalConfig`](sentinel_core::config::LocalConfig) from what the installer
+/// wrote to the registry.
+///
+/// The MSI writes registry values because that is what MSI can do transactionally — a
+/// component's values are removed on uninstall and restored by a repair, which a file
+/// written by a custom action is not. The service's own cache is `config.json`, so this
+/// is the bridge between the two: read on first start, then persisted, after which
+/// `config.json` is authoritative and a config sync can update it without fighting the
+/// installer.
+///
+/// `None` when the key is absent, which means the binary is running somewhere it was
+/// not installed — a developer's machine, or a hand-copied executable.
+pub fn local_config_from_registry() -> Option<sentinel_core::config::LocalConfig> {
+    let api_base_url = read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("ApiBaseUrl"))?;
+    let mut config = sentinel_core::config::LocalConfig {
+        api_base_url,
+        tenant_hint: read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("TenantHint")),
+        ..sentinel_core::config::LocalConfig::default()
+    };
+    config.oidc.authorize_endpoint =
+        read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("OidcAuthorizeEndpoint"))
+            .unwrap_or_default();
+    config.oidc.token_endpoint =
+        read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("OidcTokenEndpoint"));
+    config.oidc.client_id =
+        read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("OidcClientId")).unwrap_or_default();
+    config.oidc.identity_platform_tenant =
+        read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("OidcTenant"));
+    // A string property, because MSI properties are strings. Anything other than a
+    // recognised affirmative is off: telemetry defaulting on because a deployment tool
+    // wrote something unexpected is the wrong direction to fail in.
+    config.telemetry.enabled = matches!(
+        read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("TelemetryEnabled"))
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    );
+    config.telemetry.otlp_endpoint =
+        read_string(HKEY_LOCAL_MACHINE, CONFIG_KEY, w!("TelemetryEndpoint"));
+    Some(config)
 }
