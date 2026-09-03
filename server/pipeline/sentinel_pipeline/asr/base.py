@@ -46,7 +46,8 @@ class BatchASR(Protocol):
     name: str
     version: str
 
-    def transcribe(self, audio: bytes, *, sample_rate: int, language_hint: str | None = None) -> ASRResult:
+    def transcribe(self, audio: bytes, *, sample_rate: int,
+                   language_hint: str | None = None) -> ASRResult:
         ...
 
 

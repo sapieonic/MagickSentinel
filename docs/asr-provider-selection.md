@@ -239,12 +239,24 @@ SENTINEL_ASR_PROVIDER=sarvam           # India-hosted; coarser evidence spans
 SENTINEL_ASR_PROVIDER=whisper          # self-hosted; no third party in the path
 ```
 
-A language hint is passed to the model **only when the floor runs exactly one
-language**. With several, the model's own detection plus code-switching is the
-behaviour we want, and pinning one locale would suppress it mid-sentence.
+A language hint is passed to the model **only when the provider serves exactly one of
+the floor's languages**. With several, the model's own detection plus code-switching is
+the behaviour we want, and pinning one locale would suppress it mid-sentence.
+
+**Routing needs `CallContext.language` set per call.** `Finalizer` forwards it as the
+provider's `language_hint`, and that argument is the only thing `LanguageRoutedASR`
+routes on. A `ta-IN` route with `CallContext.language` left `None` sends Tamil audio to
+the default provider anyway — which is the failure the startup validation exists to
+prevent, so the two have to be configured together. Nothing yet threads the tenant's
+language from the database into `CallContext`; that is the remaining wiring, and until
+it lands a routed floor is configured but inert.
 
 ## Still outstanding
 
+0. **Thread the tenant's language into `CallContext.language`.** Until that exists,
+   `SENTINEL_ASR_ROUTES` is configured but inert, because the router has nothing to
+   route on. This is the one item on this list that makes a documented configuration
+   not work, so it goes first.
 1. **Run the measurement.** 200 hand-labelled calls per language against Gemini
    Transcribe, Sarvam `saaras:v4` and IndicWhisper, reporting WER and numeric-entity
    error rate separately. Configure Gemini with `language_hints=()` for the Hinglish

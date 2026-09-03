@@ -146,6 +146,12 @@ class GoogleTranscribeASR:
         else:
             codes = list(self.language_hints)
 
+        if self.bits_per_sample % 8:
+            # Floor division below would truncate the byte rate and drift every later
+            # chunk's offset, which lands in evidence spans.
+            raise ValueError(
+                f"bits_per_sample must be a whole number of bytes; got {self.bits_per_sample}"
+            )
         bytes_per_second = sample_rate * self.channels * self.bits_per_sample // 8
         if bytes_per_second <= 0:
             raise ValueError("sample_rate, channels and bits_per_sample must be positive")
@@ -160,10 +166,11 @@ class GoogleTranscribeASR:
             chunk = audio[offset : offset + chunk_bytes]
             if not chunk:
                 break
-            # Exact rather than chunk_index * max_chunk_s: a final short chunk and an
-            # audio length that is not a whole number of samples both have to land on
-            # the same timeline as the rest of the call, because these offsets end up
-            # in a finding's evidence span.
+            # Derived from the byte position rather than the chunk index. The two are
+            # arithmetically identical here — offset is always a whole multiple of
+            # chunk_bytes — so this is a readability choice, not a correctness one: it
+            # stays correct if chunking ever becomes uneven (splitting on silence, say),
+            # which is the change most likely to be made to this loop.
             offset_ms = offset * 1_000 // bytes_per_second
             interaction = self._call(chunk, sample_rate=sample_rate, codes=codes)
             text, chunk_words, in_tok, out_tok = _parse(interaction, offset_ms=offset_ms)
@@ -290,12 +297,22 @@ def _offset_ms(value: object) -> int:
     if value is None:
         raise GoogleTranscribeError("word annotation is missing a timing offset")
     if isinstance(value, (int, float)):
-        return round(float(value) * 1_000)
+        return _non_negative(float(value), value)
     text = str(value).strip().removesuffix("s")
     try:
-        return round(float(text) * 1_000)
+        seconds = float(text)
     except ValueError as exc:
         raise GoogleTranscribeError(f"unparseable timing offset {value!r}") from exc
+    return _non_negative(seconds, value)
+
+
+def _non_negative(seconds: float, original: object) -> int:
+    # A word cannot start before the call did. Accepting a negative offset would put a
+    # finding's evidence span at a timestamp that does not exist in the audio, which a
+    # reviewer cannot play back and so cannot defend.
+    if seconds < 0:
+        raise GoogleTranscribeError(f"negative timing offset {original!r}")
+    return round(seconds * 1_000)
 
 
 def _parse(interaction: object, *, offset_ms: int) -> tuple[str, list[Word], int, int]:
@@ -312,12 +329,12 @@ def _parse(interaction: object, *, offset_ms: int) -> tuple[str, list[Word], int
             for annotation in (_field(content, "annotations") or []):
                 if _field(annotation, "type") != "word_info":
                     continue
-                token = _field(annotation, "text")
+                token = str(_field(annotation, "text") or "").strip()
                 if not token:
                     continue
                 words.append(
                     Word(
-                        text=str(token).strip(),
+                        text=token,
                         start_ms=offset_ms + _offset_ms(_field(annotation, "start_offset")),
                         end_ms=offset_ms + _offset_ms(_field(annotation, "end_offset")),
                         # The model returns no per-word confidence. Recording None is
@@ -329,13 +346,36 @@ def _parse(interaction: object, *, offset_ms: int) -> tuple[str, list[Word], int
 
     # output_text is the assembled transcript and is preferred when present; the
     # per-step text is the fallback for a response shape that does not carry it.
-    text = _field(interaction, "output_text")
-    transcript = str(text) if text else " ".join(texts)
+    # Tested for content rather than truthiness: a whitespace-only output_text is
+    # truthy, and taking it would leave a result with spans but nothing to quote —
+    # the worst combination for a compliance record, because the finding looks
+    # traceable right up until someone opens it.
+    transcript = str(_field(interaction, "output_text") or "").strip()
+    if not transcript:
+        transcript = " ".join(texts).strip()
 
     usage = _field(interaction, "usage_metadata") or _field(interaction, "usage") or {}
     return (
-        transcript.strip(),
+        transcript,
         words,
-        int(_field(usage, "total_input_tokens") or 0),
-        int(_field(usage, "total_output_tokens") or 0),
+        _tokens(_field(usage, "total_input_tokens")),
+        _tokens(_field(usage, "total_output_tokens")),
     )
+
+
+def _tokens(value: object) -> int:
+    """Coerce a reported token count, never failing the transcript over one.
+
+    Cost accounting is the least important thing in this response. Letting an
+    unexpected token field raise would discard a finished transcript over a number
+    that only affects a spend report, so an unreadable count is recorded as zero —
+    which :mod:`sentinel_pipeline.asr.base` already documents as "not reported".
+    """
+    if value is None:
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        log.warning("unreadable token count from the transcription API",
+                    extra={"value_type": type(value).__name__})
+        return 0

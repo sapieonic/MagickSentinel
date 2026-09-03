@@ -154,8 +154,10 @@ def build(*, asr=None, analysis_provider=None, segments=None,
 
 @pytest.fixture
 def ctx(make_call):
-    def context(duration_ms: int = 300_000):
-        return make_call(duration_ms=duration_ms).context
+    def context(duration_ms: int = 300_000, language: str | None = None):
+        built = make_call(duration_ms=duration_ms).context
+        built.language = language
+        return built
 
     return context
 
@@ -205,23 +207,32 @@ def test_the_stored_words_survive_the_trip_into_the_transcript(ctx):
 # ------------------------------------------------------- what the provider is told
 
 
-def test_the_language_hint_is_not_passed_to_the_provider(ctx):
-    # Pinning current behaviour: `_transcribe` calls
-    # `transcribe(audio, sample_rate=16_000)` and never forwards a language hint,
-    # because nothing threads the tenant's configured language down to here. The
-    # consequence is that a multi-language floor depends entirely on the provider's
-    # own detection, and a `LanguageRoutedASR` — which routes on this exact
-    # argument and on nothing else — can never leave its default route from inside
-    # `Finalizer`. See the routing tests below.
+def test_the_tenant_language_is_forwarded_to_the_provider_on_every_channel(ctx):
+    # This argument is what selects the transcriber on a routed floor. Dropping it
+    # would send audio to a provider that cannot read the language and produce a
+    # clean-looking transcript with no flags on it — the failure registry.validate
+    # refuses at startup, reintroduced at run time.
+    asr = RecordingASR()
+    f, _ = build(asr=asr)
+
+    f.finalize(ctx(language="ta-IN"), TenantBudget("t", 10_000_000))
+
+    assert len(asr.requests) == 2
+    assert [r["language_hint"] for r in asr.requests] == ["ta-IN", "ta-IN"]
+    assert {r["sample_rate"] for r in asr.requests} == {SAMPLE_RATE}
+    assert {r["audio_len"] for r in asr.requests} == {320}
+
+
+def test_an_unconfigured_language_leaves_detection_to_the_provider(ctx):
+    # None is a real setting rather than a missing one: on a code-mixed floor the
+    # model's own detection is what we want, and naming one locale would suppress the
+    # mid-sentence switching the default model was chosen for.
     asr = RecordingASR()
     f, _ = build(asr=asr)
 
     f.finalize(ctx(), TenantBudget("t", 10_000_000))
 
-    assert len(asr.requests) == 2
     assert [r["language_hint"] for r in asr.requests] == [None, None]
-    assert {r["sample_rate"] for r in asr.requests} == {SAMPLE_RATE}
-    assert {r["audio_len"] for r in asr.requests} == {320}
 
 
 # --------------------------------------------------------------- missing audio
@@ -397,21 +408,29 @@ def test_a_language_routed_asr_records_the_provider_that_actually_ran(ctx):
     assert "false_legal_threat" in {x.rule_id for x in outcome.findings}
 
 
-def test_a_routed_language_is_unreachable_from_inside_the_finalizer(ctx):
-    # Two halves of one gap, pinned together. The router works: given a hint it
-    # picks the provider configured for that language. `Finalizer` never gives it
-    # one, so a Tamil route — the reason the router exists, since the default model
-    # has no Tamil at all — cannot be reached through the pipeline today.
+def test_a_tamil_floor_reaches_its_route_through_the_finalizer(ctx):
+    # The reason the router exists: the default model has no Tamil at all. If this
+    # ever regresses, a Tamil floor with a correct SENTINEL_ASR_ROUTES setting sends
+    # Tamil audio to Gemini and hands a bank a transcript with no flags on it.
     default = FakeASR(name="google-transcribe", text=CLEAN)
     tamil = FakeASR(name="sarvam", text=CLEAN)
     router = LanguageRoutedASR(default=default, routes={"ta-IN": tamil})
 
-    routed = router.transcribe(b"\x00" * 320, sample_rate=SAMPLE_RATE,
-                               language_hint="ta-IN")
-    assert routed.provider == "sarvam"
+    f, _ = build(asr=router)
+    outcome = f.finalize(ctx(language="ta-IN"), TenantBudget("t", 10_000_000))
+
+    # Every stored channel records the provider that actually ran, so a Tamil call
+    # stays distinguishable from the rest of the floor's.
+    assert {c.provider for c in outcome.transcript.channels.values()} == {"sarvam"}
+
+
+def test_a_language_with_no_route_stays_on_the_default_provider(ctx):
+    default = FakeASR(name="google-transcribe", text=CLEAN)
+    tamil = FakeASR(name="sarvam", text=CLEAN)
+    router = LanguageRoutedASR(default=default, routes={"ta-IN": tamil})
 
     f, _ = build(asr=router)
-    outcome = f.finalize(ctx(), TenantBudget("t", 10_000_000))
+    outcome = f.finalize(ctx(language="hi-IN"), TenantBudget("t", 10_000_000))
 
     assert {c.provider for c in outcome.transcript.channels.values()} == {
         "google-transcribe"

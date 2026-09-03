@@ -13,6 +13,9 @@ pytest>=8.0
 pytest-asyncio>=0.23
 ruff>=0.3
 
+[google]
+google-genai>=2.3
+
 [openai]
 openai>=1.20
 

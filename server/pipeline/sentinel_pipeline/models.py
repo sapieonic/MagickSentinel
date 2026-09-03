@@ -98,6 +98,11 @@ class CallContext:
     started_at: datetime
     duration_ms: int
     tenant_timezone: str = "Asia/Kolkata"
+    #: The tenant's configured language for this floor, BCP-47, or ``None`` to leave
+    #: detection to the provider. This is what selects the transcriber on a routed
+    #: floor, so a wrong value here is not a hint being ignored — it is Tamil audio
+    #: going to a model that has no Tamil.
+    language: str | None = None
     account_ref: str | None = None
     direction: str = "outbound"
     capture_tier: str = "A"

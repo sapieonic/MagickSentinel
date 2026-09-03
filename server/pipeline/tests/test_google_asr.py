@@ -434,11 +434,18 @@ def test_sub_millisecond_offsets_round_the_way_python_rounds(value, expected):
     assert _offset_ms(value) == expected
 
 
-def test_a_negative_offset_is_taken_at_face_value():
-    # Documents what the parser does today rather than endorsing it: nothing rejects a
-    # negative timing, so a word could be placed before the call started.
-    assert _offset_ms("-1.5s") == -1_500
-    assert _offset_ms(-2) == -2_000
+@pytest.mark.parametrize("value", ["-1.5s", -2, "-0.001s", -0.5])
+def test_a_negative_offset_is_refused(value):
+    # A word cannot start before the call did. Accepting one would put a finding's
+    # evidence span at a timestamp that does not exist in the audio, which a reviewer
+    # cannot play back and so cannot defend.
+    with pytest.raises(GoogleTranscribeError, match="negative timing offset"):
+        _offset_ms(value)
+
+
+def test_a_zero_offset_is_not_mistaken_for_a_negative_one():
+    assert _offset_ms("0s") == 0
+    assert _offset_ms(0) == 0
 
 
 # ----------------------------------------------------------------- field accessor
@@ -533,14 +540,23 @@ def test_a_word_annotation_with_no_text_is_skipped():
     assert [w.text for w in parsed[1]] == ["kal"]
 
 
-def test_a_whitespace_only_word_annotation_still_produces_a_word():
-    # Documents current behaviour, which is not obviously the right one: a whitespace
-    # token survives the emptiness check and lands in the word list with empty text.
+def test_a_whitespace_only_word_annotation_is_dropped():
+    # An empty-text Word is a phantom token: it shifts the rule engine's n-gram
+    # windows and widens whatever span_text returns around it, so it must never reach
+    # the word list.
     parsed = _parse(
         response({"content": [block(annotation("  ", "0.0s", "0.1s"), text=" ")]}),
         offset_ms=0,
     )
-    assert [(w.text, w.start_ms, w.end_ms) for w in parsed[1]] == [("", 0, 100)]
+    assert parsed[1] == []
+
+
+def test_a_bit_depth_that_is_not_whole_bytes_is_refused():
+    # Floor division on the byte rate would truncate it and drift every later chunk's
+    # offset, which lands in evidence spans.
+    asr = GoogleTranscribeASR(client=FakeClient([]), bits_per_sample=4)
+    with pytest.raises(ValueError, match="whole number of bytes"):
+        asr.transcribe(b"\x00" * 100, sample_rate=16_000)
 
 
 def test_word_text_is_stripped_of_the_padding_the_model_adds():
@@ -572,9 +588,10 @@ def test_an_empty_output_text_falls_back_to_the_per_step_text():
     assert parsed[0] == "pandrah hazaar"
 
 
-def test_a_whitespace_only_output_text_wins_over_the_per_step_text():
-    # Documents current behaviour: whitespace is truthy, so the per-step text is
-    # discarded and the transcript comes back empty even though words were parsed.
+def test_a_whitespace_only_output_text_falls_back_to_the_per_step_text():
+    # Whitespace is truthy, so a truthiness test here would discard the transcript and
+    # leave a result with spans but nothing to quote — the worst combination for a
+    # compliance record, because the finding looks traceable until someone opens it.
     parsed = _parse(
         response(
             {"content": [block(annotation("kal", "1.0s", "1.4s"), text="kal")]},
@@ -582,7 +599,7 @@ def test_a_whitespace_only_output_text_wins_over_the_per_step_text():
         ),
         offset_ms=0,
     )
-    assert parsed[0] == ""
+    assert parsed[0] == "kal"
     assert [w.text for w in parsed[1]] == ["kal"]
 
 
@@ -805,7 +822,6 @@ def test_chunk_size_and_offsets_follow_the_declared_audio_format(sample_rate, ch
     (16_000, 1, 0),
     (-16_000, 1, 16),
     (16_000, -1, 16),
-    (1, 1, 4),
 ])
 def test_an_audio_format_with_no_usable_byte_rate_is_refused(sample_rate, channels, bits):
     # A zero byte rate would mean a zero-length chunk and an offset division by zero;

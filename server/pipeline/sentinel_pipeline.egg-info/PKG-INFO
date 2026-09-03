@@ -19,5 +19,7 @@ Provides-Extra: anthropic
 Requires-Dist: anthropic>=0.25; extra == "anthropic"
 Provides-Extra: openai
 Requires-Dist: openai>=1.20; extra == "openai"
+Provides-Extra: google
+Requires-Dist: google-genai>=2.3; extra == "google"
 Provides-Extra: whisper
 Requires-Dist: faster-whisper>=1.0; extra == "whisper"
