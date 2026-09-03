@@ -270,11 +270,22 @@ mod tests {
 
     #[test]
     fn the_release_gate_matches_the_build() {
-        // In a test build `debug_assertions` is on, so the software key is permitted
-        // and every test above can run. The assertion that matters for shipping is
-        // the other direction, and it is structural: `permitted()` is a const fn over
-        // `cfg!`, so a release build without the feature cannot reach the file at all.
-        assert!(SoftwareDeviceKey::permitted(), "tests are a debug build");
+        // This used to say "tests are a debug build". That stopped being true when
+        // CI began running the suite a second time in release, as the configuration
+        // build.ps1 ships: there `debug_assertions` is off and the gate correctly
+        // refuses, so the release test step names the dev feature explicitly to get
+        // the software path back. Either way one of the two conditions holds, which
+        // is what the tests above depend on.
+        //
+        // The assertion that matters for shipping is the other direction, and it is
+        // structural rather than tested here: `permitted()` is a const fn over
+        // `cfg!`, so a build with neither condition cannot reach the key file at all.
+        // The shipping build in CI passes neither.
+        assert!(
+            SoftwareDeviceKey::permitted(),
+            "the tests above construct a software key, so this build must permit one: \
+             either debug_assertions, or the dev-software-device-key feature"
+        );
         assert_eq!(
             SoftwareDeviceKey::permitted(),
             cfg!(debug_assertions) || cfg!(feature = "dev-software-device-key")

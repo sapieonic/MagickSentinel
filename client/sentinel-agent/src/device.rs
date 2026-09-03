@@ -358,7 +358,6 @@ impl Signer for DeviceSigner {
 mod tests {
     use super::*;
     use sentinel_service::device::{save_identity, DeviceIdentity};
-    use sentinel_service::devicekey::software::SoftwareDeviceKey;
     use sentinel_service::enroll::{CERT_FILE, CHAIN_FILE};
 
     /// A leaf certificate issued by a throwaway CA against a *different* key, used
@@ -367,23 +366,75 @@ mod tests {
         MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtest\n\
         -----END CERTIFICATE-----\n";
 
-    /// `load`, forced onto the software key the test just wrote into `dir`.
+    /// A device key for tests, backed by a fixed P-256 scalar.
+    ///
+    /// Deliberately not `SoftwareDeviceKey`. That type is gated: it refuses to be
+    /// constructed unless `debug_assertions` is on or a dev feature is typed, so that
+    /// a release build cannot use a file-backed key instead of a non-exportable CNG
+    /// one. That gate is a security property and CI checks it -- the Windows job runs
+    /// the suite a second time in release with `sqlcipher`, which is the configuration
+    /// `build.ps1` ships, and there the gate correctly refused and took nine tests
+    /// with it.
+    ///
+    /// The tests it took are about the *credential*: the identity record, the chain,
+    /// the published SPKI, the rustls signer plumbing. None of them are about where a
+    /// private key is stored, so none of them should depend on a type whose whole
+    /// purpose is to be unavailable in the profile they run in. This stub has no
+    /// gate, so they run identically in debug and release, on Windows and off it.
+    ///
+    /// The scalar is fixed rather than random so that a test can reconstruct the same
+    /// key to verify a signature against, without the key having to be persisted
+    /// anywhere.
+    struct TestDeviceKey(p256::ecdsa::SigningKey);
+
+    impl TestDeviceKey {
+        fn new() -> Self {
+            let scalar = [7u8; 32];
+            TestDeviceKey(
+                p256::ecdsa::SigningKey::from_bytes(&scalar.into())
+                    .expect("a fixed, valid P-256 scalar"),
+            )
+        }
+    }
+
+    impl DeviceKey for TestDeviceKey {
+        fn public_point(&self) -> devicekey::Result<[u8; 65]> {
+            // `ToEncodedPoint` is already in scope via the parent module's imports.
+            let encoded = self.0.verifying_key().to_encoded_point(false);
+            let mut out = [0u8; 65];
+            out.copy_from_slice(encoded.as_bytes());
+            Ok(out)
+        }
+
+        fn sign(&self, message: &[u8]) -> devicekey::Result<Vec<u8>> {
+            // ECDSA over SHA-256, DER-encoded: the same contract the CNG and software
+            // implementations present, since rustls hands `Signer::sign` a message.
+            use p256::ecdsa::signature::Signer as P256Signer;
+            let sig: p256::ecdsa::Signature = P256Signer::sign(&self.0, message);
+            Ok(sig.to_der().as_bytes().to_vec())
+        }
+
+        fn kind(&self) -> KeyKind {
+            // Honest: this is not a CNG key, so it must not claim to meet spec 7.2.
+            KeyKind::Software
+        }
+    }
+
+    /// `load`, with the test's own key injected.
     ///
     /// Never plain `load` for a test that expects a credential back: on Windows that
     /// resolves the machine CNG key by name, ignores `dir`, and fails with
-    /// `Key(NotFound)` on a runner where no device has ever enrolled. Using this
-    /// keeps these assertions about the credential rather than about the platform's
-    /// key store -- see `load_with`.
+    /// `Key(NotFound)` on a runner where no device has ever enrolled. Using this keeps
+    /// these assertions about the credential rather than about the platform's key
+    /// store -- see `load_with`.
     fn load_enrolled(dir: &std::path::Path) -> Result<DeviceCredential, CredentialError> {
-        load_with(dir, || {
-            SoftwareDeviceKey::open(dir)
-                .map(|k| -> Arc<dyn DeviceKey> { Arc::new(k) })
-        })
+        load_with(dir, || Ok(Arc::new(TestDeviceKey::new()) as Arc<dyn DeviceKey>))
     }
 
     fn enrolled_dir() -> tempfile::TempDir {
+        // No key file: the key is injected by `load_enrolled`, so nothing here
+        // needs a gated type that a release build refuses to construct.
         let dir = tempfile::tempdir().unwrap();
-        SoftwareDeviceKey::generate(dir.path()).unwrap();
         std::fs::write(dir.path().join(CERT_FILE), SOME_CERT_PEM).unwrap();
         std::fs::write(dir.path().join(CHAIN_FILE), SOME_CERT_PEM).unwrap();
         save_identity(
@@ -495,7 +546,7 @@ mod tests {
         // against the key the device enrolled with.
         let message = b"a TLS 1.3 CertificateVerify transcript would go here";
         let sig = signer.sign(message).unwrap();
-        let key = SoftwareDeviceKey::open(dir.path()).unwrap();
+        let key = TestDeviceKey::new();
         let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.public_point().unwrap()).unwrap();
         let parsed = p256::ecdsa::DerSignature::try_from(sig.as_slice()).unwrap();
         vk.verify(message, &parsed).expect("rustls' signature verifies");
@@ -507,7 +558,7 @@ mod tests {
         let cred = load_enrolled(dir.path()).unwrap();
         let certified = cred.certified_key();
         let spki = certified.key.public_key().expect("an SPKI is published");
-        let key = SoftwareDeviceKey::open(dir.path()).unwrap();
+        let key = TestDeviceKey::new();
         assert_eq!(spki.as_ref(), spki_p256(&key.public_point().unwrap()).as_slice());
         assert_eq!(certified.key.algorithm(), SignatureAlgorithm::ECDSA);
     }

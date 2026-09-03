@@ -216,12 +216,26 @@ jobs:
       # `--workspace` rather than `-p sentinel-core`: the release profile with this
       # feature set is what build.ps1 produces, and a feature-unification problem
       # between crates only appears when the whole workspace is resolved at once.
+      #   * `sentinel-service/dev-software-device-key` is typed here and ONLY here.
+      #     `SoftwareDeviceKey` refuses to be constructed in a release build unless
+      #     that feature is named, so that a release can never use a file-backed key
+      #     where a non-exportable CNG one is required. That gate is doing its job:
+      #     without the feature, this step cannot run the software key's own test
+      #     suite or the CSR tests that need a key to sign with, because the type
+      #     under test declines to exist.
+      #
+      #     Typing it is exactly what the feature is for -- its own documentation
+      #     calls out wanting the software path in an optimised build as the case it
+      #     covers, and requires it to be typed rather than inferred. It applies to
+      #     these TEST binaries only. The shipping build below deliberately does not
+      #     pass it, which is what keeps the guarantee that matters: the binaries a
+      #     customer receives still refuse a software key at compile time.
       - name: cargo test (release + sqlcipher — the configuration build.ps1 ships)
         working-directory: client
         run: >-
           cargo test --workspace --release
           --target x86_64-pc-windows-msvc
-          --features sentinel-core/sqlcipher
+          --features sentinel-core/sqlcipher,sentinel-service/dev-software-device-key
 
       # Mirrors build.ps1 step 1 exactly — same target, same profile, same feature
       # spec, same package selection. It is nearly free after the step above
