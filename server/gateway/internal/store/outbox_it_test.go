@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/magickvoice/sentinel/server/gateway/internal/store"
+	"github.com/magickvoice/sentinel/server/gateway/internal/testdb"
 )
 
 // The finalize outbox against a real Postgres with the real row-level-security
@@ -41,37 +41,23 @@ type outboxFixture struct {
 
 func newOutboxFixture(t *testing.T) *outboxFixture {
 	t.Helper()
-	dsn := os.Getenv("SENTINEL_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("SENTINEL_TEST_DATABASE_URL not set; run via db/test/gateway_it.sh")
-	}
-	adminDSN := os.Getenv("SENTINEL_TEST_ADMIN_DATABASE_URL")
-	if adminDSN == "" {
-		t.Skip("SENTINEL_TEST_ADMIN_DATABASE_URL not set; run via db/test/gateway_it.sh")
-	}
 	ctx := context.Background()
+	// This suite's own database, cloned from the migrated one in the DSN, so that
+	// internal/api's truncate cannot delete rows out from under it. See
+	// internal/testdb.
+	db := testdb.Open(t, "store")
 
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect as the application role: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	admin, err := pgxpool.New(ctx, adminDSN)
-	if err != nil {
-		t.Fatalf("connect as the schema owner: %v", err)
-	}
-	t.Cleanup(admin.Close)
-
-	f := &outboxFixture{t: t, store: store.New(pool), admin: admin}
+	f := &outboxFixture{t: t, store: store.New(db.App), admin: db.Admin}
 	f.seed(ctx)
 	return f
 }
 
 func (f *outboxFixture) seed(ctx context.Context) {
 	f.t.Helper()
-	// Only this test's own rows are reset rather than the schema being truncated:
-	// the api package's integration fixture truncates, and the two suites run in
-	// the same `go test ./...` invocation against the same database.
+	// Only this test's own rows are reset rather than the schema being truncated.
+	// Nothing outside this package shares the database any more, so a truncate
+	// would be safe; it is still not worth the reseed of every table to get back
+	// to a state these tests do not look at.
 	//
 	// Deleting the calls is what resets the outbox, because call_finalize_outbox
 	// cascades from them. The tenant, user and device are left in place and

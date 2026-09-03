@@ -154,7 +154,11 @@ in `sentinel-agent/src/agent.rs`, all dependencies injected as traits. Do not in
 `httpx.Error` envelope (`code`, `message`, `request_id`); use `httpx.WriteError`, never
 `http.Error`. Middleware order is request ID → recover → log → authenticate → authorise.
 Integration tests `t.Skip` when `SENTINEL_TEST_DATABASE_URL` / `SENTINEL_TEST_ADMIN_DATABASE_URL`
-are unset — keep that pattern so `go test ./...` stays runnable without a database.
+are unset — keep that pattern so `go test ./...` stays runnable without a database. A
+database-backed package gets its pools from `internal/testdb.Open`, never from
+`pgxpool.New` on those DSNs directly: the DSNs name a template that each package clones,
+because `go test ./...` runs packages in parallel and a fixture that truncates would
+otherwise wipe another package's rows mid-test.
 
 **Python** (`server/pipeline`, ≥3.11, ruff line-length 100) — collaborators are `typing.Protocol`
 interfaces injected into dataclasses, so tests run against fakes. Provider SDKs are imported

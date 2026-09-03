@@ -114,6 +114,14 @@ pointed at it. The app DSN connects as `sentinel_app`; the admin DSN is the sche
 used for seeding and for read-backs that deliberately check rows the application role
 must not be able to see.
 
+The database those two DSNs name is a *template*, not the one the tests use. `go test
+./...` runs one binary per package in parallel, so `internal/api` — whose fixture reseeds
+with a cascading `TRUNCATE` — and `internal/store` were previously able to delete each
+other's rows mid-test. Each database-backed package now clones the template into its own
+database through `server/gateway/internal/testdb`, which keeps the real schema, the real
+RLS policies and the real `SECURITY DEFINER` functions while making the suites
+independent. Adding another such package needs no change here or in CI.
+
 ```
 cd server/gateway && go test ./...
 ```
