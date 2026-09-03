@@ -1,9 +1,15 @@
 """Sarvam AI batch ASR adapter.
 
-Sarvam is one of the three candidates the Phase 3 evaluation has to measure — with
-IndicWhisper and the incumbent — over 200 hand-labelled real calls per language. It
-is not the default until that measurement exists, and nothing in this file should be
-read as a selection.
+Sarvam is one of the candidates the Phase 3 evaluation has to measure — with
+IndicWhisper, Gemini 3.5 Transcribe and the incumbent — over 200 hand-labelled real
+calls per language. It is not the default until that measurement exists, and nothing
+in this file should be read as a selection. ``docs/asr-provider-selection.md`` records
+where each candidate stands.
+
+One gap in this provider is worth knowing before reading its output as evidence: the
+API returns timings per sentence or phrase rather than per word, so ``ASRResult.words``
+built from it is coarser than the spans ``ChannelTranscript.span_text`` is meant to
+produce.
 
 The SDK is imported inside ``__init__`` so a deployment that uses a different
 provider does not have to install it.

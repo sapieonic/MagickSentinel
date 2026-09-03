@@ -123,5 +123,6 @@ Import shared code as `@sentinel/shared`, aliased to source (not build output) i
 - [docs/architecture.md](docs/architecture.md) — system shape and the decisions most often questioned
 - [docs/security.md](docs/security.md) — each compliance requirement mapped to its implementation
 - [docs/local-setup-guide.md](docs/local-setup-guide.md) — running the stack locally
+- [docs/asr-provider-selection.md](docs/asr-provider-selection.md) — ASR candidate shortlist, per-provider feature gaps and cost at floor scale
 - [docs/open-decisions.md](docs/open-decisions.md) — OPEN-1..8; check before assuming a behaviour is settled
 - [docs/deployment.md](docs/deployment.md) — Windows support matrix, tier B, headset pinning, EDR

@@ -11,7 +11,9 @@ first customer complaint:
   because numbers are a tiny fraction of the tokens and carry all of the meaning.
 
 The required evaluation set before Phase 3 exit is 200 hand-labelled real calls per
-language, measured against Sarvam, IndicWhisper and the incumbent.
+language, measured against Sarvam, IndicWhisper, Gemini 3.5 Transcribe and the
+incumbent. See ``docs/asr-provider-selection.md`` for what each of them can and cannot
+do; several are eliminated on features rather than on these numbers.
 """
 
 from __future__ import annotations
