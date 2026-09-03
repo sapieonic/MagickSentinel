@@ -86,6 +86,16 @@ ASR failure stops the call; **analysis failure must not stop compliance** (tier-
 the transcript); judge failure leaves tier-1 findings standing unreviewed. Do not collapse these
 into one try/except.
 
+**A transcriber that cannot read the floor's language must not start.** The default
+batch ASR provider is `gemini-3.5-transcribe`, chosen in
+[server/pipeline/sentinel_pipeline/providers/registry.py](server/pipeline/sentinel_pipeline/providers/registry.py),
+and it has **no Tamil at all**. A Tamil floor pointed at it would not fail — it would
+transcribe Tamil audio as something else and hand a bank a clean-looking transcript
+with no flags on it. So `registry.validate` raises on a configured language the chosen
+provider does not support, and `build_batch_asr` never falls back to a different
+provider silently. Do not soften either into a warning, and when you add an adapter,
+declare its coverage in `CAPABILITIES` in the same commit.
+
 **No PII in logs.** Structured logging only, on every tier.
 
 ## Language conventions
@@ -123,5 +133,6 @@ Import shared code as `@sentinel/shared`, aliased to source (not build output) i
 - [docs/architecture.md](docs/architecture.md) — system shape and the decisions most often questioned
 - [docs/security.md](docs/security.md) — each compliance requirement mapped to its implementation
 - [docs/local-setup-guide.md](docs/local-setup-guide.md) — running the stack locally
+- [docs/asr-provider-selection.md](docs/asr-provider-selection.md) — ASR candidate shortlist, per-provider feature gaps and cost at floor scale
 - [docs/open-decisions.md](docs/open-decisions.md) — OPEN-1..8; check before assuming a behaviour is settled
 - [docs/deployment.md](docs/deployment.md) — Windows support matrix, tier B, headset pinning, EDR

@@ -22,6 +22,11 @@ class ASRResult:
     confidence: float | None = None
     provider: str = "unknown"
     provider_version: str = "unknown"
+    # Reported by the providers that bill per token rather than per minute of audio,
+    # so a provider evaluation can compare cost on the same calls it compares WER on.
+    # Zero means "not reported", which is the honest reading for a per-minute API.
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def to_channel_transcript(self, channel: Channel) -> ChannelTranscript:
         return ChannelTranscript(
@@ -41,7 +46,8 @@ class BatchASR(Protocol):
     name: str
     version: str
 
-    def transcribe(self, audio: bytes, *, sample_rate: int, language_hint: str | None = None) -> ASRResult:
+    def transcribe(self, audio: bytes, *, sample_rate: int,
+                   language_hint: str | None = None) -> ASRResult:
         ...
 
 

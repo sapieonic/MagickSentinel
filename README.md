@@ -239,6 +239,9 @@ out-of-sync lockfile described above.
   conversation.
 - [`docs/security.md`](docs/security.md) — the compliance and security requirements
   mapped to where they are implemented, with file paths, and what is outstanding.
+- [`docs/asr-provider-selection.md`](docs/asr-provider-selection.md) — the ASR candidate
+  shortlist as of September 2026: what each provider does and does not support, what it
+  costs at floor scale, and why Cloud Speech-to-Text is not on the list.
 - [`docs/phase-0-checklist.md`](docs/phase-0-checklist.md) — the discovery checklist and
   its go/no-go criterion.
 - [`docs/open-decisions.md`](docs/open-decisions.md) — OPEN-1 to OPEN-8, what each

@@ -136,7 +136,13 @@ class Finalizer:
                 outcome.notes.append(f"no audio on the {channel.speaker} channel")
                 continue
             try:
-                result = self.asr.transcribe(audio, sample_rate=16_000)
+                # The hint is what routes the call. On a floor whose language the
+                # default provider cannot read, dropping it here would send the audio
+                # to that provider anyway and produce a clean-looking transcript with
+                # no flags on it — the exact failure registry.validate refuses at
+                # startup, reintroduced at run time.
+                result = self.asr.transcribe(audio, sample_rate=16_000,
+                                             language_hint=ctx.language)
             except Exception as exc:  # noqa: BLE001 - provider errors are opaque
                 # No call content in the log line: the exception message could
                 # contain a transcript fragment from a provider that echoes input.
