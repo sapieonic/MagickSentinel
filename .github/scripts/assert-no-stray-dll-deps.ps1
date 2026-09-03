@@ -90,20 +90,66 @@ $Allowed = @(
 # prefix is correct rather than lazy.
 $AllowedPrefixes = @('api-ms-win-', 'ext-ms-win-')
 
-$dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
-if (-not $dumpbin) {
-    # Search the VS installation, since dumpbin is not on PATH outside a developer
-    # command prompt.
-    $candidates = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
-        -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match '\\Hostx64\\x64\\' } |
-        Sort-Object FullName -Descending
-    if (-not $candidates) {
-        throw "dumpbin.exe was not found. It ships with the MSVC toolchain, which built these binaries, so its absence means this is not the machine that built them."
+# Resolved to a plain string rather than carried as an object, because the discovery
+# paths return different shapes: `Get-Command` yields a CommandInfo whose path is
+# `.Source`, `Get-ChildItem` yields a FileInfo whose path is `.FullName`. Reaching for
+# `.Source ?? .FullName` looks like it handles both and does not: under
+# `Set-StrictMode -Version Latest` (set above) reading a property the object does not
+# have *throws* rather than yielding $null, so the null-coalescing operator never runs
+# and the script dies with "The property 'Source' cannot be found on this object".
+# That is how this script failed the first time it ever ran.
+$dumpbinPath = $null
+
+# 1. A developer command prompt has it on PATH.
+$onPath = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+if ($onPath) { $dumpbinPath = $onPath.Source }
+
+# 2. Otherwise ask vswhere, which ships at a fixed location with every Visual Studio
+#    installer and is the supported way to locate the toolchain. This is a handful of
+#    file reads: the recursive search below is the fallback because Visual Studio is
+#    tens of thousands of files and walking it cost about forty seconds per run.
+if (-not $dumpbinPath) {
+    # Bound to a local first: `Join-Path` refuses a null `-Path` with a binding
+    # error, so testing the variable after building the path is too late. Windows
+    # always sets this; a non-Windows host running the script for a syntax check
+    # does not, and it should reach the clear throw at the bottom rather than a
+    # parameter-binding failure.
+    $pf86 = ${env:ProgramFiles(x86)}
+    $vswhere = if ($pf86) { Join-Path $pf86 "Microsoft Visual Studio\Installer\vswhere.exe" } else { $null }
+    if ($vswhere -and (Test-Path $vswhere)) {
+        $root = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath 2>$null | Select-Object -First 1
+        if ($root) {
+            $verFile = Join-Path $root "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt"
+            if (Test-Path $verFile) {
+                $ver = (Get-Content $verFile -Raw).Trim()
+                $candidate = Join-Path $root "VC\Tools\MSVC\$ver\bin\Hostx64\x64\dumpbin.exe"
+                if (Test-Path $candidate) { $dumpbinPath = $candidate }
+            }
+        }
     }
-    $dumpbin = $candidates[0]
 }
-Write-Host "using $($dumpbin.Source ?? $dumpbin.FullName)"
+
+# 3. Last resort: walk the install roots, bounded. `-Depth` matters -- an unbounded
+#    `-Recurse` from a path that does not exist (or from `\Microsoft Visual Studio`
+#    when ProgramFiles is unset, as on a non-Windows host) walks whatever it lands on
+#    and does not come back.
+if (-not $dumpbinPath) {
+    $roots = @("${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio") |
+        Where-Object { $_ -and $_ -notmatch '^\\Microsoft' -and (Test-Path $_) }
+    if ($roots) {
+        $candidates = Get-ChildItem -Path $roots -Recurse -Depth 8 -Filter dumpbin.exe -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\Hostx64\\x64\\' } |
+            Sort-Object FullName -Descending
+        if ($candidates) { $dumpbinPath = @($candidates)[0].FullName }
+    }
+}
+
+if (-not $dumpbinPath) {
+    throw "dumpbin.exe was not found. It ships with the MSVC toolchain, which built these binaries, so its absence means this is not the machine that built them."
+}
+Write-Host "using $dumpbinPath"
 
 $failures = @()
 
@@ -113,7 +159,7 @@ foreach ($p in $Path) {
     Write-Host ""
     Write-Host "== $([IO.Path]::GetFileName($resolved))" -ForegroundColor Cyan
 
-    $output = & ($dumpbin.Source ?? $dumpbin.FullName) /nologo /dependents $resolved
+    $output = & $dumpbinPath /nologo /dependents $resolved
     if ($LASTEXITCODE -ne 0) { throw "dumpbin failed on $resolved" }
 
     # dumpbin prints the imports as an indented block between "Image has the following
