@@ -1,9 +1,12 @@
 jsonschema>=4.21
 pydantic>=2.6
 nats-py>=2.7
-asyncpg>=0.29
+psycopg[binary,pool]>=3.1
 boto3>=1.34
 structlog>=24.1
+opentelemetry-api>=1.24
+opentelemetry-sdk>=1.24
+opentelemetry-exporter-otlp-proto-http>=1.24
 
 [anthropic]
 anthropic>=0.25
@@ -18,6 +21,12 @@ google-genai>=2.3
 
 [openai]
 openai>=1.20
+
+[opus]
+opuslib>=3.0.1
+
+[otlp-grpc]
+opentelemetry-exporter-otlp-proto-grpc>=1.24
 
 [sarvam]
 requests>=2.31

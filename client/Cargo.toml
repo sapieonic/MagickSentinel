@@ -34,7 +34,11 @@ base64 = "0.22"
 # Uplink. `tungstenite` is the synchronous WebSocket implementation; TLS comes from
 # rustls so there is one TLS stack in the process and no OpenSSL in the MSI.
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
-rustls = "0.23"
+# `ring` is named explicitly rather than inherited from `ureq`'s feature set: the
+# device credential builds a `CryptoProvider` by hand (see
+# `sentinel-agent/src/device.rs`) and must not have the provider it names disappear
+# because a sibling crate's features changed.
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 
 # REST client for /v1/sessions, /v1/policy, /v1/heartbeat and the token endpoint.

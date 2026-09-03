@@ -6,5 +6,6 @@
 //! platform work.
 
 pub mod launcher;
+pub mod machine;
 pub mod pipe;
 pub mod scm;

@@ -37,7 +37,7 @@ pub struct Dump {
 /// Newest first because a crash loop produces near-identical dumps and the most
 /// recent one is the one that matches the currently deployed build.
 pub fn triage(mut dumps: Vec<Dump>, now: SystemTime) -> (Vec<Dump>, Vec<Dump>) {
-    dumps.sort_by(|a, b| b.modified.cmp(&a.modified));
+    dumps.sort_by_key(|a| std::cmp::Reverse(a.modified));
     let mut ship = Vec::new();
     let mut drop = Vec::new();
     for d in dumps {

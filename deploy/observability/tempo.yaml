@@ -1,0 +1,78 @@
+# Tempo: trace storage.
+#
+# Single binary, local storage. That is right for a local/dev stack and for a first
+# production deployment of a product at this stage, and it is not right forever — the
+# thing to change when it stops being right is `storage.trace.backend`, from `local` to
+# `s3`, pointed at the same India-region bucket the audio uses. OPEN-4's working
+# assumption is India-only; Tempo blocks carry span attributes including tenant
+# identifiers and call ids, so they are subject to the same answer as the audio.
+#
+# WHY TEMPO AND NOT JAEGER: Grafana is the stated preference, and Tempo's value here is
+# specifically the correlation. `tracesToLogsV2` and `tracesToMetrics` in
+# grafana/provisioning/datasources/datasources.yaml turn a trace into a jumping-off
+# point for the other two signals without anyone configuring a join. Jaeger would need
+# that built.
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+  # 30s. A query over a wide time range on local storage is slow, and the default 10s
+  # turns "the trace search was slow" into "the trace search is broken".
+  http_server_read_timeout: 30s
+  http_server_write_timeout: 30s
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  # Flush a trace 10s after its last span. Short, because a single-node stack has no
+  # redundancy: anything still in the ingester's memory when the container restarts is
+  # gone. Traces are the one signal here whose loss is merely annoying rather than
+  # material, which is why 10s is a reasonable place to trade throughput for durability.
+  complete_block_timeout: 10s
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    # 14 days. Long enough that a trace is still there when someone investigates a
+    # complaint from last week, short enough that a single-node disk survives.
+    #
+    # This is NOT the same retention as anything in OPEN-6. OPEN-6 is about borrower
+    # audio (default 30 days) and transcripts (default 365), both placeholders. Traces
+    # carry no borrower content — the collector's redaction processors see to that —
+    # so they are an operational retention decision, not a compliance one. Keeping the
+    # two separate matters: a single number covering both is a sign the question was
+    # not really asked.
+    block_retention: 336h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# The metrics generator is OFF, deliberately.
+#
+# It would produce span metrics and a service graph automatically, which is genuinely
+# useful. It is off because it generates a time series per (service, span name, status)
+# tuple, and this product's span names will include per-call operations. On a floor
+# doing thousands of calls a day that is unbounded cardinality arriving in Prometheus
+# from a component nobody is watching, and the first symptom is Prometheus running out
+# of memory — at which point every alert in sentinel.rules.yml stops evaluating,
+# including the ones about audio being lost.
+#
+# Turn it on when there is a span-name policy to turn it on against.
+overrides:
+  defaults:
+    metrics_generator:
+      processors: []

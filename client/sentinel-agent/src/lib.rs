@@ -17,6 +17,7 @@
 //! | [`heartbeat`] | the 30 s tamper and health signal |
 //! | [`widget`] | the WebView2 shell and its `sentinel.*` surface |
 //! | [`api`] | the REST routes the agent needs |
+//! | [`device`] | loading the enrolled mTLS credential and signing with it |
 //! | [`ipc`] | the agent side of the service's control pipe |
 //!
 //! Everything above is platform-neutral except the Credential Manager, the browser
@@ -27,6 +28,7 @@
 pub mod agent;
 pub mod api;
 pub mod auth;
+pub mod device;
 pub mod encode;
 pub mod heartbeat;
 pub mod identity;
@@ -48,11 +50,23 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// account reference or a borrower name; where a value could carry one — a gateway
 /// error message, a UIA scrape — it is dropped rather than logged.
 pub fn init_logging() {
+    init_logging_with(None)
+}
+
+/// Initialise logging, optionally with OTLP export attached.
+///
+/// The OTLP layer is `None` unless the tenant turned telemetry on: see
+/// `sentinel_core::config::TelemetrySettings` and `sentinel_service::telemetry`. Local
+/// JSON logging is unconditional and unaffected by it — the exporter is an addition,
+/// never a replacement, because the log file is what a support engineer reads on a
+/// machine whose uplink is the thing that is broken.
+pub fn init_logging_with(otlp: Option<sentinel_service::telemetry::OtlpLayer>) {
     use tracing_subscriber::prelude::*;
     let filter = tracing_subscriber::EnvFilter::try_from_env("SENTINEL_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().json().with_current_span(false))
+        .with(otlp)
         .try_init();
 }

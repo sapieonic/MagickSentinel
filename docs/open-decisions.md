@@ -46,11 +46,23 @@ Platform ID tokens against Google's JWKS
 from the verified claims. That works identically whether the upstream is a SAML
 federation to Entra ID or a password credential, so the build has not had to guess.
 
-A PKCE implementation exists at `client/sentinel-agent/src/auth/pkce.rs`, though at the
-time of writing the agent crate's root is still a placeholder and does not compile it in.
-Either way, PKCE against Identity Platform is the same flow whether the upstream is
-federated or not, so this decision's practical consequences — provisioning,
-deprovisioning, MFA behaviour on a shared desktop — are still ahead.
+The PKCE implementation at `client/sentinel-agent/src/auth/pkce.rs` is now reachable and
+compiled in — an earlier version of this entry said the agent crate's root was a
+placeholder that did not build it, and that is no longer true. The desktop runs the flow
+in the system browser, and the exchange it dead-ended at before now exists:
+`POST /v1/oauth/token` (`server/gateway/internal/api/token.go`, `internal/idp`) brokers
+the authorization-code exchange server-side, so the desktop stays a public client per RFC
+8252 and neither an OAuth client secret nor an Identity Platform API key ships in an MSI.
+The tenant's OIDC endpoints and client id now live in `LocalConfig`
+(`client/sentinel-core/src/config.rs`), written by the installer per tenant, with no
+default and a named error for each missing value rather than a shared fallback.
+
+None of that decides this question. PKCE against Identity Platform is the same flow
+whether the upstream is federated to Entra ID or a password credential, which is exactly
+why the build has been able to proceed without an answer. The practical consequences —
+provisioning, deprovisioning, MFA behaviour on a shared desktop where three shifts sign in
+and out of the same machine — are all still ahead, and the installer property that names
+the tenant's authorize endpoint is the place where the answer will eventually land.
 
 **What would settle it:** the identity provider inventory in
 `docs/phase-0-checklist.md` — the provider and tenant, whether agents have individual
@@ -83,15 +95,28 @@ that carry a compliance flag.
 
 **Blocks:** Phase 1 infrastructure.
 
-**Working assumption:** India only. `contracts/openapi.yaml` names
-`https://api.sentinel.magickvoice.com` as production and annotates it `ap-south-1`.
-Nothing in the repository pins a region beyond that: there is no deployment
-configuration, no Terraform, and the object-store layer has only a filesystem and an
-in-memory backend (`server/gateway/internal/blob/blob.go`), so the S3 region has not yet
-had to be chosen.
+**Working assumption:** India only, and the code now defaults to it in three places
+rather than asserting it in one. `contracts/openapi.yaml` names
+`https://api.sentinel.magickvoice.com` as production and annotates it `ap-south-1`. There
+is an S3 backend, `server/gateway/internal/blob/s3.go`, whose `DefaultRegion` is
+`ap-south-1`. And `deploy/` creates MinIO's development bucket in the same region, so that
+nobody develops against a `us-east-1` default — the region a bucket was created in is the
+one fact about an object store that cannot be changed afterwards.
 
-That is the whole point of raising it now. The cost of confirming India-only before the
-infrastructure exists is a conversation; after it exists, it is a migration.
+Two deliberate omissions keep the question from being answered by accident.
+`SENTINEL_S3_SSE` and `SENTINEL_S3_KMS_KEY_ID` are left unset, because the key that would
+encrypt borrower audio at rest has a residency of its own. And there is still no
+Terraform, no Helm chart and no Kubernetes manifest: `deploy/README.md` records that
+infrastructure-as-code written now would encode a region and a cloud into the repository
+before this decision is made, which is precisely the cost this entry exists to avoid.
+`deploy/observability/` likewise names no managed telemetry backend, because Grafana
+Cloud, Datadog, New Relic and Honeycomb all resolve to a US or EU region if nobody
+chooses.
+
+**A default is not a confirmation.** Nothing in the repository has been deployed, and
+nobody at the bank has put India-only in writing. The cost of the answer is still a
+configuration change rather than a migration, but that window is narrower than when this
+was raised: the storage layer now exists and has a region baked into its default.
 
 **What would settle it:** written confirmation from the bank client that all storage
 stays in an India region, and that cross-region replication requires their prior written
@@ -119,15 +144,31 @@ See `docs/asr-provider-selection.md`.
 
 **Blocks:** the Phase 1 MSI.
 
-**Working assumption:** none. `client/installer/` exists as an empty directory — no WiX
-project — and there is no widget shell, so neither the Evergreen bootstrapper nor a
-fixed-version runtime has been bundled or even chosen between.
+**Working assumption: Evergreen only, marked in the WiX source as not decided.**
+`client/installer/` is no longer empty — it holds a complete WiX v4 package — so this
+entry's old text, that there is no WiX project and nothing has been chosen between, is
+out of date. What `Sentinel.wxs` actually does is install the Evergreen bootstrapper and
+nothing else, with a comment at the component saying in as many words that OPEN-5 is **not
+decided** and that the air-gapped case is unresolved. It searches HKLM for an existing
+per-machine runtime first, and if the bootstrapper fails the install is allowed to
+continue rather than failing the whole package, because leaving a floor with capture and
+no widget is a better failure than leaving it with neither — the missing runtime is
+reported in the heartbeat instead.
 
-The question is whether the Evergreen bootstrapper, which fetches the runtime from
-Microsoft at install time, is acceptable, or whether a fixed-version runtime has to ship
-inside the MSI for floors with no outbound access at install time. Fixed-version costs
-package size and takes on the responsibility for updating the runtime; Evergreen costs
-an internet dependency at the worst possible moment.
+The release workflow fetches that bootstrapper rather than committing it
+(`.github/scripts/fetch-webview2.ps1`), verifies it against a SHA-256 pinned outside the
+script in a repository variable, checks the Authenticode signature names Microsoft, and
+fails closed on any of those. That is a supply-chain control, not an answer to this
+question.
+
+The question is unchanged: whether the Evergreen bootstrapper, which fetches the runtime
+from Microsoft at install time, is acceptable, or whether a fixed-version runtime has to
+ship inside the MSI for floors with no outbound access at install time. Fixed-version
+costs package size and takes on the responsibility for updating the runtime; Evergreen
+costs an internet dependency at the worst possible moment. Nothing has been installed
+anywhere — no MSI has been built — so neither branch has been tried. The `.wxs` comment
+records both exits, so that whichever way this is settled it is an edit in one place
+rather than an archaeology exercise.
 
 **What would settle it:** the network egress answer from Phase 0 — specifically whether
 desktops can reach Microsoft's WebView2 distribution endpoints during installation, and
@@ -147,13 +188,26 @@ gateway returns both in the policy snapshot, and `blob.SegmentKey` partitions ob
 keys by day specifically so that a retention sweep can delete a day's audio by prefix
 rather than row by row (`server/gateway/internal/blob/blob.go`).
 
-The purge job now exists too, at `server/pipeline/sentinel_pipeline/retention.py`. It
-reads the two periods per tenant rather than hard-coding them, which is the right shape
-for a value that is still open — but it runs against `Protocol` interfaces that nothing
-implements, nothing schedules it, and it has no tests.
+The purge job at `server/pipeline/sentinel_pipeline/retention.py` reads the two periods
+per tenant rather than hard-coding them, which is the right shape for a value that is
+still open, and it is no longer the sketch this entry used to describe. The `Protocol`
+interfaces now have concrete implementations (`persistence.py`, `blobstore.py`) against
+Postgres and object storage; there is an entry point, `sentinel-pipeline retention`, and a
+one-shot container for it in `deploy/compose.yaml`; and it is covered by
+`tests/test_retention_jobs.py`, which for a job whose failure mode is deleting the wrong
+data was the qualification that mattered most.
+
+Two properties keep the still-open answer from being pre-empted. **It defaults to a dry
+run** — `RetentionJob(dry_run=True)`, and the CLI requires an explicit `--commit` — and a
+dry-run pass writes an audit entry marked as such, so it cannot be mistaken for a purge
+that happened. **And nothing schedules it:** no cron, no timer, no orchestrator, and the
+compose stack it lives in has never been stood up.
 
 Do not read the two defaults as a decision. They have never been checked against a real
-requirement, and the code that would enforce them has never deleted anything.
+requirement. What has changed is only that the code which would enforce them is now
+tested; it still has not deleted a production row or object, and there is deliberately no
+object-lock or WORM setting on the audio bucket, because object lock is the one storage
+setting that cannot be undone and turning it on now would make a placeholder permanent.
 
 **What would settle it:** the bank client's retention requirement and the BPO's, which
 are often different, plus whatever the applicable RBI guidance requires for recovery-call
@@ -172,8 +226,17 @@ dialer minutes, captured minutes and a gap reason
 (`db/migrations/0001_init.up.sql`). `server/pipeline/sentinel_pipeline/coverage.py`
 implements the reconciliation arithmetic behind a `CdrSource` protocol, with the
 docstring recording that the format and delivery differ per bank and that only the
-arithmetic belongs in that module. Nothing implements `CdrSource`, nothing populates
-`coverage_daily`, and the module has no tests.
+arithmetic belongs in that module. It now has tests (`tests/test_coverage.py`) and an
+entry point (`sentinel-pipeline coverage`).
+
+`CdrSource` also has one implementation now — but read what it is before reading it as
+progress. `sentinel_pipeline/cdr.py` is an adapter *registry* keyed by
+`SENTINEL_CDR_ADAPTER`, with a CSV reader as the reference entry: configurable column
+names, a configurable path template, and an error naming this decision when an unknown
+adapter is asked for. It is written against no customer's file. A registry with one
+reference adapter is the shape you build when you expect the real format to be different,
+which is the same thing as saying the question is open. Nothing populates `coverage_daily`
+from real data, because no dialer export has been supplied.
 
 This one is worth pressing on early despite blocking a later phase. Coverage percentage
 against the dialer's own record of calls is the metric that turns tamper detection from
@@ -197,12 +260,17 @@ built.** `SoftphoneConfig` in `client/sentinel-core/src/config.rs` carries
 `process_names` as an ordered preference list and `uia_account_ref_selector` as an
 optional string, delivered by `GET /v1/policy`. The comment on that field records that
 it is OPEN-8. When the selector is absent the account reference is left null and the
-server reconciles against the dialer CDR instead — which is also OPEN-7, so the fallback
-is currently unavailable too.
+server reconciles against the dialer CDR instead — which is also OPEN-7. A reference CSV
+adapter now exists there, but no customer's export format does, so the fallback is still
+unavailable in practice.
 
 What is missing is one worked example: a real softphone, on a real desktop, with a
 verified process name and a selector that actually reads the account reference out of
-the dialer window.
+the dialer window. Nothing in the recent work moves this. The COM capture code that would
+resolve a process name to an audio session still has zero tests, the `windows-latest` CI
+job that would at least compile and lint it has never run, and no build of this software
+has been installed on a machine with a softphone on it. This remains a configuration
+shape with no observation behind it.
 
 **What would settle it:** the softphone identification item in
 `docs/phase-0-checklist.md`, confirmed by watching a live call rather than by reading
@@ -217,10 +285,10 @@ a way that only shows up when capture silently never arms.
 | ID | Decision | Blocks | Working assumption in this repository |
 |---|---|---|---|
 | OPEN-1 | Rust or C# for the native agent | Phase 1 start | Settled: Rust, in `client/` |
-| OPEN-2 | Does the customer run Entra ID | Phase 1 | None; token verification is provider-agnostic |
+| OPEN-2 | Does the customer run Entra ID | Phase 1 | None; token verification is provider-agnostic, and PKCE plus the gateway's `/v1/oauth/token` broker work either way |
 | OPEN-3 | Agent replay of own call audio | Phase 4 | Per-tenant flag, defaults to off |
-| OPEN-4 | Data residency | Phase 1 infra | India only, asserted in the OpenAPI server list; no infrastructure yet — **but the ASR default now sends audio to a global Google endpoint** |
-| OPEN-5 | Air-gapped WebView2 path | Phase 1 MSI | None; `client/installer/` is empty |
-| OPEN-6 | Audio and transcript retention | Phase 3 | Schema defaults of 30 and 365 days, explicitly placeholders; purge job written, unwired and untested |
-| OPEN-7 | Dialer CDR export | Phase 4 | No format assumed; reconciliation arithmetic written behind a `CdrSource` nothing implements |
-| OPEN-8 | Softphone names and UIA selectors | Phase 2 | Tenant config shape built; no worked example |
+| OPEN-4 | Data residency | Phase 1 infra | India only: `ap-south-1` in the OpenAPI server list and as the S3 default, deliberately no IaC — **still unconfirmed in writing, and the ASR default sends audio to a global Google endpoint** |
+| OPEN-5 | Air-gapped WebView2 path | Phase 1 MSI | Evergreen bootstrapper only, marked NOT DECIDED in `Sentinel.wxs`; no MSI has been built |
+| OPEN-6 | Audio and transcript retention | Phase 3 | Schema defaults of 30 and 365 days, explicitly placeholders; purge job implemented and tested, dry run by default, unscheduled, has never deleted anything |
+| OPEN-7 | Dialer CDR export | Phase 4 | No customer format assumed; reconciliation arithmetic tested, behind a `CdrSource` registry whose one entry is a reference CSV reader |
+| OPEN-8 | Softphone names and UIA selectors | Phase 2 | Tenant config shape built; no worked example, and the capture code has never run |

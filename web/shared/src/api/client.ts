@@ -10,6 +10,20 @@
  * session — so the token arrives through a provider function rather than being
  * stored here. The provider is called per request so a refreshed token is picked up
  * without rebuilding the client.
+ *
+ * Identity Platform ID tokens expire hourly, which means the interesting failure is
+ * not "no token" but "a token that was valid when the screen mounted and is not
+ * valid now". That is handled in exactly one place — here — rather than in every
+ * screen, because a per-screen retry is how you end up with six subtly different
+ * behaviours and one of them looping. The rule is:
+ *
+ *   401 -> force a refresh -> retry the request once -> give up.
+ *
+ * "Give up" means a `no_credentials` failure, not a second 401, so the caller can
+ * put the user back on the sign-in screen instead of retrying forever. A second 401
+ * with a freshly minted token is passed through as a 401, because that is the
+ * gateway refusing this user (suspended row, tenant mismatch) and no amount of
+ * refreshing fixes it.
  */
 import type {
   AgentStats,
@@ -45,6 +59,28 @@ import type {
 } from './types.js';
 
 export type TokenProvider = () => string | null | undefined | Promise<string | null | undefined>;
+
+/**
+ * Mints a *new* credential, bypassing whatever cache the provider reads from.
+ *
+ * Distinct from `TokenProvider` on purpose. The provider is allowed — and expected —
+ * to return a cached token; the refresher must not, because it is only ever called
+ * after the gateway has already rejected the cached one. Returning the same string
+ * from both is therefore a bug that shows up as a retry loop, and the client guards
+ * against it by comparing the two.
+ *
+ * Returning null (or throwing) means "the credential is gone": for the portal, the
+ * Identity Platform session could not be renewed; for the widget, the native layer
+ * has no token to hand over. Either way the answer is to go back to signed-out.
+ */
+export type TokenRefresher = () => string | null | undefined | Promise<string | null | undefined>;
+
+/**
+ * Error code for "we never had a credential to send", as opposed to "the gateway
+ * rejected the one we sent". Exported because both surfaces branch on it to render a
+ * sign-in prompt rather than a network error.
+ */
+export const MISSING_CREDENTIALS = 'no_credentials';
 
 /**
  * Rejected value for every failed call. Carries the contract's `{code, message,
@@ -83,16 +119,47 @@ export class ApiError extends Error {
     return this.status === 409;
   }
 
-  /** No response reached us: offline, DNS, TLS, aborted. Retrying may work. */
+  /**
+   * No response reached us: offline, DNS, TLS, aborted — or the gateway answered
+   * but the browser refused to show us the answer because the response carried no
+   * `Access-Control-Allow-Origin` for our origin. The fetch spec deliberately makes
+   * a CORS rejection indistinguishable from a dead network (revealing the
+   * difference would let any page probe internal hosts), so the message names both
+   * possibilities rather than guessing. Retrying may work; changing
+   * `SENTINEL_ALLOWED_ORIGINS` on the gateway may be what actually works.
+   */
   get isTransport(): boolean {
-    return this.status === 0;
+    return this.status === 0 && this.code !== MISSING_CREDENTIALS;
+  }
+
+  /**
+   * We had nothing to send, or the refresh that would have produced something
+   * failed. Deliberately *not* a transport error: "you are signed out" and "your
+   * network is down" call for different words and different buttons, and conflating
+   * them is what makes a signed-out portal look broken.
+   */
+  get isMissingCredentials(): boolean {
+    return this.code === MISSING_CREDENTIALS;
   }
 }
 
 export interface ApiClientOptions {
-  /** Gateway origin, e.g. `https://api.sentinel.magickvoice.com`. No trailing slash needed. */
+  /**
+   * Gateway origin, e.g. `https://api.sentinel.magickvoice.com`. No trailing slash
+   * needed. Always configured by the caller — no production host is baked into
+   * either bundle — because the gateway's `SENTINEL_ALLOWED_ORIGINS` and this value
+   * are two halves of one CORS agreement and a hard-coded default would silently
+   * break the half we do not control.
+   */
   baseUrl: string;
   getToken: TokenProvider;
+  /**
+   * Optional. Without it a 401 is surfaced as-is; with it, a 401 buys exactly one
+   * forced refresh and one retry. Every long-lived surface should supply it, because
+   * an hourly token expiry otherwise turns into a screen full of "your session
+   * expired" the first time a supervisor leaves the portal open over lunch.
+   */
+  refreshToken?: TokenRefresher;
   /** Injectable for tests and for the widget's WebView fetch. */
   fetch?: typeof globalThis.fetch;
   /** Applied per request; the caller's own signal still wins if it aborts first. */
@@ -114,16 +181,33 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 export class ApiClient {
   readonly #baseUrl: string;
   readonly #getToken: TokenProvider;
+  readonly #refreshToken: TokenRefresher | undefined;
   readonly #fetch: typeof globalThis.fetch;
   readonly #timeoutMs: number;
+  /**
+   * The single in-flight forced refresh, shared by every request that 401s while it
+   * runs. A portal screen fires five requests on mount; when the token has just
+   * expired all five come back 401 within a few milliseconds of each other, and
+   * without this they would trigger five concurrent refreshes. Identity Platform
+   * tolerates that, but the fourth and fifth would race the first and one of them
+   * would win with a token the others had already replaced — which is how you get
+   * an intermittent second 401 that nobody can reproduce.
+   */
+  #refreshInFlight: Promise<string | null> | null = null;
 
   constructor(options: ApiClientOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, '');
     this.#getToken = options.getToken;
+    this.#refreshToken = options.refreshToken;
     // Bound to globalThis: an unbound `fetch` reference throws "Illegal invocation"
     // in the WebView2 host.
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  }
+
+  /** The configured gateway origin, for error copy that has to name it. */
+  get baseUrl(): string {
+    return this.#baseUrl;
   }
 
   /* ------------------------------------------------------------- transport */
@@ -131,18 +215,62 @@ export class ApiClient {
   async #request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
     const url = this.#baseUrl + path + encodeQuery(options.query);
 
+    // Enrollment and health carry no credential at all, so there is nothing to
+    // refresh and nothing to retry: a 401 from them is a real answer.
+    if (options.anonymous) return this.#attempt<T>(method, path, url, options, null);
+
+    const token = await readCredential(this.#getToken);
+    if (!token) {
+      // Fail before the round trip: an unauthenticated request would come back
+      // 401 and be indistinguishable from an expired token, which sends the
+      // widget into a sign-out loop.
+      throw new ApiError(0, { code: MISSING_CREDENTIALS, message: 'No auth token available' });
+    }
+
+    try {
+      return await this.#attempt<T>(method, path, url, options, token);
+    } catch (cause) {
+      if (!(cause instanceof ApiError) || cause.status !== 401 || this.#refreshToken === undefined) throw cause;
+
+      const fresh = await this.#forceRefresh();
+      if (fresh === null) {
+        // The refresh failed, so the credential is gone rather than merely stale.
+        // Reporting this as `no_credentials` instead of re-throwing the 401 is what
+        // stops the loop: the caller signs out and shows the sign-in screen, rather
+        // than re-rendering, re-fetching and 401ing again a few milliseconds later.
+        throw new ApiError(0, {
+          code: MISSING_CREDENTIALS,
+          message: 'Your session could not be renewed. Sign in again.',
+        });
+      }
+      if (fresh === token) {
+        // A "refreshed" token identical to the one the gateway just rejected means
+        // the refresher served a cache. Retrying with it would produce the same 401,
+        // so surface the original rejection instead of burning a round trip.
+        throw cause;
+      }
+      // Exactly one retry. If this 401s too, the gateway is refusing the user and
+      // not the token, and that is the caller's answer.
+      return await this.#attempt<T>(method, path, url, options, fresh);
+    }
+  }
+
+  /**
+   * One HTTP round trip. Split out of `#request` so the retry gets its own timeout
+   * budget and its own body serialisation — a retry sharing the first attempt's
+   * `AbortSignal.timeout` would inherit however much of the budget the first attempt
+   * had already spent, and could abort before it was even sent.
+   */
+  async #attempt<T>(
+    method: string,
+    path: string,
+    url: string,
+    options: RequestOptions,
+    token: string | null,
+  ): Promise<T> {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
-    if (!options.anonymous) {
-      const token = await this.#getToken();
-      if (!token) {
-        // Fail before the round trip: an unauthenticated request would come back
-        // 401 and be indistinguishable from an expired token, which sends the
-        // widget into a sign-out loop.
-        throw new ApiError(0, { code: 'no_credentials', message: 'No auth token available' });
-      }
-      headers['Authorization'] = `Bearer ${token}`;
-    }
+    if (token !== null) headers['Authorization'] = `Bearer ${token}`;
 
     const timeout = AbortSignal.timeout(this.#timeoutMs);
     const signal = options.signal ? anySignal([options.signal, timeout]) : timeout;
@@ -153,6 +281,18 @@ export class ApiClient {
         method,
         headers,
         signal,
+        // Both surfaces are cross-origin to the gateway — the portal is served from
+        // its own host, the widget from file:// or a WebView2 virtual host — so this
+        // is a CORS request whether we say so or not.
+        mode: 'cors',
+        // Sentinel's authentication is entirely in the Authorization header; there
+        // is no session cookie anywhere in the system. Saying `omit` rather than
+        // leaving the default is deliberate: a credentialed request forces the
+        // gateway into the strict half of CORS, where it must echo an exact origin
+        // and send `Access-Control-Allow-Credentials`. Opting out keeps the
+        // gateway's allowed-origin list the only thing that has to be right, and
+        // means we never send a cookie some intermediary planted.
+        credentials: 'omit',
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
       });
     } catch (cause) {
@@ -161,7 +301,10 @@ export class ApiClient {
       // response bodies are not, because they can carry borrower data.
       throw new ApiError(0, {
         code: isAbort(cause) ? 'timeout' : 'network_error',
-        message: isAbort(cause) ? `Request timed out: ${method} ${path}` : `Network error: ${method} ${path}`,
+        message: isAbort(cause)
+          ? `Request timed out: ${method} ${path}`
+          : `Could not reach ${this.#baseUrl} (${method} ${path}). The gateway is unreachable, ` +
+            'or it did not permit this origin.',
       });
     }
 
@@ -178,6 +321,23 @@ export class ApiClient {
         message: `Expected JSON from ${method} ${path}`,
       });
     }
+  }
+
+  /**
+   * Forced refresh, coalesced. Never rejects: a refresher that throws is a
+   * refresher that failed, and the caller's decision is the same either way.
+   */
+  #forceRefresh(): Promise<string | null> {
+    if (this.#refreshInFlight !== null) return this.#refreshInFlight;
+    const refresher = this.#refreshToken;
+    if (refresher === undefined) return Promise.resolve(null);
+    const run = readCredential(refresher)
+      .catch(() => null)
+      .finally(() => {
+        this.#refreshInFlight = null;
+      });
+    this.#refreshInFlight = run;
+    return run;
   }
 
   /* ---------------------------------------------------------------- health */
@@ -412,6 +572,20 @@ export type CallQuery = {
 
 function sig(signal: AbortSignal | undefined): RequestOptions {
   return signal ? { signal } : {};
+}
+
+/**
+ * Normalises a provider's answer to `string | null`.
+ *
+ * The empty string is folded into null on purpose. A native host that has not been
+ * handed a token yet, and a JS runtime coercing `undefined` through a marshalling
+ * layer, both produce `''` — and `Authorization: Bearer ` reaches the gateway as a
+ * malformed header, which comes back as a 400 rather than a 401 and so never
+ * triggers the sign-in path it should.
+ */
+async function readCredential(provider: TokenProvider | TokenRefresher): Promise<string | null> {
+  const value = await provider();
+  return typeof value === 'string' && value !== '' ? value : null;
 }
 
 function isAbort(cause: unknown): boolean {

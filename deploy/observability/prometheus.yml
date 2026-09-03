@@ -1,0 +1,65 @@
+# Prometheus, used as a metrics sink for the OTel Collector rather than as a scraper.
+#
+# WHY REMOTE WRITE AND NOT SCRAPING.
+#
+# Two of the three emitters cannot be scraped. `sentinel-agent` runs on an agent's
+# desktop behind whatever the BPO's network does to inbound connections — there is no
+# route from a server to a collections floor desktop, and there must not be one. The
+# pipeline workers are a horizontally scaled consumer pool with no stable addresses.
+# Only the gateway could be scraped, and running one collection model for one service
+# and another for the other two means two sets of metric names and two sets of
+# staleness semantics.
+#
+# So all three push OTLP to the collector, the collector remote-writes here, and this
+# file scrapes only Prometheus itself. `--web.enable-remote-write-receiver` is on the
+# command line in compose.yaml; without it, remote write returns 404 and the
+# collector's `otelcol_exporter_send_failed_metric_points` climbs while every
+# dashboard shows "No data".
+#
+# ONE CONSEQUENCE WORTH KNOWING: pushed metrics have no `up` series, so the usual
+# "is the target down" alert does not exist. That is why the rules file leans on
+# `absent()` instead — for this product, a service that has stopped reporting is
+# indistinguishable from a service reporting that everything is fine, and that is the
+# failure mode the whole alert set is built around.
+
+global:
+  # 15s matches the collector's batch timeout closely enough that a rate() over a 5m
+  # window is stable, and is short enough that a spool filling up is visible within a
+  # minute rather than within five.
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+  external_labels:
+    # Stamped onto every series leaving this Prometheus (via remote write or federation)
+    # and onto every alert. `region` is OPEN-4's working assumption made visible: if a
+    # series ever shows up with a region that is not an India region, that is a
+    # residency incident and it should be legible from the label rather than from
+    # someone's memory of where the stack runs.
+    region: ap-south-1
+    environment: ${SENTINEL_ENVIRONMENT}
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Prometheus itself. Everything else arrives by remote write.
+  - job_name: prometheus
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+
+# Alertmanager is deliberately not configured. Alert *routing* is a deployment
+# decision that depends on who is on call at the BPO and at MagickVoice, and which of
+# these alerts wake someone at 3am versus land in a queue for the morning. The rules
+# below are the engineering judgement — which conditions matter and why — and the
+# routing on top of them is not.
+#
+# When one is added:
+#
+#   alerting:
+#     alertmanagers:
+#       - static_configs:
+#           - targets: ['alertmanager:9093']
+#
+# and note that SentinelSpoolEviction and SentinelHealthyButNotCapturing are the two
+# that should page rather than queue. Both mean audio is being lost right now, and both
+# are silent from every other vantage point.

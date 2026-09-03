@@ -74,13 +74,63 @@ Get-AuthenticodeSignature .\out\Sentinel-0.1.0-x64.msi | Format-List
 msiexec /i Sentinel-0.1.0-x64.msi /qn /l*v %TEMP%\sentinel-install.log ^
         ENROLLMENTTOKEN=<single-use token from the portal> ^
         APIBASEURL=https://api.sentinel.magickvoice.com ^
-        TENANTHINT=<identity platform tenant id>
+        TENANTHINT=<identity platform tenant id> ^
+        OIDCAUTHORIZEENDPOINT=<the tenant's IdP authorize URL> ^
+        OIDCCLIENTID=<the desktop app's public OAuth client id> ^
+        OIDCTENANT=<identity platform tenant id>
 ```
 
 `ENROLLMENTTOKEN` is single-use and expires after 24 hours (spec 7.2). It is marked
 `Secure` so it survives elevation, and listed in `MsiHiddenProperties` so it does not
 appear in the verbose log an administrator will attach to a support ticket. Mint one
 token per deployment wave, not one per fleet.
+
+### Every property the package reads
+
+| Property | Required | What it sets |
+|---|---|---|
+| `ENROLLMENTTOKEN` | for a machine that is to capture | The single-use, tenant-scoped enrollment token (24 h TTL). |
+| `APIBASEURL` | defaulted | Gateway base URL. Everything else — ingest, the token endpoint, the telemetry relay — is derived from it. |
+| `TENANTHINT` | recommended | Tenant id, used as the Identity Platform tenant when `OIDCTENANT` is absent. |
+| `OIDCAUTHORIZEENDPOINT` | for sign-in | The IdP's authorize URL, opened in the system browser. Must be `https`. |
+| `OIDCCLIENTID` | for sign-in | The desktop app's **public** OAuth client id. There is no client secret — RFC 8252 native clients do not have one, and PKCE is what replaces it. |
+| `OIDCTENANT` | optional | Identity Platform tenant, sent as `tenantId`. Omit on a provider with no tenant concept. |
+| `OIDCTOKENENDPOINT` | rarely | Overrides the gateway's `{APIBASEURL}/v1/oauth/token`. Leave unset in production. |
+| `TELEMETRYENABLED` | optional, `0` | `1` turns on OTLP export, relayed by the gateway. |
+| `TELEMETRYENDPOINT` | development only | Sends OTLP straight to a collector instead. This opens a second egress from the desktop; the client logs a warning whenever it is set. |
+
+There are no defaults for the OIDC properties, deliberately. A machine installed
+without them starts, heartbeats and shows a widget, and refuses to begin a sign-in with
+a log line naming the property that is empty. A plausible default would instead fail at
+the IdP with an error about an unregistered redirect that nobody traces back to here.
+
+Note that the OIDC values are **not** secrets and are written where `Users` can read
+them. An authorize URL and a public client id are public by construction; the thing that
+makes the flow safe is PKCE, not the confidentiality of these.
+
+### How the enrollment token reaches the service
+
+The MSI writes it to `HKLM\SOFTWARE\MagickVoice\Sentinel\Enrollment\Token`, under a
+key ACLed to `SYSTEM` and `Administrators` only. `SentinelService.exe` reads it on its
+first start, exchanges it for a device certificate, and deletes the value.
+
+Two alternatives were rejected, and it is worth saying why, because both look simpler:
+
+- **The main `SOFTWARE\MagickVoice\Sentinel` key.** `Users` can read that one, so for
+  the window between the install finishing and the service starting, the token would be
+  readable by every agent on the floor.
+- **A custom action command line** (`SentinelService.exe --enroll <token>`). The command
+  line of a running process is readable by any user on the machine —
+  `Get-CimInstance Win32_Process` is enough — for as long as the action runs.
+
+The token is single-use server-side regardless: `enroll.go` consumes it atomically
+*before* it signs, so a leaked one buys nobody a second certificate. This is about the
+24 hours before it is used, not after.
+
+The value is deleted **after** a successful exchange, never before. A machine whose
+first attempt hit a transient failure — the gateway currently answers `503 no_ca` until
+a certificate authority is configured — must be able to retry on its next start rather
+than needing an operator to mint another token.
 
 ### Detection rule
 
@@ -207,7 +257,7 @@ inherited:
 | `SYSTEM` | Full control | The service manages the spool, stages updates, ships dumps. |
 | `Administrators` | Full control | Support and uninstall. |
 | `Users` | Modify (inheritable) | `SentinelAgent.exe` runs as the signed-in user and **writes** the spool. |
-| `Users` on `device\` | Read only | Machine identity, renewed by the service. The private key is not on disk at all — it is generated non-exportably in CNG. |
+| `Users` on `device\` | Read only | Machine identity, renewed by the service. The private key is not on disk at all — it is generated non-exportably in CNG (`sentinel-service/src/devicekey/cng.rs`), and the agent signs with it through `NCryptSignHash` rather than reading it. The **wrapped** spool key lives here too, as a DPAPI machine-scope blob the agent unwraps. |
 | `Users` on `staging\` | None | A directory a user can write and LocalSystem later executes from is a local privilege escalation. |
 
 Two principals share this directory — the user-session agent writes it, the SYSTEM
@@ -228,6 +278,26 @@ a user may create a file but not modify one another user created — which, acro
 shift change, is precisely the spool.
 
 ---
+
+## Certificate renewal
+
+Device certificates are issued for a year and renewed with 30 days left (spec 7.2).
+There is no renewal endpoint in `contracts/openapi.yaml`, so renewal is re-enrollment:
+the service sends the same `POST /v1/devices/enroll` with a **fresh** single-use token.
+
+Because the CSR is built against the same CNG key — the key's name is stable across
+renewals — the machine keeps one identity. A renewal that fails leaves the existing
+certificate in place and still valid, which is what the 30-day window is for.
+
+To renew a machine, write a fresh token to
+`%PROGRAMDATA%\MagickVoice\Sentinel\device\renewal-token` (that directory is
+`Users`-read-only, so this needs an administrator or the MDM agent) and let the service
+pick it up on its next credential check, which runs at start-up and every six hours.
+The file is deleted once the exchange succeeds.
+
+A machine cannot renew itself unattended, deliberately. Minting a token is
+`POST /v1/admin/enrollment-tokens`, which requires the `manage_fleet` capability: a
+device that could re-certify itself forever is a device a revocation cannot stop.
 
 ## What the package does not do
 

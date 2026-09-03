@@ -21,6 +21,38 @@
 .pt-nav a:hover { color: var(--sx-text); }
 .pt-nav__on { color: var(--sx-text) !important; box-shadow: inset 0 -2px 0 var(--sx-accent); }
 .pt-who { margin-left: auto; }
+.pt-signout { margin-left: 4px; }
+
+/* ------------------------------------------------------------- sign-in
+
+   Centred and narrow. This is the only screen in the portal that is not dense:
+   it is read once per shift, by someone who has just sat down, and the tenant
+   line on it is the last chance to notice a wrong portal URL before a password
+   is typed into it. */
+
+.pt-signin { display: flex; justify-content: center; padding: 8vh 16px; }
+
+.pt-signin__card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 340px;
+  background: var(--sx-surface);
+  border: 1px solid var(--sx-border);
+  border-radius: 8px;
+  padding: 22px;
+}
+
+.pt-signin__brand { margin: 0; font-size: 20px; letter-spacing: 0.02em; }
+.pt-signin__tenant { margin: -8px 0 0; font-size: 11px; word-break: break-all; }
+.pt-signin__error { margin: 0; }
+.pt-signin__or { margin: 0; text-align: center; font-size: 11px; }
+.pt-signin__field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--sx-text-dim); }
+.pt-signin__field input { width: 100%; }
+.pt-signin__federated, .pt-signin__submit { width: 100%; }
+.pt-signin__problems { margin: 0; padding-left: 18px; font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
+.pt-signin__hint { margin: 0; font-size: 11px; }
 
 .pt-main { padding: 16px; }
 .pt-boot { padding: 32px; }

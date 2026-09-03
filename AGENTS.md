@@ -8,8 +8,8 @@ transcripts, analysis and RBI fair-practices compliance findings for a React por
 option that keeps a compliance finding accurate and auditable.
 
 Read [README.md](README.md) first — it holds the per-component state-of-play (what is real,
-what is a scaffold) and the full rationale behind each test suite. This file is only the
-rules that are not discoverable from the code.
+what is written but has never been executed) and the full rationale behind each test suite.
+This file is only the rules that are not discoverable from the code.
 
 ## `contracts/` is the source of truth
 
@@ -38,24 +38,39 @@ cd server/gateway && go test ./...                        # skips DB-backed test
 bash db/test/gateway_it.sh                                # gateway + throwaway Postgres
 bash db/test/rls_test.sh                                  # RLS acceptance — after ANY db/migrations/ change
 cd server/pipeline && python -m pytest                    # needs `pip install -e '.[dev]'`
+cd server/pipeline && bash tests/pg_integration.sh        # pipeline + Postgres; needs the psycopg extra
 cd web && npm run typecheck && npm test && npm run build
 ```
 
 Gotchas that will otherwise cost you a cycle:
 
-- **The Windows cross-check is mandatory after touching `client/**/src/windows/`.** That code
-  is `#[cfg(windows)]`-gated, compiled out on Linux, and has no tests. `cargo check` for the
-  `x86_64-pc-windows-gnu` target is the only thing catching breakage. It needs mingw-w64
-  because `rusqlite` and `audiopus` build C sources.
-- **`npm ci` is broken** — `web/package-lock.json` predates the `shared` and `portal`
-  workspaces. Use `npm install`. Regenerating and committing the lockfile is a known
-  outstanding fix, not something to work around.
+- **The Windows cross-check is mandatory after touching `client/**/src/windows/`,
+  `src/devicekey/cng.rs` or `src/spoolkey.rs`.** That code is `#[cfg(windows)]`-gated,
+  compiled out on Linux, and has no tests — there are zero tests under
+  `client/**/src/windows/`. `cargo check` for the `x86_64-pc-windows-gnu` target is the
+  only thing catching breakage that has actually run. It needs mingw-w64 because
+  `rusqlite` and `audiopus` build C sources. There is a `windows-latest` job in
+  `.github/workflows/ci.yml` that would do more, but it has never run; do not treat it as
+  cover.
+- **`npm ci` works — use it.** The lockfile that predated the `shared` and `portal`
+  workspaces has been regenerated and committed, and the CI web job now runs `npm ci` and
+  gates on it instead of skipping itself. `npm install` still works; `npm ci` is what CI
+  does and what catches a manifest the lockfile does not match.
+- **The widget's vite build must stay single-file.** `client/installer/Sentinel.wxs`
+  packages exactly one `widget.html`. `vite-plugin-singlefile` plus the inlining settings
+  in `web/widget/vite.config.ts` are what make that honest; removing them produces an MSI
+  that installs, reports healthy and renders a blank widget.
 - **Do not run `cargo fmt` across the tree.** It is not rustfmt-clean, the check is advisory in
   CI on purpose, and a repo-wide reformat would bury real changes. Format only what you edit.
 - Python: provider SDKs are optional extras. The test suite needs only `pytest` and
   `jsonschema` — do not add a hard dependency to make a test pass.
-- `docker compose up -d db` then `docker compose run --rm migrate` for a local Postgres. The
-  image is `pgvector/pgvector:pg16`; the schema declares `vector(1024)` columns.
+- The local stack lives in `deploy/`, not at the repository root:
+  `bash deploy/gen-dev-secrets.sh`, then
+  `docker compose -f deploy/compose.yaml up -d postgres` and
+  `docker compose -f deploy/compose.yaml run --rm migrate`. The image is
+  `pgvector/pgvector:pg16`; the schema declares `vector(1024)` columns. Every credential
+  is `${VAR:?…}` with no default on purpose — see `deploy/README.md`. Note that none of
+  this has been stood up: the compose file and the images are written, not verified.
 
 ## Invariants
 
@@ -68,6 +83,30 @@ transaction-scoped `set_config('sentinel.tenant_id', …, true)` so context cann
 next borrower of a pooled connection. The gateway connects as `sentinel_app`, which is
 `NOBYPASSRLS`. Never add a query path that skips this wrapper, and never "fix" a missing-row
 bug by loosening a policy — the missing-context case must return zero rows, not all of them.
+
+The pipeline is under the same rule and enforces it from its own side: it connects as
+`sentinel_pipeline` and [server/pipeline/sentinel_pipeline/db.py](server/pipeline/sentinel_pipeline/db.py)
+calls `assert_rls_enforced` at boot, refusing to start if the connected role can bypass
+RLS. A DSN pointed at the schema owner would otherwise see every tenant while every
+application-level filter still passed and no test noticed. When a nightly job genuinely
+needs to cross tenants — enumerating which tenants exist — the answer is a narrow
+`SECURITY DEFINER` function (`sentinel_pipeline_tenants()`, `db/migrations/0008`), not a
+loosened policy. There are exactly four such functions; keep it greppable.
+
+**The finalize message is published from a transactional outbox, not from the handler.**
+[server/gateway/internal/outbox](server/gateway/internal/outbox) drains
+`call_finalize_outbox` (`db/migrations/0007`) into `sentinel.call.finalize`. Do not
+"simplify" this into a publish at the end of the finalize handler: a publish that fails
+after the database commit gives you a call that is captured, stored, billed and never
+analysed, with no error anywhere and nothing that would notice. Delivery is at-least-once
+and the consumer is built for it.
+
+**Foreign-marked segments are stored and must never be transcribed.** On tier B the
+loopback stream carries whatever the agent's speakers play. `media_segments.foreign_audio`
+is checked twice in [server/pipeline/sentinel_pipeline/segments.py](server/pipeline/sentinel_pipeline/segments.py)
+— once in SQL, once in Python — so that a future edit to either alone cannot turn the
+filter off. Transcribing that audio does not degrade quality; it files RBI conduct
+findings against an agent for words nobody said.
 
 **Money is an integer number of paise, end to end.** `*_paise` int64 on the wire; rupees exist
 only at the point of display. See [web/shared/src/money.ts](web/shared/src/money.ts). A rupee
@@ -136,3 +175,4 @@ Import shared code as `@sentinel/shared`, aliased to source (not build output) i
 - [docs/asr-provider-selection.md](docs/asr-provider-selection.md) — ASR candidate shortlist, per-provider feature gaps and cost at floor scale
 - [docs/open-decisions.md](docs/open-decisions.md) — OPEN-1..8; check before assuming a behaviour is settled
 - [docs/deployment.md](docs/deployment.md) — Windows support matrix, tier B, headset pinning, EDR
+- [deploy/README.md](deploy/README.md) — container images, the compose stack, the migration runner, observability

@@ -20,6 +20,23 @@ pub trait PolicyFetch {
     fn fetch(&self) -> anyhow::Result<Policy>;
 }
 
+/// The machine configuration the installer wrote, where there is one.
+///
+/// The MSI writes registry values rather than a file because a component's values are
+/// removed on uninstall and restored by a repair, which a file dropped by a custom
+/// action is not. This is the one-way bridge into the service's own `config.json`
+/// cache; see [`ConfigStore::persist_local`].
+fn installed_config() -> Option<LocalConfig> {
+    #[cfg(windows)]
+    {
+        crate::windows::machine::local_config_from_registry()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 pub struct ConfigStore {
     dir: PathBuf,
     local: LocalConfig,
@@ -34,6 +51,7 @@ impl ConfigStore {
         let local = std::fs::read_to_string(dir.join("config.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<LocalConfig>(&s).ok())
+            .or_else(installed_config)
             .unwrap_or_default();
         let policy = std::fs::read_to_string(dir.join("policy.json"))
             .ok()
@@ -43,6 +61,19 @@ impl ConfigStore {
 
     pub fn local(&self) -> &LocalConfig {
         &self.local
+    }
+
+    /// Write the current local config to `config.json`.
+    ///
+    /// Called on first start so the values the MSI put in the registry become the
+    /// service's own cache, after which `config.json` is authoritative and a config
+    /// sync can change it without fighting the installer's component.
+    pub fn persist_local(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join("config.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.local)?)?;
+        std::fs::rename(tmp, self.dir.join("config.json"))?;
+        Ok(())
     }
 
     pub fn policy(&self) -> Option<&Policy> {

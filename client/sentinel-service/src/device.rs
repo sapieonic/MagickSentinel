@@ -35,13 +35,12 @@ pub struct DeviceIdentity {
 }
 
 /// Directory holding the device credential, under `%PROGRAMDATA%`.
+///
+/// The MSI ACLs this one read-only for `Users` — see `client/installer/README.md` —
+/// because it holds machine identity: the SYSTEM service writes it at enrollment and
+/// renewal, and the user-session agent only reads it.
 pub fn credential_dir() -> PathBuf {
-    if cfg!(windows) {
-        let base = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
-        PathBuf::from(base).join("MagickVoice").join("Sentinel").join("device")
-    } else {
-        PathBuf::from("/var/lib/magickvoice-sentinel/device")
-    }
+    crate::data_dir().join("device")
 }
 
 /// The hardware fingerprint the enrollment request carries.

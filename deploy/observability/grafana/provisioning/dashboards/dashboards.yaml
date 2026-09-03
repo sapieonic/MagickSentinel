@@ -1,0 +1,32 @@
+# Dashboard provisioning.
+#
+# `allowUiUpdates: false` and `disableDeletion: true` together mean the dashboard is
+# what is in git and nothing else. Someone can still edit a panel in the browser to
+# investigate something — Grafana allows the edit and simply does not persist it — and
+# the next provisioning sweep restores the file.
+#
+# That is the right default for this particular dashboard rather than a general policy.
+# It is the on-call view for a product whose dangerous failure mode is looking healthy
+# while capturing nothing; a panel silently narrowed to one tenant, or a threshold
+# nudged during an incident and forgotten, is a dashboard that reports fine while the
+# thing it exists to catch is happening. Changes to it should be reviewable.
+#
+# `foldersFromFilesStructure: false` because there is one folder and one dashboard.
+# When there are several, turn it on and let the directory layout be the folder layout.
+
+apiVersion: 1
+
+providers:
+  - name: sentinel
+    orgId: 1
+    folder: Sentinel
+    folderUid: sentinel
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    # 30s: fast enough that a dashboard edit lands while you are still looking at it,
+    # slow enough not to re-read the directory constantly.
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

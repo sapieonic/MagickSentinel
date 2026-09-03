@@ -1,0 +1,404 @@
+# Alert rules for the four signals that matter for this product, plus the one that
+# matters most and is not a signal so much as an absence.
+#
+# ==================================================================================
+# THE ORGANISING IDEA
+#
+# Sentinel's dangerous failure mode is not crashing. It is **looking healthy while not
+# capturing**. The service starts, detects its tier, reports healthy every thirty
+# seconds, and records nothing — and the portal's fleet view says the machine is
+# covered, so the BPO tells its bank client that 100% of calls are monitored. Every
+# rule below is written against that, which is why several of them alert on the
+# *absence* of a signal rather than on a bad value. A metric that has stopped arriving
+# and a metric reporting zero problems look identical on a graph, and only one of them
+# is fine.
+#
+# Every rule is per-tenant. A fleet-wide average hides the one tenant that has stopped
+# capturing, and one tenant is one bank client's portfolio.
+#
+# The metric name contract these read is documented in
+# deploy/observability/otel-collector.yaml. Three services emit it concurrently:
+# sentinel-gateway, sentinel-pipeline, sentinel-agent.
+# ==================================================================================
+
+groups:
+  # ================================================================================
+  - name: sentinel.ingest
+    interval: 30s
+    rules:
+      # Ingest lag is the time between an audio frame being captured on the endpoint
+      # and the gateway durably writing it. It is the first thing to move when anything
+      # between the desktop and the database is unwell, and it is measured per tenant
+      # because a single tenant's floor losing its uplink is invisible in an aggregate.
+      - alert: SentinelIngestLagHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (tenant_id, le) (rate(sentinel_ingest_lag_seconds_bucket[5m]))
+          ) > 120
+        for: 10m
+        labels:
+          severity: warning
+          signal: ingest-lag
+        annotations:
+          summary: "p95 ingest lag above 2 minutes for tenant {{ $labels.tenant_id }}"
+          description: >-
+            p95 ingest lag is {{ $value | humanizeDuration }}. Audio is reaching the
+            gateway late, which means the endpoint spools are growing. The spool evicts
+            oldest-first at 2 GB or 72 hours, whichever comes first, so sustained lag
+            eventually becomes permanently lost audio rather than delayed audio.
+            Check the spool depth panel for the same tenant before deciding this is
+            merely slow.
+
+      - alert: SentinelIngestLagCritical
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (tenant_id, le) (rate(sentinel_ingest_lag_seconds_bucket[5m]))
+          ) > 900
+        for: 5m
+        labels:
+          severity: critical
+          signal: ingest-lag
+        annotations:
+          summary: "p95 ingest lag above 15 minutes for tenant {{ $labels.tenant_id }}"
+          description: >-
+            At this lag the 72-hour spool horizon is the only thing preventing data
+            loss, and it is being consumed. Treat as an incident.
+
+      # The absence rule. Ingest that has stopped entirely produces no lag samples at
+      # all, so the lag alerts above go quiet — which reads as "lag is fine".
+      #
+      # 30m rather than something tighter because a small floor genuinely can have half
+      # an hour with no calls: a shift change, a lunch break, a public holiday. This
+      # will produce a false positive on a quiet tenant, and that is the right trade
+      # for a product whose failure mode is silence. Tune it per tenant when there is
+      # per-tenant call-volume data to tune it against, not before.
+      - alert: SentinelIngestStopped
+        expr: |
+          sum by (tenant_id) (rate(sentinel_ingest_segments_total[15m])) == 0
+          and on (tenant_id)
+          sum by (tenant_id) (sentinel_devices_reporting{signed_in="true"}) > 0
+        for: 30m
+        labels:
+          severity: critical
+          signal: ingest-lag
+        annotations:
+          summary: "No audio segments ingested for tenant {{ $labels.tenant_id }} in 15 minutes, with agents signed in"
+          description: >-
+            Devices are online and users are signed in, and no audio has arrived. This
+            is the product's characteristic failure: everything reports healthy and
+            nothing is being captured. Check the gateway's WSS ingest endpoint, the
+            device certificate status, and whether the tenant's pinned audio device is
+            present on the affected machines.
+
+  # ================================================================================
+  - name: sentinel.spool
+    interval: 30s
+    rules:
+      # ANY eviction is an alert, at critical, with no threshold and no `for` window
+      # longer than a scrape.
+      #
+      # This looks aggressive and it is deliberate. `spool.rs` evicts oldest-first when
+      # the spool passes 2 GB or 72 hours and emits a `spool_eviction` event carrying
+      # the count, and the module's own comment says why the event exists: "A
+      # compliance product that quietly drops audio is worse than one that admits it
+      # did." Every evicted segment is a piece of a recorded call that no longer exists
+      # anywhere — the endpoint had the only copy, because the server never acked it.
+      # There is no threshold below which that is acceptable, and there is no later
+      # recovery.
+      - alert: SentinelSpoolEviction
+        expr: increase(sentinel_spool_evicted_segments_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          signal: spool
+        annotations:
+          summary: "Audio permanently lost: {{ $value | printf \"%.0f\" }} segments evicted from a spool (tenant {{ $labels.tenant_id }})"
+          description: >-
+            An endpoint spool hit its 2 GB / 72 h cap and dropped its oldest segments.
+            That audio existed only on that desktop — the server had not acked it, so
+            the agent had not deleted it, and now the cap has. It cannot be recovered
+            and the affected calls will show as a coverage gap. Find out why the uplink
+            was down for long enough to fill a spool; the eviction is the symptom.
+
+      - alert: SentinelSpoolDepthGrowing
+        expr: |
+          max by (tenant_id, device_id) (sentinel_spool_depth_segments) > 500
+          and
+          deriv(max by (tenant_id, device_id) (sentinel_spool_depth_segments)[30m:]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          signal: spool
+        annotations:
+          summary: "Spool on device {{ $labels.device_id }} is deep and still growing (tenant {{ $labels.tenant_id }})"
+          description: >-
+            {{ $value | printf "%.0f" }} unacked segments and the trend is upward, so
+            the uplink is not keeping pace with capture. This is the alert that fires
+            *before* SentinelSpoolEviction; acting on it is how the eviction is avoided.
+            The `deriv` term matters — a deep spool that is draining is a machine
+            recovering from an outage and is not a problem.
+
+      - alert: SentinelSpoolNearCap
+        # 2 GB is the byte cap in sentinel-core/src/config.rs's SpoolLimits. 80% of it.
+        expr: max by (tenant_id, device_id) (sentinel_spool_size_bytes) > 0.8 * 2 * 1024 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: critical
+          signal: spool
+        annotations:
+          summary: "Spool on device {{ $labels.device_id }} is at {{ $value | humanize1024 }}B, near the 2 GB cap"
+          description: >-
+            Eviction begins at the cap and it is oldest-first, so the audio about to be
+            destroyed is the oldest unacked audio on this machine — the calls that have
+            been waiting longest to be delivered.
+
+  # ================================================================================
+  - name: sentinel.cost
+    interval: 60s
+    rules:
+      # Model spend is the dominant variable cost and it is per-tenant, budgeted, with
+      # alerts specified at 70% and 90% (docs/architecture.md; cost.py implements the
+      # budget, ceiling, minimum-duration and kill-switch controls).
+      #
+      # Money is an integer number of paise end to end, so these are paise. The
+      # humanize is left off deliberately: a rupee value in an alert annotation would be
+      # a float, and floats are what the paise invariant exists to prevent.
+      - alert: SentinelTenantBudget70
+        expr: |
+          (
+            sum by (tenant_id) (increase(sentinel_model_spend_paise_total[30d]))
+            /
+            max by (tenant_id) (sentinel_tenant_budget_paise > 0)
+          ) > 0.70
+        for: 15m
+        labels:
+          severity: info
+          signal: spend
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} has used {{ $value | humanizePercentage }} of its monthly model budget"
+          description: >-
+            The 70% notice from spec 13. Informational: nothing has changed in the
+            tenant's service yet. Worth knowing early because the alternative to raising
+            the budget is the kill switch, and the kill switch stops compliance analysis.
+
+      - alert: SentinelTenantBudget90
+        expr: |
+          (
+            sum by (tenant_id) (increase(sentinel_model_spend_paise_total[30d]))
+            /
+            max by (tenant_id) (sentinel_tenant_budget_paise > 0)
+          ) > 0.90
+        for: 5m
+        labels:
+          severity: warning
+          signal: spend
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} has used {{ $value | humanizePercentage }} of its monthly model budget"
+          description: >-
+            At 100% the kill switch in cost.py stops paid analysis for this tenant.
+            Tier-1 compliance rules are deterministic and free and keep running; the
+            tier-2 judge and the analyser do not. The visible effect on the customer is
+            that flags stop being reviewed and summaries stop appearing — the product
+            degrades in the direction it was designed to degrade, but it degrades.
+
+      - alert: SentinelTenantBudgetExhausted
+        expr: |
+          (
+            sum by (tenant_id) (increase(sentinel_model_spend_paise_total[30d]))
+            /
+            max by (tenant_id) (sentinel_tenant_budget_paise > 0)
+          ) >= 1.0
+        for: 0m
+        labels:
+          severity: critical
+          signal: spend
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} is over its monthly model budget; paid analysis is stopping"
+          description: >-
+            The kill switch has engaged or is about to. Deterministic tier-1 rules still
+            run on 100% of calls, so compliance flagging continues; the LLM judge and the
+            per-call analysis do not. Decide within the day: raise the budget, or accept
+            unreviewed tier-1 findings for the rest of the month and tell the customer
+            which it is.
+
+      # A sudden spend spike, independent of the budget. Catches a runaway retry loop or
+      # a provider price change before the monthly budget notices.
+      - alert: SentinelModelSpendSpike
+        expr: |
+          sum by (tenant_id) (rate(sentinel_model_spend_paise_total[15m]))
+          >
+          5 * sum by (tenant_id) (rate(sentinel_model_spend_paise_total[6h] offset 15m))
+        for: 15m
+        labels:
+          severity: warning
+          signal: spend
+        annotations:
+          summary: "Model spend for tenant {{ $labels.tenant_id }} is 5x its six-hour baseline"
+          description: >-
+            Not necessarily wrong — a backlog being worked through looks like this — but
+            a redelivery loop does too, and JetStream redelivers up to max_deliver=4
+            times. Check the DLQ depth and the pipeline's error rate before assuming
+            volume.
+
+  # ================================================================================
+  - name: sentinel.coverage
+    interval: 5m
+    rules:
+      # Coverage is captured calls over the dialer's own record of calls. It is the
+      # metric that turns tamper detection from an arms race into a management
+      # conversation, and it is also how the "100% of calls monitored" claim that
+      # justifies the purchase is demonstrated. Without it the number is unprovable.
+      #
+      # NOTE: OPEN-7 is undecided — the dialer CDR export format and delivery are not
+      # agreed, `coverage.py` implements the arithmetic behind a `CdrSource` nothing
+      # implements, and nothing populates `coverage_daily`. So this rule will not fire
+      # until a CDR source exists. That is the correct state: the rule is here so that
+      # the day a CDR source lands, the alerting for it already exists and does not have
+      # to be remembered.
+      - alert: SentinelCoverageBelowTarget
+        expr: min by (tenant_id) (sentinel_coverage_ratio) < 0.98
+        for: 1h
+        labels:
+          severity: warning
+          signal: coverage
+        annotations:
+          summary: "Capture coverage for tenant {{ $labels.tenant_id }} is {{ $value | humanizePercentage }}"
+          description: >-
+            The dialer placed more calls than Sentinel captured. Reasons, in order of
+            how often they turn out to be the cause: a machine with no pinned headset
+            present, an agent who signed out mid-shift, an EDR quarantine, a tier C
+            machine that should have been blocked at install, and deliberate tampering.
+            Note that this is a supervisor conversation and not an enforcement action —
+            spec 6.8 is detect-and-report, and the product does not fight the user.
+
+      - alert: SentinelCoverageCritical
+        expr: min by (tenant_id) (sentinel_coverage_ratio) < 0.90
+        for: 30m
+        labels:
+          severity: critical
+          signal: coverage
+        annotations:
+          summary: "Capture coverage for tenant {{ $labels.tenant_id }} has fallen to {{ $value | humanizePercentage }}"
+          description: >-
+            More than one call in ten is not being captured. The contractual claim to
+            the bank client is not currently true, and it is better for us to say so
+            than for their audit to.
+
+  # ================================================================================
+  - name: sentinel.silence
+    interval: 60s
+    rules:
+      # ---- THE ONE THAT MATTERS MOST ----
+      #
+      # docs/security.md, section 9, describes the server-side alert the product is
+      # supposed to have: "device online, user signed in, dialer session active, no
+      # capture". This is that alert, and it is the entire reason the heartbeat carries
+      # capture_state, dialer_session_active, signed_in and pinned_device_present as
+      # separate fields rather than one health boolean.
+      #
+      # Everything about such a machine looks correct. The service is running. The
+      # heartbeat arrives every thirty seconds. The fleet view shows it green. It is
+      # capturing nothing.
+      - alert: SentinelHealthyButNotCapturing
+        expr: |
+          sum by (tenant_id) (
+            sentinel_devices_reporting{
+              signed_in="true",
+              dialer_session_active="true",
+              capture_state!~"IN_CALL|ARMED|WRAP|FINALIZE"
+            }
+          ) > 0
+        for: 10m
+        labels:
+          severity: critical
+          signal: silent-failure
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} device(s) in tenant {{ $labels.tenant_id }} are signed in with an active dialer session and are not capturing"
+          description: >-
+            The dangerous state. These machines report healthy and are recording
+            nothing, so the fleet view says they are covered and the coverage figure
+            will not disagree until tomorrow's reconciliation. Most likely causes:
+            the pinned headset is absent (check pinned_device_present), the softphone
+            process name in tenant policy does not match what is actually running
+            (OPEN-8 — there is still no worked example), capture is in BLOCKED, or the
+            machine is tier C and the installer was bypassed.
+
+      - alert: SentinelPinnedDeviceMissing
+        expr: sum by (tenant_id) (sentinel_devices_reporting{signed_in="true", pinned_device_present="false"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+          signal: silent-failure
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} signed-in device(s) in tenant {{ $labels.tenant_id }} cannot see their pinned headset"
+          description: >-
+            Capture does not start at all without the pinned device — deliberately, so
+            that it never silently falls back to the system default and records the
+            wrong stream. The widget shows "headset not detected". Usually a headset
+            unplugged at a break; persistently, a policy entry with the wrong container
+            ID, or a headset model on the floor that nobody added to the policy.
+
+      # ---- TELEMETRY ITSELF GOING QUIET ----
+      #
+      # Pushed metrics have no `up` series, so nothing else notices a service that has
+      # stopped reporting. On a product whose failure mode is silence, a monitoring
+      # stack that goes silent is the same failure one level up: every panel reads
+      # "No data", which is visually identical to "no problems".
+      #
+      # One rule per expected service.name, listed explicitly. A loop over whatever
+      # happens to be present cannot alert on something that is absent.
+      - alert: SentinelGatewayTelemetryAbsent
+        expr: absent(sentinel_ingest_segments_total{service_name="sentinel-gateway"})
+        for: 15m
+        labels:
+          severity: critical
+          signal: telemetry
+        annotations:
+          summary: "No metrics from sentinel-gateway"
+          description: >-
+            Either the gateway is down, or its OTLP export is off, or the collector is
+            not delivering. Check otelcol_exporter_send_failed_metric_points before
+            concluding the gateway is down: the export is off by default, and an
+            OTEL_EXPORTER_OTLP_ENDPOINT that was never set looks exactly like an outage.
+
+      - alert: SentinelPipelineTelemetryAbsent
+        expr: absent(sentinel_model_spend_paise_total{service_name="sentinel-pipeline"})
+        for: 30m
+        labels:
+          severity: warning
+          signal: telemetry
+        annotations:
+          summary: "No metrics from sentinel-pipeline"
+          description: >-
+            30m rather than 15m because a pipeline with an empty queue legitimately
+            reports no spend. If the gateway is ingesting and the pipeline is spending
+            nothing, calls are being recorded and not analysed.
+
+      - alert: SentinelAgentTelemetryAbsent
+        expr: absent(sentinel_devices_reporting{service_name="sentinel-agent"})
+        for: 15m
+        labels:
+          severity: critical
+          signal: telemetry
+        annotations:
+          summary: "No metrics from any sentinel-agent"
+          description: >-
+            Not one desktop in the estate is reporting. Every capture-side alert above
+            depends on this series, so while this is firing the silent-failure
+            detection is itself silent.
+
+      - alert: SentinelCollectorExportFailing
+        expr: rate(otelcol_exporter_send_failed_metric_points[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          signal: telemetry
+        annotations:
+          summary: "The OTel collector is failing to export metric points to {{ $labels.exporter }}"
+          description: >-
+            Telemetry is being dropped at the collector. Usually the remote-write
+            receiver: Prometheus returns 404 for /api/v1/write unless it was started
+            with --web.enable-remote-write-receiver, and the resulting dashboards look
+            like an application outage.

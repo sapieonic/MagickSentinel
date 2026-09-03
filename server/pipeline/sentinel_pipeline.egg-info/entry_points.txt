@@ -1,0 +1,2 @@
+[console_scripts]
+sentinel-pipeline = sentinel_pipeline.__main__:main

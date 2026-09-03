@@ -1,0 +1,427 @@
+# The local/dev stack: Postgres, NATS JetStream, MinIO, the gateway and the pipeline.
+#
+#   docker compose -f deploy/compose.yaml up -d
+#   docker compose -f deploy/compose.yaml run --rm migrate
+#
+# Compose takes its project directory from this file's location, so `deploy/.env` is
+# the env file it reads. Copy `deploy/.env.example` to `deploy/.env` first — the stack
+# refuses to start without it, on purpose, because every credential in it has no
+# default. See the note on `${VAR:?}` below.
+#
+# ==================================================================================
+# WHAT THIS STACK CAN AND CANNOT DO TODAY. Read this before concluding something is
+# broken.
+#
+# It stands up every dependency, migrates the database, and runs both services against
+# MinIO as a real S3 backend. What it still cannot do is complete a device enrolment,
+# and that is a property of the repository rather than a defect in this file:
+#
+#   * **Device enrolment needs a certificate authority.** `main.go` requires
+#     SENTINEL_CA_CERT and SENTINEL_CA_KEY, and there is no development CA committed —
+#     only the gateway integration test supplies one. Without them the gateway either
+#     refuses to start or answers `503 no_ca` to every enrolment, so no agent can
+#     obtain the device certificate that `/v1/policy`, `/v1/heartbeat` and `/v1/ingest`
+#     all require. Generate a throwaway CA and mount it if you need to drive a real
+#     agent against this stack; `bash db/test/gateway_it.sh` is the faster route to
+#     seeing the API answer.
+#   * **Nothing produces load.** There is no synthetic agent in the repository, so the
+#     dashboards in deploy/observability stay empty until something emits.
+#
+# ==================================================================================
+# CREDENTIALS: WHY EVERY ONE OF THEM IS `${VAR:?...}`
+#
+# Not a single credential in this file has a default. `${POSTGRES_PASSWORD:?...}` makes
+# compose fail with a named message instead of substituting an empty string.
+#
+# The alternative — `${POSTGRES_PASSWORD:-postgres}` — is how a dev default reaches
+# production. It works everywhere, so nobody notices it is there, and the first time it
+# is noticed is when someone finds `postgres/postgres` on a host that is not a laptop.
+# This is a product whose database holds borrower call records under row-level security;
+# the credential that reaches it is not a thing to be convenient about.
+#
+# `deploy/gen-dev-secrets.sh` writes a `.env` with random values so that the friction
+# is one command rather than an argument.
+# ==================================================================================
+
+name: sentinel
+
+# ---------------------------------------------------------------------- networking
+#
+# No `networks:` block, deliberately. Compose gives every project a `default` network
+# and attaches every service to it, and `name: sentinel` above is what makes both this
+# file and deploy/observability/compose.yaml the same project. So layering them:
+#
+#   docker compose -f deploy/compose.yaml -f deploy/observability/compose.yaml up -d
+#
+# already puts the collector on the same network as the gateway and the pipeline, and
+# `otel-collector:4317` resolves. Declaring a named network as well would look tidier
+# and do nothing — a named network that no service lists in its own `networks:` key is
+# simply dropped, which `docker compose config` shows and a reader would not.
+
+volumes:
+  postgres-data:
+  nats-data:
+  minio-data:
+
+services:
+  # ================================================================== Postgres =====
+  postgres:
+    # pgvector/pgvector:pg16, NOT postgres:16, and this is not a preference.
+    # db/migrations/0001_init.up.sql does `CREATE EXTENSION IF NOT EXISTS vector` for
+    # the `vector(1024)` transcript embedding column, and stock postgres:16 does not
+    # carry pgvector. ci.yml's go job uses the same image for the same reason.
+    #
+    # db/test/pgtest.sh works around a missing pgvector by installing a STUB extension
+    # so the RLS tests can run in a dev image. That stub makes embedding columns behave
+    # as opaque text with no index and no distance operator, and it reports no error
+    # while similarity search returns nothing. deploy/migrate/migrate.sh detects it and
+    # refuses; that check exists because "it worked on my machine with the stub" is a
+    # thing that will otherwise happen.
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in deploy/.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in deploy/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # 127.0.0.1 only. A bare "5432:5432" binds 0.0.0.0 and publishes the database to
+      # every network the host is on, which on a laptop on a corporate network means
+      # the whole corporate network. Every published port in this file is bound the
+      # same way for the same reason.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      # -U with the configured user: pg_isready without it uses the OS user, which in
+      # this image is `root` and does not exist as a role, so the check reports the
+      # server as up-but-rejecting rather than ready.
+      test: ["CMD-SHELL", "pg_isready -q -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ================================================================= migrations ====
+  #
+  # Not a long-running service: run it explicitly.
+  #
+  #   docker compose -f deploy/compose.yaml run --rm migrate
+  #
+  # It is in the `tools` profile so `up` does not start it, because a migration runner
+  # that runs automatically on every `up` is a migration runner that will one day run
+  # against something it should not have. `restart: "no"` for the same reason: a
+  # migration that failed should stay failed and visible.
+  migrate:
+    image: pgvector/pgvector:pg16
+    profiles: ["tools"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # psql reads these directly, so the runner assembles no DSN of its own. Connects
+      # as the schema owner: migrations create roles and policies, which sentinel_app
+      # cannot and must not be able to do.
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:?}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?}
+      PGDATABASE: ${POSTGRES_DB:?}
+      # 0003_roles.up.sql creates sentinel_app and sentinel_pipeline with LOGIN and no
+      # password — correct for a file in git, insufficient for anything connecting over
+      # TCP. The runner sets them from here. See the long comment in migrate.sh.
+      SENTINEL_APP_PASSWORD: ${SENTINEL_APP_PASSWORD:?set SENTINEL_APP_PASSWORD in deploy/.env}
+      SENTINEL_PIPELINE_PASSWORD: ${SENTINEL_PIPELINE_PASSWORD:?set SENTINEL_PIPELINE_PASSWORD in deploy/.env}
+    volumes:
+      # db/ is read-only here. Another work stream owns db/migrations and is adding to
+      # it; the runner discovers *.up.sql by glob and orders by the four-digit prefix,
+      # so new migrations are picked up with no change to this file. Mounting it :ro
+      # makes "the migration runner edited a migration" impossible rather than
+      # unlikely.
+      - ../db/migrations:/migrations:ro
+      - ./migrate:/opt/migrate:ro
+    entrypoint: ["/bin/bash", "/opt/migrate/migrate.sh"]
+
+  # ====================================================================== NATS =====
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    # -js is redundant given the `jetstream {}` block in nats.conf, and is passed
+    # anyway: a future edit that comments out the block to debug something would
+    # otherwise silently start a server with no JetStream, and every pull subscribe
+    # would fail with a message about a missing stream rather than a missing feature.
+    command: ["-c", "/etc/nats/nats.conf", "-js"]
+    environment:
+      # Substituted by nats-server into the UNQUOTED values in nats.conf. See the
+      # parsing note in that file: quoted `$` is a literal there, unquoted `$` is a
+      # variable, and getting it backwards produces two different confusing errors.
+      NATS_GATEWAY_USER: ${NATS_GATEWAY_USER:?set NATS_GATEWAY_USER in deploy/.env}
+      NATS_GATEWAY_PASSWORD: ${NATS_GATEWAY_PASSWORD:?set NATS_GATEWAY_PASSWORD in deploy/.env}
+      NATS_PIPELINE_USER: ${NATS_PIPELINE_USER:?set NATS_PIPELINE_USER in deploy/.env}
+      NATS_PIPELINE_PASSWORD: ${NATS_PIPELINE_PASSWORD:?set NATS_PIPELINE_PASSWORD in deploy/.env}
+      NATS_SYS_USER: ${NATS_SYS_USER:?set NATS_SYS_USER in deploy/.env}
+      NATS_SYS_PASSWORD: ${NATS_SYS_PASSWORD:?set NATS_SYS_PASSWORD in deploy/.env}
+    volumes:
+      - ./nats/nats.conf:/etc/nats/nats.conf:ro
+      - nats-data:/data
+    ports:
+      - "127.0.0.1:${NATS_PORT:-4222}:4222"
+      # The monitoring endpoint has no authentication of its own, so localhost only.
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222"
+    healthcheck:
+      # /healthz on the monitoring port, and `--js-enabled-only` matters: the plain
+      # /healthz returns ok as soon as the server is listening, before JetStream has
+      # finished recovering its file store. A pipeline started in that window fails its
+      # stream lookup and exits, and compose restarts it, and the loop looks like a
+      # broken pipeline rather than a slow broker.
+      test: ["CMD-SHELL", "wget -q -O- 'http://127.0.0.1:8222/healthz?js-enabled-only=true' | grep -q ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ===================================================================== MinIO =====
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in deploy/.env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in deploy/.env}
+      # OPEN-4's working assumption, made concrete locally so nobody develops against a
+      # us-east-1 default and discovers the residency question at deployment time. It
+      # is an assumption, not a decision — see docs/open-decisions.md.
+      MINIO_REGION: ${SENTINEL_S3_REGION:-ap-south-1}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio-init:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+      SENTINEL_S3_BUCKET: ${SENTINEL_S3_BUCKET:-sentinel-audio}
+      SENTINEL_S3_REGION: ${SENTINEL_S3_REGION:-ap-south-1}
+      # The least-privileged application credential the bootstrap creates. It cannot
+      # delete the bucket or change its policy; see deploy/minio/bootstrap.sh for why
+      # the root credential must not be what the application uses.
+      SENTINEL_S3_ACCESS_KEY: ${SENTINEL_S3_ACCESS_KEY:?set SENTINEL_S3_ACCESS_KEY in deploy/.env}
+      SENTINEL_S3_SECRET_KEY: ${SENTINEL_S3_SECRET_KEY:?set SENTINEL_S3_SECRET_KEY in deploy/.env}
+    volumes:
+      - ./minio:/opt/minio:ro
+    entrypoint: ["/bin/sh", "/opt/minio/bootstrap.sh"]
+
+  # =================================================================== gateway =====
+  gateway:
+    build:
+      # Context is the repository root: the Dockerfile builds from server/gateway and
+      # also compiles the health probe from deploy/containers/healthprobe, which is how
+      # a distroless image gets a HEALTHCHECK without a shell. See that Dockerfile's
+      # header.
+      context: ..
+      dockerfile: deploy/containers/gateway.Dockerfile
+      args:
+        VERSION: ${SENTINEL_VERSION:-dev}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      # completed_successfully, not service_healthy: minio-init is a one-shot that
+      # creates the bucket and the application credential. The gateway's readiness probe
+      # checks the object store, so starting before the bucket exists means a container
+      # that reports unhealthy for its whole start period for a reason that looks like a
+      # gateway fault.
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      SENTINEL_ADDR: ":8080"
+      SENTINEL_ENV: ${SENTINEL_ENVIRONMENT:-local}
+      # Connects as sentinel_app, which is NOBYPASSRLS. This is the whole tenant
+      # isolation design: the application does not filter by tenant, PostgreSQL does,
+      # and it can only do that against a role that cannot bypass it. Never point this
+      # at POSTGRES_USER to "fix" a query that returns no rows — a missing-context bug
+      # returning zero rows is the design working.
+      SENTINEL_DATABASE_URL: postgres://sentinel_app:${SENTINEL_APP_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}?sslmode=disable
+      # Sets the expected issuer and audience for Identity Platform ID tokens. Any
+      # string works until there is a real project; it is not a credential.
+      SENTINEL_GCP_PROJECT: ${SENTINEL_GCP_PROJECT:-sentinel-local}
+
+      # ---- object storage: MinIO through the real S3 adapter ----
+      # `openObjectStore` prefers S3 when SENTINEL_S3_BUCKET is set and falls back to
+      # the filesystem backend when only SENTINEL_BLOB_DIR is. Using S3 here rather
+      # than the filesystem stand-in is deliberate: the S3 path is what production
+      # runs, and a local stack that exercises the other one is a local stack that
+      # cannot reproduce a blob bug.
+      SENTINEL_S3_ENDPOINT: http://minio:9000
+      SENTINEL_S3_BUCKET: ${SENTINEL_S3_BUCKET:-sentinel-audio}
+      SENTINEL_S3_REGION: ${SENTINEL_S3_REGION:-ap-south-1}
+      SENTINEL_S3_ACCESS_KEY_ID: ${SENTINEL_S3_ACCESS_KEY:?}
+      SENTINEL_S3_SECRET_ACCESS_KEY: ${SENTINEL_S3_SECRET_KEY:?}
+      # SENTINEL_S3_SSE and SENTINEL_S3_KMS_KEY_ID are deliberately unset. MinIO here
+      # has no KMS, and more importantly the key that would encrypt borrower audio at
+      # rest in production has a residency of its own — OPEN-4 — so a default set in a
+      # local compose file would be a decision made in the wrong place. Production must
+      # set them.
+
+      # ---- NATS ----
+      SENTINEL_NATS_SERVERS: nats://nats:4222
+      SENTINEL_NATS_USER: ${NATS_GATEWAY_USER:?}
+      SENTINEL_NATS_PASSWORD: ${NATS_GATEWAY_PASSWORD:?}
+      # Without a NATS URL the gateway logs that finalize messages will queue in
+      # Postgres and carries on, which is the right degradation and not what we want to
+      # be exercising locally.
+
+      # ---- CORS ----
+      # Empty locally. The gateway validates this before use and rejects '*' outright,
+      # because a wildcard on an API that serves borrower call summaries to a browser
+      # is a cross-origin read of every tenant the caller's token can see.
+      SENTINEL_ALLOWED_ORIGINS: ${SENTINEL_ALLOWED_ORIGINS:-}
+
+      # SENTINEL_OTEL_ENABLED and OTEL_EXPORTER_OTLP_ENDPOINT are deliberately ABSENT.
+      # The instrumentation keeps export off by default so a collector-less deploy still
+      # runs, and this stack has no collector. Layering
+      # deploy/observability/compose.yaml sets both. Setting them here would make every
+      # `up` of the base stack log export failures every few seconds, which teaches
+      # people to ignore the logs of the service whose logs matter most.
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
+    # No TLS in this stack: SENTINEL_TLS_CERT is unset, so main.go serves plaintext.
+    # That is a local-stack decision. Production sets TLS 1.3 (main.go enforces
+    # MinVersion) and SENTINEL_CLIENT_CA for the device mTLS identity — without which
+    # every /v1/policy, /v1/heartbeat and /v1/ingest request is refused by
+    # api.RequireDevice, because a valid user token alone is not enough to read a
+    # tenant's capture configuration.
+    security_opt:
+      - no-new-privileges:true
+    # The gateway writes only to the blobs volume, so the rest of its filesystem can be
+    # read-only. Cheap hardening for a process that terminates connections from every
+    # agent desktop on a floor.
+    read_only: true
+
+  # ================================================================== pipeline =====
+  #
+  # The image's ENTRYPOINT is the repository's own `sentinel-pipeline` console script
+  # (server/pipeline/sentinel_pipeline/__main__.py), which is what pyproject.toml says a
+  # container entrypoint should call. The default CMD is `consume`; `retention` and
+  # `coverage` below run the same image with a different subcommand.
+  pipeline: &pipeline
+    build:
+      context: ..
+      dockerfile: deploy/containers/pipeline.Dockerfile
+      args:
+        # Must include the SDK for the configured SENTINEL_ASR_PROVIDER, plus `opus` for
+        # decoding stored segments. Default `google,opus` matches
+        # providers/registry.py's default batch provider.
+        #
+        # If OPEN-4's residency answer is India-only in the strict sense, build with
+        # PIPELINE_EXTRAS=sarvam,opus and set SENTINEL_ASR_PROVIDER=sarvam: the Gemini
+        # endpoint is global, so the default sends borrower audio out of India.
+        PIPELINE_EXTRAS: ${PIPELINE_EXTRAS:-google,opus}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment: &pipeline-env
+      # sentinel_pipeline, NOBYPASSRLS. `sentinel-pipeline check` calls
+      # `db.assert_rls_enforced()` and refuses to start if the connecting role can
+      # bypass row-level security, because such a worker returns every tenant's rows for
+      # every query and nothing anywhere reports an error.
+      SENTINEL_PIPELINE_DATABASE_URL: postgres://sentinel_pipeline:${SENTINEL_PIPELINE_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}?sslmode=disable
+
+      SENTINEL_NATS_SERVERS: nats://nats:4222
+      SENTINEL_NATS_USER: ${NATS_PIPELINE_USER:?}
+      SENTINEL_NATS_PASSWORD: ${NATS_PIPELINE_PASSWORD:?}
+      # No TLS on the local broker, so the client has to be told that plaintext is
+      # intended rather than accidental. Deliberately an explicit opt-in: on a floor
+      # network the credentials above go over the wire on connect, and a client that
+      # silently accepted plaintext would make that invisible.
+      SENTINEL_NATS_ALLOW_INSECURE: "1"
+
+      SENTINEL_S3_ENDPOINT: http://minio:9000
+      SENTINEL_S3_BUCKET: ${SENTINEL_S3_BUCKET:-sentinel-audio}
+      SENTINEL_S3_REGION: ${SENTINEL_S3_REGION:-ap-south-1}
+      # boto3 reads the credential from the standard AWS variables.
+      AWS_ACCESS_KEY_ID: ${SENTINEL_S3_ACCESS_KEY:?}
+      AWS_SECRET_ACCESS_KEY: ${SENTINEL_S3_SECRET_KEY:?}
+
+      # The ASR selection, and the most important startup gate in the stack.
+      # `registry.validate` raises on a language the chosen provider cannot read, and
+      # `sentinel-pipeline check` runs it before anything else. The reason is in
+      # AGENTS.md: the default batch provider has no Tamil at all, and a Tamil floor
+      # pointed at it would not fail — it would transcribe Tamil audio as something else
+      # and hand a bank a clean-looking transcript with no compliance flags on it.
+      SENTINEL_ASR_PROVIDER: ${SENTINEL_ASR_PROVIDER:-}
+      SENTINEL_ASR_LANGUAGES: ${SENTINEL_ASR_LANGUAGES:-hi-IN,en-IN}
+      SENTINEL_ASR_ROUTES: ${SENTINEL_ASR_ROUTES:-}
+      SENTINEL_GOOGLE_API_KEY: ${SENTINEL_GOOGLE_API_KEY:-}
+      SENTINEL_SARVAM_API_KEY: ${SENTINEL_SARVAM_API_KEY:-}
+      SENTINEL_ANTHROPIC_API_KEY: ${SENTINEL_ANTHROPIC_API_KEY:-}
+      SENTINEL_OPENAI_API_KEY: ${SENTINEL_OPENAI_API_KEY:-}
+      SENTINEL_LOG_LEVEL: ${SENTINEL_LOG_LEVEL:-INFO}
+      # SENTINEL_OTEL_ENABLED and OTEL_EXPORTER_OTLP_ENDPOINT deliberately absent; see
+      # the gateway service.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      # Python writes nothing outside /tmp here (PYTHONDONTWRITEBYTECODE is set in the
+      # image), so the root filesystem can stay read-only. Cheap hardening for a process
+      # that holds provider API keys with real spend attached.
+      - /tmp
+
+  # ---------------------------------------------------------------- scheduled jobs
+  #
+  # Two one-shot subcommands of the same image, in the `tools` profile so `up` does not
+  # start them. In a real deployment they are cron entries or Kubernetes CronJobs.
+  #
+  #   docker compose -f deploy/compose.yaml run --rm retention
+  #   docker compose -f deploy/compose.yaml run --rm coverage
+  #
+  # The YAML anchor above shares the whole environment block, because a retention job
+  # configured differently from the consumer is a retention job deleting against
+  # different assumptions than the one that wrote the data.
+  retention:
+    <<: *pipeline
+    profiles: ["tools"]
+    restart: "no"
+    # NO --commit, deliberately. `sentinel-pipeline retention` is a dry run unless told
+    # otherwise, and this file is not the place to say otherwise: the job's failure mode
+    # is deleting the wrong borrower data, its retention periods are OPEN-6 placeholders
+    # that "have never been checked against a real requirement", and the module has no
+    # test coverage at all. Run it, read what it says it would remove, and pass --commit
+    # yourself when you believe it.
+    command: ["retention"]
+
+  coverage:
+    <<: *pipeline
+    profiles: ["tools"]
+    restart: "no"
+    # Reconciles captured calls against the dialer's CDR. Exits non-zero when a tenant's
+    # CDR export was missing, so a cron that ignores stdout still notices — which
+    # matters, because a coverage figure computed from a partial CDR is worse than no
+    # figure: it reads as good coverage.
+    #
+    # Blocked on OPEN-7 in practice: no CDR export format is agreed, so
+    # SENTINEL_CDR_ADAPTER is unset and this reports that there is nothing to reconcile
+    # against.
+    command: ["coverage"]

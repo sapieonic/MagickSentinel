@@ -82,20 +82,48 @@ pub struct HttpApi {
 }
 
 impl HttpApi {
-    /// Build a client presenting the device certificate on every request.
+    /// A client with no device certificate.
     ///
-    /// `client_cert` is `None` only in development against a gateway with mTLS off;
-    /// production always has one, because a device-scoped route without a certificate
-    /// is a request the gateway cannot attribute to a device.
-    pub fn new(
+    /// `/v1/policy` and `/v1/heartbeat` sit behind `api.RequireDevice` and will answer
+    /// 403 to this, which is the correct outcome for an unenrolled machine: the agent
+    /// still runs, still shows a widget, and still spools, and the failure is visible
+    /// rather than being a silent unauthenticated upload.
+    pub fn new(base_url: &str) -> Result<Self, ApiError> {
+        Self::build(base_url, None)
+    }
+
+    /// A client presenting the enrolled device certificate on every request.
+    ///
+    /// `credential` supplies both halves, and they are not symmetrical: the certificate
+    /// chain is data, but the *key* may be a CNG handle this process cannot read, so it
+    /// arrives as a `CryptoProvider` whose key provider yields the signer rather than
+    /// as bytes. See `crate::device` for why that seam exists.
+    pub fn with_device(
         base_url: &str,
-        client_cert: Option<ureq::tls::ClientCert>,
+        credential: &crate::device::DeviceCredential,
     ) -> Result<Self, ApiError> {
-        let tls = ureq::tls::TlsConfig::builder()
-            .client_cert(client_cert)
-            .build();
+        Self::build(base_url, Some(credential))
+    }
+
+    fn build(
+        base_url: &str,
+        credential: Option<&crate::device::DeviceCredential>,
+    ) -> Result<Self, ApiError> {
+        let mut tls = ureq::tls::TlsConfig::builder();
+        if let Some(credential) = credential {
+            tls = tls
+                .client_cert(Some(credential.ureq_client_cert()))
+                // Marked "unversioned" by `ureq` because it exposes a `rustls` type
+                // across ureq's semver boundary. Used deliberately: it is the only way
+                // to give ureq a private key that cannot be expressed as DER, which is
+                // exactly what a non-exportable CNG key is. A `ureq` upgrade that
+                // changes this API is a compile error here, which is the failure mode
+                // we want — the alternative is an agent that silently stops presenting
+                // its certificate and starts getting 403s from device-scoped routes.
+                .unversioned_rustls_crypto_provider(credential.ureq_crypto_provider());
+        }
         let config = ureq::Agent::config_builder()
-            .tls_config(tls)
+            .tls_config(tls.build())
             .timeout_global(Some(TIMEOUT))
             .user_agent(concat!("SentinelAgent/", env!("CARGO_PKG_VERSION")))
             .build();
@@ -180,6 +208,17 @@ impl Default for HttpTokenEndpoint {
 }
 
 impl HttpTokenEndpoint {
+    /// No device certificate, deliberately.
+    ///
+    /// The token exchange goes to the gateway (`{api_base}/v1/oauth/token`), which
+    /// would happily attribute it to a device if one were presented — and doing so was
+    /// considered and rejected. The gateway's listener is
+    /// `VerifyClientCertIfGiven`, so presenting a certificate it cannot verify fails
+    /// the *handshake*, not the request. That would mean an expired or damaged device
+    /// certificate stopped agents signing in, on top of stopping capture, and the
+    /// widget would show "sign in failed" for a problem that has nothing to do with
+    /// the user's credentials. Sign-in is the one thing that must keep working while
+    /// the machine's identity is being repaired.
     pub fn new() -> Self {
         HttpTokenEndpoint {
             agent: ureq::Agent::config_builder()

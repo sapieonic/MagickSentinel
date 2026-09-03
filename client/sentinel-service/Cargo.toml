@@ -17,6 +17,20 @@ path = "src/lib.rs"
 name = "SentinelService"
 path = "src/main.rs"
 
+# Two features, and both exist to make an unsafe development shortcut impossible to
+# ship by accident rather than to make it convenient. Neither is on by default, and
+# each is checked at runtime against `debug_assertions` as well, so `cargo test` — a
+# debug build with default features — covers the code while a release build refuses to
+# use it. See `devicekey::software` and `spoolkey` for the full reasoning.
+[features]
+default = []
+# Permit a P-256 private key in a PEM file instead of a non-exportable CNG key. Does
+# NOT meet spec 7.2.
+dev-software-device-key = []
+# Permit storing the SQLCipher key without DPAPI, i.e. next to the database it
+# encrypts. Only reachable off Windows, where there is no DPAPI.
+dev-plaintext-spool-key = []
+
 [dependencies]
 sentinel-core = { path = "../sentinel-core" }
 anyhow.workspace = true
@@ -27,6 +41,22 @@ time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 sha2.workspace = true
+rand.workspace = true
+base64.workspace = true
+
+# The enrollment exchange and the OTLP relay. `ureq` and not a second HTTP client:
+# the agent already carries it, so this adds no new TLS stack to the MSI.
+ureq.workspace = true
+
+# P-256 for the development software device key, and for verifying our own CSR
+# signature in the tests. Pure Rust, so it cross-compiles to the mingw target without
+# a C toolchain of its own — which matters because `cargo check --target
+# x86_64-pc-windows-gnu` is the only thing guarding the Windows code.
+#
+# Not optional, deliberately: `cargo test` builds default features, and a
+# feature-gated key implementation would simply not be covered by the command the
+# repository documents. The gate that matters is the runtime one.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
 
 # Deliberately NOT a dependency: `sentinel-capture`. A SYSTEM service runs in session
 # 0 and cannot reach a user's audio session, so any audio code here would be dead at
@@ -42,6 +72,9 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    # NCrypt (the non-exportable device key) and DPAPI (the machine-scope spool key
+    # wrap). Both live under this one feature.
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Environment",

@@ -14,16 +14,32 @@ concurrency:
 
 jobs:
   # --------------------------------------------------------------------------
-  # Rust client: sentinel-core and sentinel-capture.
+  # Rust client on Linux: the platform-neutral half, plus the mingw cross-check.
   #
   # `cargo test` covers the platform-neutral half — state machine, spool, wire
   # codec, VAD, resampler, device matching, tier detection, foreign-audio
-  # suppression. The Windows COM code under sentinel-capture/src/windows/ is
-  # compiled out on Linux and has no tests, so the cross-target check is the only
-  # thing standing between it and rot.
+  # suppression. None of it needs audio hardware, a network or a database, which
+  # is why it can be the fast job that gates every push.
+  #
+  # The `x86_64-pc-windows-gnu` cross-check is KEPT even though the `rust-windows`
+  # job below now compiles the same code with MSVC. It is not redundant:
+  #
+  #   * It is cheap. It runs on a Linux runner that is already warm, and it fails
+  #     in a couple of minutes rather than waiting on a Windows runner to boot.
+  #   * It catches feature-flag rot specifically. `#[cfg(windows)]` code reached
+  #     only through a target-specific dependency table is invisible to a Linux
+  #     `cargo check`, and a feature that has been renamed or a
+  #     `[target.'cfg(windows)'.dependencies]` entry that has been dropped shows
+  #     up here first.
+  #   * Two toolchains disagreeing is itself signal. mingw and MSVC differ on C
+  #     ABI details in the `rusqlite` and `audiopus` build scripts, and a change
+  #     that only builds under one of them is a change that will surprise someone.
+  #
+  # What it does NOT do is tell you the Windows code works — nothing is executed.
+  # That is the `rust-windows` job's job.
   # --------------------------------------------------------------------------
   rust:
-    name: Rust
+    name: Rust (Linux + mingw cross-check)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,9 +72,12 @@ jobs:
 
       - name: cargo clippy
         working-directory: client
-        # No `-D warnings` yet: the tree currently has two clippy warnings. Add the
-        # flag once they are cleared and this becomes a real gate.
-        run: cargo clippy --all-targets
+        # A real gate now: the tree is clippy-clean, so `-D warnings` costs nothing
+        # to keep and is the only thing that stops the next warning becoming the
+        # forty-first. Note this pins the gate to whatever `stable` resolves to on
+        # the day, so a new lint in a future release can fail a build that changed
+        # nothing -- fix the lint rather than dropping the flag.
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo fmt --check
         working-directory: client
@@ -68,6 +87,305 @@ jobs:
         # `cargo fmt` pass lands.
         continue-on-error: true
         run: cargo fmt --check
+
+  # --------------------------------------------------------------------------
+  # Rust client on Windows. This job exists because of the largest untested
+  # surface in the repository.
+  #
+  # Everything under client/sentinel-capture/src/windows/ and
+  # client/sentinel-service/src/windows/ — tier A process loopback, tier B
+  # endpoint loopback, softphone session tracking, device-change notification, OS
+  # build detection from the registry, the SCM entry point, the named-pipe host —
+  # is `#[cfg(windows)]`. Until this job existed, that code was compiled by a
+  # mingw `cargo check` and executed by nothing at all, on any platform. README.md
+  # and docs/architecture.md both say to treat it as unverified rather than as
+  # working, and that was accurate.
+  #
+  # What this job changes, in order of how much it is worth:
+  #
+  #   1. The whole platform-neutral suite now runs on the operating system the
+  #      product ships on, compiled by the toolchain the product ships from. Paths
+  #      (`\` vs `/`), the temp directory, file locking, `Local\` mutex namespaces
+  #      and named-pipe behaviour all differ from Linux, and every one of those is
+  #      touched by code under test (spool, update staging, crash-dump scan,
+  #      single-instance guard, IPC codec).
+  #   2. The Windows COM code is compiled by MSVC, which is what `build.ps1` uses.
+  #      The mingw cross-check and MSVC do not agree about everything.
+  #   3. `cargo clippy` finally sees the `cfg(windows)` code. On Linux clippy
+  #      cannot lint what is compiled out, so the COM modules have never been
+  #      linted by anything.
+  #   4. **The shipped configuration is tested.** `build.ps1` builds with
+  #      `--features sentinel-core/sqlcipher`; nothing in CI ever did. The
+  #      difference is whether borrower call audio on the endpoint is encrypted at
+  #      rest, and the `PRAGMA key` path in `sentinel-core/src/spool.rs` — including
+  #      the wrong-key detection that exists so a bad key surfaces at open time
+  #      rather than mid-call — had never been executed by anything, anywhere. See
+  #      the release step below.
+  #
+  # What it still does not do: exercise a single line of WASAPI. See the
+  # `rust-windows-audio` job for that seam and why it cannot live here.
+  # --------------------------------------------------------------------------
+  rust-windows:
+    name: Rust (Windows, MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          # This job builds the same workspace three ways — debug, and release
+          # with `sqlcipher` — so its cache contents have nothing in common with
+          # the Linux job's. rust-cache already keys on the runner OS, so the
+          # explicit key is about keeping the debug and release+sqlcipher
+          # artefacts of *this* job together rather than about cross-OS collision.
+          key: msvc-sqlcipher
+
+      # SQLCipher needs libcrypto. See the action for the full explanation; the
+      # short version is that rusqlite's `bundled-sqlcipher` vendors SQLCipher's C
+      # sources but links OpenSSL from the system, and `openssl-sys` reports a
+      # missing native library as something that reads like a Rust error.
+      - name: Provide OpenSSL for rusqlite/bundled-sqlcipher
+        uses: ./.github/actions/sqlcipher-openssl
+
+      # ---------------------------------------------------------------- debug
+      # Fast and highest-signal first: this is the step that will catch a genuine
+      # Windows behaviour difference, and it should fail before the runner has
+      # spent twenty minutes on a release build.
+      #
+      # `--target` is redundant on a Windows host (it is already the host target)
+      # and is passed anyway so the artefact layout is `target\x86_64-pc-windows-
+      # msvc\<profile>`, exactly where build.ps1 looks. A CI job whose output
+      # directory differs from the release build's is a job that can pass while
+      # the release build cannot find its own binaries.
+      - name: cargo test (MSVC, debug)
+        working-directory: client
+        # Deliberately no SENTINEL_TEST_AUDIO_HARDWARE here. A hosted runner has
+        # no audio endpoint, no softphone and no interactive audio session, so any
+        # test that needs one must skip rather than fail. See `rust-windows-audio`.
+        run: cargo test --target x86_64-pc-windows-msvc
+
+      # Not a gate, and not run: this prints the inventory of tests that have
+      # declared themselves hardware-in-the-loop by being `#[ignore]`d. It exists
+      # so the marker convention is visible in every CI log rather than being a
+      # rule in a comment nobody reads, and so that a test which quietly stops
+      # being ignored is noticed.
+      - name: Hardware-in-the-loop tests (listed, not run)
+        working-directory: client
+        continue-on-error: true
+        run: cargo test --target x86_64-pc-windows-msvc -- --ignored --list
+
+      - name: cargo clippy (MSVC, sees the cfg(windows) code)
+        working-directory: client
+        # No `-D warnings`, deliberately diverging from the Linux job, which does
+        # gate. The asymmetry is the point: Linux clippy is verified clean, so the
+        # flag there costs nothing, whereas this run lints the cfg(windows) modules
+        # Linux clippy never sees -- the COM capture paths, CNG, DPAPI -- and those
+        # have never been linted anywhere, because this job has never run. Gating on
+        # an unknown count would fail the first execution on lint debt rather than on
+        # anything a change introduced.
+        #
+        # Turn this into a gate in its own commit, once one run has reported the
+        # real count and it has been cleared. Until then a warning here is
+        # information, which is more than we had.
+        run: cargo clippy --all-targets --target x86_64-pc-windows-msvc
+
+      # ------------------------------------------------ the shipped configuration
+      # This is the step that closes the gap docs/security.md calls "the most
+      # checkable gap in this document": the tested configuration was not the
+      # shipped configuration, and the difference was encryption at rest for
+      # borrower audio on the agent's desktop.
+      #
+      # Two things happen here that happen nowhere else in CI:
+      #
+      #   * `--features sentinel-core/sqlcipher` links SQLCipher instead of plain
+      #     SQLite, so `Spool::from_connection`'s `PRAGMA key` branch and its
+      #     wrong-key probe are compiled and executed. Without the feature that
+      #     whole branch is `#[cfg]`-ed out and the spool tests pass against an
+      #     unencrypted database.
+      #   * `--release` trips the `compile_error!` guard in spool.rs if the feature
+      #     is ever dropped, which means this step also verifies that the guard
+      #     still guards.
+      #
+      # `--workspace` rather than `-p sentinel-core`: the release profile with this
+      # feature set is what build.ps1 produces, and a feature-unification problem
+      # between crates only appears when the whole workspace is resolved at once.
+      #   * `sentinel-service/dev-software-device-key` is typed here and ONLY here.
+      #     `SoftwareDeviceKey` refuses to be constructed in a release build unless
+      #     that feature is named, so that a release can never use a file-backed key
+      #     where a non-exportable CNG one is required. That gate is doing its job:
+      #     without the feature, this step cannot run the software key's own test
+      #     suite or the CSR tests that need a key to sign with, because the type
+      #     under test declines to exist.
+      #
+      #     Typing it is exactly what the feature is for -- its own documentation
+      #     calls out wanting the software path in an optimised build as the case it
+      #     covers, and requires it to be typed rather than inferred. It applies to
+      #     these TEST binaries only. The shipping build below deliberately does not
+      #     pass it, which is what keeps the guarantee that matters: the binaries a
+      #     customer receives still refuse a software key at compile time.
+      - name: cargo test (release + sqlcipher — the configuration build.ps1 ships)
+        working-directory: client
+        run: >-
+          cargo test --workspace --release
+          --target x86_64-pc-windows-msvc
+          --features sentinel-core/sqlcipher,sentinel-service/dev-software-device-key
+
+      # Mirrors build.ps1 step 1 exactly — same target, same profile, same feature
+      # spec, same package selection. It is nearly free after the step above
+      # (identical profile and features, so the artefacts are already built) and it
+      # is what proves the release workflow's first step can succeed before a tag
+      # is pushed. A release workflow that fails on its own build is a release
+      # workflow discovered at the worst moment.
+      - name: cargo build (release, the two shipping binaries)
+        working-directory: client
+        run: >-
+          cargo build --release
+          --target x86_64-pc-windows-msvc
+          -p sentinel-agent -p sentinel-service
+          --features sentinel-core/sqlcipher
+
+      - name: Verify both binaries exist where build.ps1 expects them
+        working-directory: client
+        shell: pwsh
+        run: |
+          # build.ps1 throws if either of these is missing after its cargo build.
+          # Asserting it here means a rename lands as a CI failure on the pull
+          # request rather than as a failed release build on a tag.
+          $bin = "target\x86_64-pc-windows-msvc\release"
+          foreach ($exe in @("SentinelAgent.exe", "SentinelService.exe")) {
+            $p = Join-Path $bin $exe
+            if (-not (Test-Path $p)) { throw "expected $p to exist" }
+            Write-Host ("{0}  {1} bytes" -f $exe, (Get-Item $p).Length)
+          }
+
+      # The check that makes the sqlcipher build honest, and it belongs on every pull
+      # request rather than only on a tag.
+      #
+      # Sentinel.wxs packages two executables and a widget.html. If either executable
+      # imports a DLL that is not part of Windows, the MSI installs cleanly, registers
+      # the service, and leaves a machine where the binary cannot start — install
+      # reported success, fleet view says covered, nothing ever captured.
+      #
+      # `libsqlite3-sys/bundled-sqlcipher` emits `rustc-link-lib=dylib=libcrypto`, and
+      # whether that becomes a `libcrypto-3-x64.dll` dependency depends only on which
+      # kind of `libcrypto.lib` was on the link line. Both builds succeed identically.
+      # This is the only thing that tells them apart.
+      - name: Assert no stray DLL dependencies
+        shell: pwsh
+        run: |
+          $bin = "client\target\x86_64-pc-windows-msvc\release"
+          .\.github\scripts\assert-no-stray-dll-deps.ps1 `
+            (Join-Path $bin "SentinelAgent.exe") `
+            (Join-Path $bin "SentinelService.exe")
+
+      # Unsigned, and therefore not shippable — this is a smoke-test artefact for
+      # someone who wants to reproduce a Windows-only bug without a Windows box,
+      # not a release. The release workflow is the only thing that produces a
+      # customer artefact, and it signs. Short retention because these are large
+      # and there is one per push.
+      - name: Upload unsigned binaries (smoke testing only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-windows-unsigned-${{ github.sha }}
+          path: |
+            client/target/x86_64-pc-windows-msvc/release/SentinelAgent.exe
+            client/target/x86_64-pc-windows-msvc/release/SentinelService.exe
+            client/target/x86_64-pc-windows-msvc/release/*.pdb
+          retention-days: 7
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Hardware-in-the-loop: the tests a hosted runner physically cannot run.
+  #
+  # This job is disabled unless the repository sets the variable
+  # SENTINEL_WINDOWS_AUDIO_RUNNER to 'true' and registers a self-hosted runner
+  # labelled [self-hosted, windows, audio]. It is written now, red never, so the
+  # seam exists before the hardware does.
+  #
+  # WHAT ACTUALLY NEEDS HARDWARE, named honestly rather than hand-waved. Every one
+  # of these is a function that cannot return a truthful answer on a hosted runner
+  # because the runner has no audio endpoint, no softphone process and no
+  # interactive audio session:
+  #
+  #   * `sentinel-capture/src/windows/process_loopback.rs` — tier A capture via
+  #     ActivateAudioInterfaceAsync with
+  #     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK. Needs a live process that is
+  #     rendering audio. On a runner there is no such process, and the activation
+  #     completes with a stream that never produces a buffer, which is
+  #     indistinguishable from the bug we would be testing for.
+  #   * `sentinel-capture/src/windows/endpoint_loopback.rs` — tier B capture from a
+  #     pinned render endpoint. Needs a real render endpoint. Hosted Windows
+  #     runners have no audio device at all; IMMDeviceEnumerator returns an empty
+  #     collection, so `GetDefaultAudioEndpoint` fails with E_NOTFOUND and the test
+  #     would be asserting on the failure path forever.
+  #   * `sentinel-capture/src/windows/session.rs` — softphone audio session
+  #     tracking via IAudioSessionManager2. Needs an audio session, which needs a
+  #     process rendering to a device that does not exist.
+  #   * `sentinel-capture/src/windows/notification.rs` — IMMNotificationClient
+  #     device add/remove/default-change callbacks. Needs a device to arrive or
+  #     leave. Nothing plugs a headset into a hosted runner.
+  #   * Foreign-audio suppression end to end. The unit tests in
+  #     `sentinel-capture/src/foreign.rs` cover the decision logic against
+  #     synthetic input, which is the right place for it. What they cannot cover is
+  #     the timing relationship the module is built around — that the session state
+  #     notification leads and lags the actual audio — because that relationship is
+  #     a property of the audio engine, not of our code.
+  #
+  # The convention, and it mirrors the Go integration tests' `t.Skip` on absent
+  # SENTINEL_TEST_* variables so there is one pattern in the repository rather than
+  # two:
+  #
+  #   * Mark a hardware-in-the-loop test `#[ignore]` with a reason. `cargo test`
+  #     then skips it everywhere by default and it can never turn a hosted runner
+  #     red.
+  #   * Have it also check `std::env::var("SENTINEL_TEST_AUDIO_HARDWARE")` and
+  #     return early if unset, so running it by hand on a developer laptop without
+  #     a headset produces a skip rather than a confusing COM error.
+  #
+  # Deleting these tests, or writing them to assert the no-device failure path, are
+  # both worse than not having them: this product's dangerous failure mode is
+  # looking healthy while capturing nothing, and a green test suite that proves
+  # capture cannot start is that failure mode in test form.
+  # --------------------------------------------------------------------------
+  rust-windows-audio:
+    name: Rust (Windows, audio hardware)
+    if: vars.SENTINEL_WINDOWS_AUDIO_RUNNER == 'true'
+    runs-on: [self-hosted, windows, audio]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Provide OpenSSL for rusqlite/bundled-sqlcipher
+        uses: ./.github/actions/sqlcipher-openssl
+
+      # `--include-ignored` rather than `--ignored`: run the whole suite on the
+      # machine that has the hardware, so a hardware test that passes while a
+      # neutral test regresses is not reported as a pass.
+      #
+      # The pinned container ID is deliberately a repository variable and not a
+      # secret: it identifies a headset model, not a credential, and having it
+      # legible in the log is how you diagnose "capture did not arm" on the rig.
+      - name: cargo test (release + sqlcipher, including hardware tests)
+        working-directory: client
+        env:
+          SENTINEL_TEST_AUDIO_HARDWARE: '1'
+          SENTINEL_TEST_PINNED_CONTAINER_ID: ${{ vars.SENTINEL_TEST_PINNED_CONTAINER_ID }}
+        run: >-
+          cargo test --workspace --release
+          --target x86_64-pc-windows-msvc
+          --features sentinel-core/sqlcipher
+          -- --include-ignored
 
   # --------------------------------------------------------------------------
   # Go gateway, including the Postgres-backed integration tests.
@@ -251,18 +569,33 @@ jobs:
   # --------------------------------------------------------------------------
   # Web: @sentinel/shared, @sentinel/widget, @sentinel/portal.
   #
-  # Gated on one thing only, and it is a real blocker rather than a placeholder:
-  # web/package-lock.json is out of sync with the workspaces (it predates
-  # @sentinel/shared and @sentinel/portal), so `npm ci` refuses to run at all.
-  # Everything else in this job passes today — typecheck, vitest and both vite
-  # builds all succeed against the current tree.
+  # This job used to skip itself. It carried an `npm ci --dry-run` guard and four
+  # `if:` lines because web/package-lock.json predated the @sentinel/shared and
+  # @sentinel/portal workspaces, so `npm ci` refused to run at all and the job
+  # would otherwise have been a permanently red check that everyone learned to
+  # ignore. The guard's own comment said to delete it and the four `if:` lines once
+  # the lockfile landed. The lockfile has landed, so it is deleted, and this is now
+  # a real gate.
   #
-  # The fix is one command, run in web/ and committed:  npm install
+  # Two properties of the shape it replaces are worth keeping in mind, because they
+  # are the reason to go back to `npm ci` rather than staying on `npm install`:
   #
-  # Until then the guard below skips the job with a notice rather than leaving a
-  # permanently red check. It heals itself: the guard is a real `npm ci --dry-run`,
-  # so the moment the lockfile is regenerated the job starts enforcing. Delete the
-  # guard and the four `if:` lines once that has landed.
+  #   * `npm ci` fails when the lockfile and the manifests disagree. `npm install`
+  #     silently *fixes* the disagreement by rewriting the lockfile, which means a
+  #     dependency bump merged without its lockfile change would pass CI and then
+  #     resolve differently on the next machine. For a bundle that ends up inside a
+  #     signed MSI, "resolved differently on the next machine" is a supply-chain
+  #     answer nobody wants to give a bank's security reviewer.
+  #   * `npm ci` deletes node_modules first, so it also catches a dependency that
+  #     only works because it is already installed.
+  #
+  # If this job goes red on a lockfile-out-of-sync error again, the fix is `npm
+  # install` in web/ with the regenerated lockfile committed — never a re-added
+  # guard, and never `npm install` in CI.
+  #
+  # The MSI depends on `npm run build` here: the release workflow builds
+  # web/widget and stages its output as the WebDir payload. A web job that skips
+  # is a release that ships a stale or missing widget bundle.
   # --------------------------------------------------------------------------
   web:
     name: Web
@@ -279,28 +612,14 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: Check that the lockfile is in sync
-        id: ready
-        run: |
-          if npm ci --dry-run >/dev/null 2>&1; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Web checks skipped::web/package-lock.json is out of sync with the workspaces, so npm ci cannot run. Run 'npm install' in web/ and commit the lockfile. See .github/workflows/ci.yml."
-          fi
-
       - name: Install
-        if: steps.ready.outputs.ready == 'true'
         run: npm ci
 
       - name: Typecheck
-        if: steps.ready.outputs.ready == 'true'
         run: npm run typecheck
 
       - name: Test
-        if: steps.ready.outputs.ready == 'true'
         run: npm test
 
       - name: Build
-        if: steps.ready.outputs.ready == 'true'
         run: npm run build

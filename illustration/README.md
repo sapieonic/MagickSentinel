@@ -20,7 +20,7 @@ npx http-server illustration -p 8099 -c-1
 
 | # | Section | What it shows |
 |---|---|---|
-| 01 | Service map | Who calls whom, and the one edge that is designed but has no publisher yet. |
+| 01 | Service map | Who calls whom, and why the finalize edge publishes from a transactional outbox rather than from the handler. |
 | 02 | Building the `.exe` | `cargo` → sign → `wix` → sign, and why the order is that way. |
 | 03 | Two processes | Session 0 vs the interactive session, and the relaunch backoff — click to crash the agent. |
 | 04 | Call detection | A live simulation of the state machine against scripted audio energy. |
@@ -41,11 +41,21 @@ source, not out of a design document. The ones most likely to drift:
 | 34-byte header, 50 frames per segment | `client/sentinel-core/src/protocol.rs`, `contracts/wire.md` |
 | Ack cadence, close codes, resume semantics | `contracts/wire.md` |
 | The RLS fixture and its six answers | `db/test/rls_test.sh` |
-| Build order and the tier gate | `client/installer/build.ps1`, `client/installer/README.md` |
+| Build order and the tier gate | `client/installer/build.ps1`, `client/installer/Sentinel.wxs`, `client/installer/README.md` |
+| The finalize edge, the outbox and the four fields on the bus | `db/migrations/0007_finalize_outbox.up.sql`, `server/gateway/internal/outbox/`, `server/pipeline/sentinel_pipeline/consumer.py` |
+| Non-exportable CNG device key, DPAPI machine scope | `client/sentinel-service/src/devicekey/`, `client/sentinel-service/src/spoolkey.rs` |
 
 The simulation in diagram 04 is a direct transcription of the Rust detector's rules into
 JavaScript. If you change the state machine, change it there too — or the page will
 confidently show behaviour the product no longer has.
+
+The same applies to what the page marks as unbuilt. Diagram 01 carried a dashed
+"no publisher yet" edge for a long time, and it was right at the time; when the outbox
+landed it became the page confidently showing a gap the product no longer had, which is
+the worse direction for a diagram to be wrong in — a reader trusts it and stops looking.
+The dashed-edge machinery is still in `diagrams.js` (`kind: 'todo'`) for the next honest
+gap. Nothing currently uses it, and that is a claim about the tree, not an aspiration:
+before adding a dashed edge, read the source; before removing one, read the source again.
 
 ## Publishing
 

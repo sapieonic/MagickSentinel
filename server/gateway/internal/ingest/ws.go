@@ -10,6 +10,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/magickvoice/sentinel/server/gateway/internal/auth"
+	"github.com/magickvoice/sentinel/server/gateway/internal/telemetry"
 	"github.com/magickvoice/sentinel/server/gateway/internal/wire"
 )
 
@@ -24,6 +25,8 @@ type Handler struct {
 	DeviceActive func(ctx context.Context, tenantID, deviceID string) bool
 	RevokePoll   time.Duration
 	Now          func() time.Time
+	// Metrics may be nil; every recorder tolerates it.
+	Metrics *telemetry.Metrics
 }
 
 func (h *Handler) now() time.Time {
@@ -88,7 +91,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			out := h.dispatch(session, f)
+			out := h.dispatch(ctx, session, f)
 			if !h.send(ctx, conn, out) {
 				return
 			}
@@ -128,7 +131,7 @@ func (h *Handler) readLoop(ctx context.Context, conn *websocket.Conn, out chan<-
 	}
 }
 
-func (h *Handler) dispatch(s *Session, f frame) Outbound {
+func (h *Handler) dispatch(ctx context.Context, s *Session, f frame) Outbound {
 	now := h.now()
 	if f.binary {
 		records, err := wire.DecodeAll(f.data)
@@ -139,6 +142,12 @@ func (h *Handler) dispatch(s *Session, f frame) Outbound {
 			h.log().Warn("ingest: bad media frame", "error", err)
 			return Outbound{Close: int(websocket.StatusInvalidFramePayloadData), CloseReason: "bad media frame"}
 		}
+		// Counted on arrival rather than after storage, unlike the segment
+		// counter in DBSink: the gap between the two is the interesting number.
+		// Frames accepted minus segments stored is how much audio the socket took
+		// and the object store or Postgres then refused, which is the shape of a
+		// silent capture failure.
+		h.Metrics.IngestFrames(ctx, s.peer.TenantID, int64(len(records)))
 		var merged Outbound
 		for _, rec := range records {
 			out, err := s.OnMedia(rec, now)

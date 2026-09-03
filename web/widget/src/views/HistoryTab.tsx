@@ -31,13 +31,7 @@ export function HistoryTab({ api, onOpenPortal }: { api: ApiClient | null; onOpe
       .then((page) => setCalls(page.items))
       .catch((cause: unknown) => {
         if (controller.signal.aborted) return;
-        // Distinguish "offline" from "rejected": on a collections desktop the first
-        // is routine and the agent should be told to wait, not to sign in again.
-        setError(
-          cause instanceof ApiError && cause.isTransport
-            ? 'History is unavailable while offline.'
-            : 'Could not load your history.',
-        );
+        setError(historyErrorMessage(cause));
       });
     return () => controller.abort();
   }, [api]);
@@ -75,4 +69,20 @@ export function HistoryTab({ api, onOpenPortal }: { api: ApiClient | null; onOpe
       })}
     </ul>
   );
+}
+
+/**
+ * Three outcomes, three different instructions to the agent.
+ *
+ * The distinction that matters on a collections desktop is between "offline" and
+ * "signed out". Being offline for a minute is routine and the agent should wait; being
+ * signed out means the token the native layer holds is gone or was refused, and no
+ * amount of waiting fixes it. Telling an agent to wait for a session that has ended is
+ * how a shift gets spent not knowing the widget needed a sign-in.
+ */
+export function historyErrorMessage(cause: unknown): string {
+  if (!(cause instanceof ApiError)) return 'Could not load your history.';
+  if (cause.isMissingCredentials) return 'Sign in to see your history.';
+  if (cause.isTransport) return 'History is unavailable while offline.';
+  return 'Could not load your history.';
 }

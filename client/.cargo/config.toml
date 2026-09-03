@@ -1,0 +1,37 @@
+# Link the MSVC C runtime statically.
+#
+# Without this, `SentinelAgent.exe` and `SentinelService.exe` import
+# `vcruntime140.dll`, which is redistributable and is NOT guaranteed present on a
+# clean Windows 10 image. The failure mode is the one this product must never have:
+# the MSI installs, the service registers, the deployment tool reports success, and
+# the binaries cannot start -- so the fleet view says the machine is covered while it
+# captures nothing. `.github/scripts/assert-no-stray-dll-deps.ps1` exists to catch
+# exactly this, and it did, on the first run that got far enough to produce binaries.
+#
+# Static rather than shipping the redistributable, for three reasons already recorded
+# elsewhere in the repository:
+#
+#   * OPEN-1 chose Rust for "a single static binary with no runtime dependency in the
+#     MSI and one fewer question in the bank's security review". A redistributable
+#     prerequisite gives that back.
+#   * OPEN-5 is unresolved and the floor may have no egress at install time. A
+#     prerequisite that has to be fetched fails there; one that has to be bundled adds
+#     package size to a decision that is already about package size.
+#   * A third-party DLL beside two EV-signed executables, in a directory a SYSTEM
+#     service executes from, is both an EDR conversation and a DLL-planting surface --
+#     the same argument `.github/actions/sqlcipher-openssl` makes for linking OpenSSL
+#     statically rather than packaging `libcrypto-3-x64.dll`.
+#
+# This has a hard coupling: everything linked into these binaries must use the SAME
+# CRT. `cc`-rs reads `crt-static` from the target features and compiles the vendored C
+# (SQLCipher's `sqlite3.c`, libopus) with `/MT` to match, so those follow
+# automatically. OpenSSL does not -- it comes from vcpkg, and its triplet has to be
+# `x64-windows-static` (static CRT) rather than `x64-windows-static-md` (dynamic CRT).
+# `.github/actions/sqlcipher-openssl` sets that, and its header explains the pairing.
+# Mixing the two produces duplicate-symbol link errors rather than a clean diagnostic.
+#
+# Note that a `RUSTFLAGS` environment variable, if set, REPLACES this rather than
+# adding to it. Nothing in CI or in build.ps1 sets one; if something starts to, it has
+# to carry this flag too or the dependency silently comes back.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

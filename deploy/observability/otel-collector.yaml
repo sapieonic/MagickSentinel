@@ -1,0 +1,527 @@
+# OpenTelemetry Collector: the single point every signal passes through.
+#
+# ==================================================================================
+# THE THREE EMITTERS
+#
+# Exactly three services emit, concurrently, and this file is provisioned for exactly
+# those `service.name` values:
+#
+#   sentinel-gateway    Go, server/gateway
+#   sentinel-pipeline   Python, server/pipeline
+#   sentinel-agent      Rust, client/sentinel-agent
+#
+# All three use the standard OTEL_EXPORTER_OTLP_ENDPOINT and keep export OFF by
+# default, so a collector-less deployment still runs. deploy/compose.yaml therefore
+# does NOT set that variable; deploy/observability/compose.yaml does. That is why the
+# base stack is silent rather than logging export failures every few seconds.
+#
+# ==================================================================================
+# PRIVACY: WHY THIS FILE REDACTS RATHER THAN TRUSTING THE EMITTERS
+#
+# Spec 12.10 and 15: transcripts, account references and borrower names must not appear
+# in application logs at any level. `docs/security.md` reports that the gateway enforces
+# this structurally — `httpx.LogRequests` logs `r.Pattern`, the matched route pattern,
+# rather than the raw path, because a raw path can carry an account reference in a query
+# string — and then says the thing that matters here:
+#
+#     "What this does not have is a test. Nothing asserts that no log line contains a
+#      transcript, and nothing prevents a future handler from logging one."
+#
+# Telemetry makes that worse in two specific ways, both of which are properties of
+# instrumentation rather than of anyone's carelessness:
+#
+#   * **Automatic instrumentation attaches whatever it finds.** An HTTP client
+#     instrumentation records `url.full`; a database instrumentation records
+#     `db.statement`. A query against `calls.account_ref` or a `GET` carrying an account
+#     reference then lands in a span attribute nobody wrote a line of code to put there.
+#   * **A span attribute is not reviewed like a log line.** Nobody grep-reviews
+#     attribute names, and there is no code-review moment where a new attribute is
+#     obviously PII.
+#
+# So the collector drops and redacts rather than trusting every emitter. It is a second
+# line, not the first: the emitters must still not emit borrower content. But a second
+# line that costs a config file is worth having for a product where a leak of borrower
+# transcript text into a telemetry backend is a DPDP incident, not a bug.
+#
+# ==================================================================================
+# RESIDENCY: OPEN-4, AND WHY NOTHING HERE POINTS OUTSIDE INDIA
+#
+# OPEN-4 asserts India-only (`ap-south-1`), annotated on the production server in
+# contracts/openapi.yaml, and it is UNDECIDED — the thing that would settle it is
+# written confirmation from the bank client. `docs/security.md`: "asserted, not
+# enforced".
+#
+# Every exporter below therefore points at a backend inside this deployment. There is
+# no managed telemetry backend configured and no default region for one, deliberately:
+#
+#   * Grafana Cloud, Datadog, New Relic and Honeycomb all default to a US or EU region
+#     if you do not choose. Adding one "just for staging" puts telemetry outside India
+#     before anyone has been asked.
+#   * Telemetry from this product is not innocuous even after the redaction below. Span
+#     names, tenant identifiers, call volumes and per-tenant model spend are all
+#     commercially sensitive, and a compliance-flag rate per tenant is exactly the
+#     figure a BPO's bank client would want and its competitor would too.
+#
+# If a managed backend is ever added: it must be an India-region endpoint
+# (Grafana Cloud's `prod-ap-south-1`, for example), the choice belongs in the OPEN-4
+# record rather than in this file, and the redaction below becomes load-bearing rather
+# than defence in depth, because the data then leaves our control.
+#
+# ==================================================================================
+# ONE CONFIGURATION DETAIL THAT WILL OTHERWISE COST SOMEONE AN AFTERNOON
+#
+# `add_metric_suffixes: false` on the Prometheus exporter, below. The default is true,
+# and it appends a unit and a `_total` to every metric name during OTel-to-Prometheus
+# translation. `sentinel.spool.size` with unit `By` becomes `sentinel_spool_size_bytes`;
+# with unit `{segment}` the unit is dropped entirely; a Gauge with unit `1` gains
+# `_ratio`. The rules are reasonable and they are not memorable, and getting one wrong
+# produces a dashboard panel that says "No data" — which on this product's dashboard is
+# indistinguishable from "no calls are being captured".
+#
+# With suffixes off, the translation is exactly: dots and dashes become underscores.
+# So the emitters name their metrics with the units already in the name, the Prometheus
+# name is mechanically derivable, and a dashboard cannot silently miss.
+#
+# THE METRIC NAME CONTRACT — what the three emitters must produce, and what the
+# dashboard and alert rules read:
+#
+#   OTel instrument name                    Prometheus name                        Kind
+#   ------------------------------------    -----------------------------------    -----
+#   sentinel.ingest.lag.seconds             sentinel_ingest_lag_seconds            Histogram
+#   sentinel.ingest.segments.total          sentinel_ingest_segments_total         Counter
+#   sentinel.spool.depth.segments           sentinel_spool_depth_segments          Gauge
+#   sentinel.spool.size.bytes               sentinel_spool_size_bytes              Gauge
+#   sentinel.spool.evicted.segments.total   sentinel_spool_evicted_segments_total  Counter
+#   sentinel.model.spend.paise.total        sentinel_model_spend_paise_total       Counter
+#   sentinel.tenant.budget.paise            sentinel_tenant_budget_paise           Gauge
+#   sentinel.coverage.ratio                 sentinel_coverage_ratio                Gauge
+#   sentinel.coverage.dialer.calls          sentinel_coverage_dialer_calls         Gauge
+#   sentinel.coverage.captured.calls        sentinel_coverage_captured_calls       Gauge
+#   sentinel.devices.reporting              sentinel_devices_reporting             Gauge
+#
+# Required attribute on every one of them: `tenant_id`. Everything in this product is
+# per-tenant, and a fleet-wide average hides the one tenant that has stopped capturing.
+#
+# `paise` in two of the names is deliberate and matches the invariant in AGENTS.md:
+# money is an integer number of paise end to end, and rupees exist only at the point of
+# display. A metric named `..._rupees` would be a float, and a float rupee value is the
+# thing that invariant exists to prevent.
+#
+# EXPLICITLY FORBIDDEN as an attribute on any of them: `user_uid`, `firebase_uid`,
+# `account_ref`, `borrower_name`, `transcript`, `summary`, `phone`, anything carrying
+# call content. The processors below strip them, and a stripped attribute is a bug in
+# the emitter that the collector happened to catch — check `otelcol` logs for the
+# redaction summary.
+# ==================================================================================
+
+receivers:
+  # The collector logs a warning about 0.0.0.0 binds on startup. It is right in general
+  # and unavoidable here: inside a container, a listener bound to 127.0.0.1 is
+  # unreachable from any other container, so the OTLP receiver has to accept on all
+  # interfaces. What actually limits exposure is the port mapping — compose publishes
+  # 4317/4318 to 127.0.0.1 on the host only.
+  #
+  # That is enough for a local stack and NOT enough for a real one, where the agent on
+  # a collections floor desktop has to reach this. An OTLP receiver with no
+  # authentication accepts telemetry from anyone who can route to it, which means anyone
+  # on the floor network can fill the metrics store with series and evict the ones the
+  # alerts read. When agent export is turned on for a floor, this receiver needs TLS and
+  # an auth extension (bearertokenauth or oidc) in front of it.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # 8 MiB rather than the 4 MiB default. The agent batches heartbeat-derived
+        # metrics for a whole floor and a reconnect after an outage sends a large
+        # first batch; a rejected batch is silently lost telemetry, which is the one
+        # kind of monitoring failure that looks like healthy silence.
+        max_recv_msg_size_mib: 8
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # The collector's own metrics, so "is telemetry flowing" is answerable from
+  # Prometheus rather than by reading collector logs. `otelcol_exporter_send_failed_*`
+  # is the series that tells you a dashboard's empty panel is a pipeline problem and
+  # not an application one — a distinction worth having at 3am.
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 30s
+          static_configs:
+            - targets: ['127.0.0.1:8888']
+
+processors:
+  # --------------------------------------------------------------------- safety
+  # First in every pipeline. Without a memory limiter a collector under load from a
+  # reconnecting fleet is OOM-killed, and a restarting collector loses telemetry in
+  # exactly the window when telemetry matters most.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  # ------------------------------------------------------- PII: exact-key removal
+  #
+  # First pass, and the deterministic one. `attributes` is a stable, core processor
+  # that supports traces, metrics and logs, so this pass behaves identically across
+  # collector versions — which matters, because the pattern-based pass below depends on
+  # a contrib processor whose signal support has changed over releases.
+  #
+  # Every key here is one that a real instrumentation library attaches without being
+  # asked, or one a well-meaning `span.SetAttributes` would add:
+  attributes/strip_pii:
+    actions:
+      # ---- identity. The server already knows who is signed in from the verified
+      # bearer token, so a UID in telemetry is gratuitous as well as forbidden. The
+      # agent's own heartbeat comment says exactly this about the request body.
+      - key: user_uid
+        action: delete
+      - key: firebase_uid
+        action: delete
+      - key: enduser.id
+        action: delete
+      - key: user.id
+        action: delete
+
+      # ---- borrower identity and call content. account_ref is the borrower's account
+      # with the bank; it is the DPDP subject key (`retention.py`'s SubjectRequest) and
+      # must not be in a telemetry backend.
+      - key: account_ref
+        action: delete
+      - key: borrower_name
+        action: delete
+      - key: transcript
+        action: delete
+      - key: transcript_text
+        action: delete
+      - key: summary
+        action: delete
+      - key: evidence_span
+        action: delete
+      - key: promise_to_pay
+        action: delete
+
+      # ---- the automatic-instrumentation leaks. db.statement can carry a WHERE clause
+      # against account_ref; url.full and http.target can carry it in a query string.
+      # This is why httpx.LogRequests logs r.Pattern instead of the raw path, and the
+      # same reasoning applies one layer up.
+      - key: db.statement
+        action: delete
+      - key: db.query.text
+        action: delete
+      - key: url.full
+        action: delete
+      - key: url.query
+        action: delete
+      - key: http.target
+        action: delete
+      - key: http.url
+        action: delete
+
+      # ---- credentials. Not PII, and worse if leaked.
+      - key: http.request.header.authorization
+        action: delete
+      - key: authorization
+        action: delete
+      - key: token
+        action: delete
+      - key: api_key
+        action: delete
+
+      # A call id is NOT deleted. It is a ULID with no borrower information in it, it is
+      # what makes a trace joinable to an audit row, and removing it would make an
+      # incident investigation impossible for no privacy gain. `tenant_id` stays for the
+      # same reason and because every alert below is per-tenant.
+
+  # ---------------------------------------------- PII: pattern-based KEY removal
+  #
+  # Second pass, for the attribute names nobody enumerated above. The exact-key list is
+  # a list of leaks we have thought of; this is for the ones we have not.
+  #
+  # WHY `transform` AND NOT `redaction`. The obvious tool is the `redaction` processor's
+  # `blocked_key_patterns`, and it does not exist in the pinned collector version — the
+  # 0.116 contrib redaction processor accepts `allow_all_keys`, `allowed_keys`,
+  # `ignored_keys`, `blocked_values` and `summary`, and nothing else. Configuring
+  # `blocked_key_patterns` there does not warn; the collector refuses to start with
+  # "'' has invalid keys", which is at least loud. The version-stable way to delete
+  # attributes by name pattern is OTTL's `delete_matching_keys`, which is what this is.
+  #
+  # An allow-list (`allowed_keys`) would be the other option and is rejected on
+  # purpose: it silently drops every new attribute someone adds for a good reason, and
+  # a monitoring stack that quietly discards new signals is one people stop trusting
+  # and then stop reading.
+  #
+  # `error_mode: ignore` so that one malformed statement cannot take the whole pipeline
+  # down. The trade is that a broken pattern fails open — check the collector's own
+  # logs after editing these.
+  transform/strip_pii_patterns:
+    error_mode: ignore
+    trace_statements:
+      - context: resource
+        statements: &strip_patterns
+          - delete_matching_keys(attributes, "(?i).*transcript.*")
+          - delete_matching_keys(attributes, "(?i).*account_?ref.*")
+          - delete_matching_keys(attributes, "(?i).*borrower.*")
+          - delete_matching_keys(attributes, "(?i).*(^|[_.])uid$")
+          - delete_matching_keys(attributes, "(?i).*password.*")
+          - delete_matching_keys(attributes, "(?i).*secret.*")
+          - delete_matching_keys(attributes, "(?i).*api_?key.*")
+          - delete_matching_keys(attributes, "(?i).*authorization.*")
+          - delete_matching_keys(attributes, "(?i).*bearer.*")
+          - delete_matching_keys(attributes, "(?i).*phone.*")
+          - delete_matching_keys(attributes, "(?i).*msisdn.*")
+          - delete_matching_keys(attributes, "(?i).*aadhaar.*")
+      - context: span
+        statements: *strip_patterns
+      - context: spanevent
+        statements: *strip_patterns
+    metric_statements:
+      - context: resource
+        statements: *strip_patterns
+      # Datapoint attributes are what become Prometheus labels, so a leak here is not
+      # merely stored — it becomes an indexed dimension, and every distinct borrower
+      # value becomes its own time series. A PII leak into metrics is a cardinality
+      # incident as well as a privacy one.
+      - context: datapoint
+        statements: *strip_patterns
+    log_statements:
+      - context: resource
+        statements: *strip_patterns
+      - context: log
+        statements: *strip_patterns
+
+  # -------------------------------------------- PII: pattern-based VALUE redaction
+  #
+  # The pass above removes attributes whose NAME looks wrong. This one removes values
+  # that look wrong regardless of the name they arrived under — a borrower's phone
+  # number in an attribute innocuously called `contact` or `arg0`.
+  #
+  # `allow_all_keys: true`: this processor is being used only for its value matching.
+  # Key filtering is the transform above.
+  redaction/values:
+    allow_all_keys: true
+    blocked_values:
+      # Indian mobile numbers, with or without the +91 country code. A phone number in
+      # a span attribute on this product is a borrower's phone number.
+      - "(\\+?91[\\-\\s]?)?[6-9]\\d{9}"
+      # PAN: five letters, four digits, one letter.
+      - "[A-Z]{5}[0-9]{4}[A-Z]"
+      # Twelve consecutive digits: an Aadhaar number. Nothing else in this product is a
+      # bare twelve-digit number — call ids are ULIDs, tenant ids are UUIDs, money is
+      # paise and lives in metrics rather than attributes.
+      - "\\d{12}"
+    # `debug` records the COUNT of redacted keys under `redaction.redacted.count`, and
+    # the key names under `redaction.masked.keys` — never the values. That is how an
+    # emitter leaking a forbidden value becomes visible without the leak being stored,
+    # which is the property that makes this safe to leave on.
+    summary: debug
+
+  # ------------------------------------------------------ PII: log body truncation
+  #
+  # The attribute passes above cannot help with a free-form log body. A structured
+  # logger emits `{"msg": "...", ...}`; a `log.error(f"failed on {transcript}")` emits
+  # a body. There is no reliable way to tell a transcript from a stack trace by
+  # inspection, so the collector does the one thing that is reliably true of a
+  # transcript and not of a log line: it is long.
+  #
+  # 2 KiB. A structured log message that needs more than two kilobytes is carrying data
+  # rather than describing an event, and a truncated body that says so is more useful
+  # than a full one nobody may read.
+  transform/log_bodies:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - >-
+            set(body, Concat([Substring(body, 0, 2048),
+            "…[truncated by the collector: a log body this long is carrying data
+            rather than describing an event. See deploy/observability/otel-collector.yaml]"], ""))
+            where IsString(body) and Len(body) > 2048
+
+  # ------------------------------------------------------------------ correlation
+  #
+  # What makes traces, metrics and logs joinable in Grafana:
+  #
+  #   trace -> log    Tempo's tracesToLogsV2 (datasources.yaml) matches on
+  #                   service.name plus the time range, so `service.name` must be
+  #                   present on logs as a resource attribute. It is, from the SDK.
+  #   log -> trace    Loki's derivedFields extracts trace_id from the log line. The
+  #                   SDKs put trace_id/span_id on a log record when it is emitted
+  #                   inside a span, and the Loki exporter promotes them.
+  #   metric -> trace exemplars, below.
+  #
+  # Fill in deployment.environment when an emitter did not set it. The three services
+  # set it through OTEL_RESOURCE_ATTRIBUTES; `insert` (not `upsert`) means this is a
+  # default rather than an override, so a service that knows better keeps its answer.
+  # The `:-unknown` default is load-bearing, not tidiness. With a bare
+  # ${env:SENTINEL_ENVIRONMENT} and the variable unset, the substitution yields an
+  # empty string and the collector refuses to start with:
+  #
+  #   error creating AttrProc. Either field "value", "from_attribute" or
+  #   "from_context" setting must be specified for 0-th action
+  #
+  # — which names neither the processor's purpose nor the missing variable. Found by
+  # running it. `unknown` is also a more useful value than an empty label: an alert
+  # stamped environment="unknown" says "nobody set this", while environment="" reads
+  # as a Prometheus quirk.
+  resource/defaults:
+    attributes:
+      - key: deployment.environment
+        action: insert
+        value: ${env:SENTINEL_ENVIRONMENT:-unknown}
+
+  # Promote two resource attributes onto metric DATA POINTS.
+  #
+  # This is necessary and it is not obvious. Prometheus has no notion of resource
+  # attributes: a resource attribute is either turned into a label or it is lost. The
+  # `prometheusremotewrite` exporter turns service.name and service.namespace into the
+  # `job` label (as "namespace/name") and service.instance.id into `instance`, and that
+  # is all — there is no `service_name` label unless something makes one.
+  #
+  # The alert rules and the dashboard both filter on `service_name`, so without this
+  # every one of the three sentinel.silence "telemetry absent" rules would match
+  # nothing and fire permanently, and every panel filtered by service would be empty.
+  #
+  # The alternative — `resource_to_telemetry_conversion: enabled` on the exporter —
+  # promotes ALL resource attributes, including service.version, host.name, process.pid
+  # and every telemetry.sdk.* key. Each distinct value is a new time series, so a
+  # redeploy that changes service.version doubles the cardinality of every metric in
+  # the system. Two attributes by hand is the right trade.
+  transform/promote_metric_labels:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["service_name"], resource.attributes["service.name"]) where resource.attributes["service.name"] != nil
+          - set(attributes["deployment_environment"], resource.attributes["deployment.environment"]) where resource.attributes["deployment.environment"] != nil
+
+  # Last in every pipeline, after everything that inspects individual records. Batching
+  # before redaction would work; batching after keeps the CPU cost of redaction on
+  # single records where the processor is designed for it.
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    # 5s rather than the 200ms default. This is not a latency-sensitive path — nobody
+    # is watching a trace appear in real time — and larger batches mean fewer, bigger
+    # writes to Tempo and Loki, which matters much more on a single-node stack.
+    timeout: 5s
+
+exporters:
+  # ------------------------------------------------------------------- traces
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      # In-cluster, single Docker network. A real deployment terminates TLS here; the
+      # setting is explicit rather than omitted so that "we forgot" and "we decided"
+      # are distinguishable.
+      insecure: true
+
+  # ------------------------------------------------------------------ metrics
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    tls:
+      insecure: true
+    # See the long note in the header. Off, so the Prometheus name is exactly the OTel
+    # name with dots replaced by underscores, and a dashboard cannot silently miss.
+    add_metric_suffixes: false
+    # Resource attributes as labels would put service.version, host.name, process.pid
+    # and telemetry.sdk.* on every series. Each distinct value is a new time series, so
+    # a redeploy that changes service.version doubles the cardinality of every metric.
+    # The two attributes worth having are promoted to real labels by resource/promote
+    # above.
+    resource_to_telemetry_conversion:
+      enabled: false
+    # Trace exemplars. This is the whole metric-to-trace correlation story: a spike in
+    # sentinel_ingest_lag_seconds becomes clickable through to the trace of a slow
+    # ingest write, rather than being a shape on a graph.
+    send_metadata: true
+
+  # --------------------------------------------------------------------- logs
+  otlphttp/loki:
+    # Loki 3.x accepts OTLP natively at /otlp/v1/logs, so there is no Loki-specific
+    # exporter and no label mangling in between. The older `loki` exporter required
+    # choosing which attributes became Loki labels, and getting that wrong is how a
+    # Loki index ends up with a label per call id.
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+  # Kept for debugging the collector itself, and NOT wired into any pipeline below.
+  # Enabling it prints every record to the collector's stdout — including, by
+  # definition, anything the redaction above was supposed to remove, into the container
+  # log, which is then shipped somewhere. Use it deliberately and briefly.
+  debug:
+    verbosity: normal
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  # pprof and zpages deliberately omitted: they expose in-flight telemetry, which is
+  # the redaction bypass nobody would think to look for.
+
+service:
+  extensions: [health_check]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      # `readers` rather than the older `address:`, which 0.116 warns is deprecated.
+      # Bound to 127.0.0.1 because the only consumer is the `prometheus/self` receiver
+      # in this same process; the collector's own metrics include exporter queue sizes
+      # and failure counts, which is enough to infer another deployment's throughput.
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+
+  pipelines:
+    # Order is the same in all three and it matters:
+    #   memory_limiter first          — nothing downstream runs if we are about to OOM
+    #   attributes/strip_pii          — exact keys, deterministic, cheapest
+    #   transform/strip_pii_patterns  — keys by name pattern
+    #   redaction/values              — values by pattern, whatever key they arrived on
+    #   resource/defaults             — fill in what emitters omitted
+    #   transform/promote_*           — correlation labels (metrics only)
+    #   batch last                    — everything above inspects single records
+    traces:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - attributes/strip_pii
+        - transform/strip_pii_patterns
+        - redaction/values
+        - resource/defaults
+        - batch
+      exporters: [otlp/tempo]
+
+    metrics:
+      receivers: [otlp, prometheus/self]
+      processors:
+        - memory_limiter
+        - attributes/strip_pii
+        - transform/strip_pii_patterns
+        - redaction/values
+        - resource/defaults
+        - transform/promote_metric_labels
+        - batch
+      exporters: [prometheusremotewrite]
+
+    logs:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        # Body truncation before the attribute passes: a 40 KB body is the expensive
+        # thing to carry through the rest of the chain, and the attribute processors
+        # cannot see inside a body anyway.
+        - transform/log_bodies
+        - attributes/strip_pii
+        - transform/strip_pii_patterns
+        - redaction/values
+        - resource/defaults
+        - batch
+      exporters: [otlphttp/loki]

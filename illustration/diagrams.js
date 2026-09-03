@@ -605,7 +605,8 @@ const SEQUENCES = {
       { from: 'a', to: 'g', text: 'WSS /v1/ingest — call.start, media, acks, call.end', kind: 'async' },
       { from: 'a', to: 'g', text: 'POST /v1/heartbeat every 30 s — state, spool depth, restarts. No PII.' },
       { divider: 'finalize' },
-      { from: 'g', to: 'w', text: 'publish sentinel.call.finalize', kind: 'todo' },
+      { from: 'g', to: 'w', text: 'publish sentinel.call.finalize',
+        sub: 'from the outbox: one commit finalizes the call and queues the message' },
       { from: 'w', to: 'w', text: 'ASR per channel → analysis → 10 deterministic rules on 100% of calls' },
       { from: 'w', to: 'w', text: 'LLM judge on flagged calls plus a deterministic sample; analysis failing must not stop compliance' },
       { from: 'w', to: 'g', text: 'transcript, summary, PTP in paise, per-speaker sentiment, flags' },
@@ -640,7 +641,8 @@ const SEQUENCES = {
     const noteLines = spec.rows.map((r) => (r.note ? wrap(r.note, 118) : null));
     const heights = spec.rows.map((r, i) => {
       if (r.note) return noteLines[i].length * 15 + 26;
-      if (r.kind === 'todo') return ROW + 14;
+      // A row carrying a `sub` line needs the extra pitch that line sits in.
+      if (r.sub || r.kind === 'todo') return ROW + 14;
       return ROW;
     });
     const tops = [];
@@ -716,9 +718,13 @@ const SEQUENCES = {
         const t = svg('text', { x: mid, y: y - 8, 'text-anchor': 'middle', class: 'edge-label' }, r.text);
         if (r.kind === 'todo') t.setAttribute('fill', 'var(--tier-b)');
         g.appendChild(t);
-        if (r.kind === 'todo') {
-          g.appendChild(svg('text', { x: mid, y: y + 15, 'text-anchor': 'middle', class: 'n-tiny', fill: 'var(--tier-b)' },
-            'no publisher yet — the consumer is written and tested, the producer is not'));
+        // `sub` is a second, smaller line under the message, for the one or two rows
+        // whose mechanism does not fit in a label. It inherits the row's colour, so a
+        // `todo` row's sub-line still reads as unbuilt.
+        if (r.sub) {
+          const attrs = { x: mid, y: y + 15, 'text-anchor': 'middle', class: 'n-tiny' };
+          if (r.kind === 'todo') attrs.fill = 'var(--tier-b)';
+          g.appendChild(svg('text', attrs, r.sub));
         }
       }
       host.appendChild(g);

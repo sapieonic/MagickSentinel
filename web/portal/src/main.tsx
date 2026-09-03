@@ -3,31 +3,52 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import '@sentinel/shared/styles.css';
 import './portal.css';
-import { App } from './App.js';
-import { SessionProvider } from './session.js';
+import { AuthProvider } from './auth/AuthProvider.js';
+import { readApiBaseUrl, readAuthConfig } from './auth/config.js';
+import type { ConfigResult } from './auth/config.js';
+import { createFirebaseIdentityBackend } from './auth/firebase.js';
+import { PortalRoot } from './PortalRoot.js';
 
 const container = document.getElementById('root');
 if (!container) throw new Error('portal: #root missing from index.html');
 
-// Gateway origin comes from the build environment; the local-development server in
-// contracts/openapi.yaml is the fallback so a fresh checkout runs without config.
-const baseUrl = import.meta.env['VITE_API_BASE_URL'] ?? 'http://localhost:8080';
-
 /**
- * Token seam. The portal's Identity Platform session is not part of this workspace;
- * the SDK that owns it sets `window.__SENTINEL_PORTAL_TOKEN__` (or this function is
- * replaced outright when it lands). Returning null makes every request fail with a
- * clean `no_credentials` rather than a confusing 401.
+ * All configuration is read once, here, before anything renders.
+ *
+ * Both halves are validated together and their problems merged into one result, so a
+ * deployment missing three variables sees three lines on one screen rather than
+ * discovering them one redeploy at a time. Nothing below this point invents a default:
+ * the Identity Platform tenant and — in a production build — the gateway origin have
+ * no fallback, because guessing either produces a portal that looks like it works and
+ * cannot authenticate.
  */
-const getToken = (): string | null =>
-  (globalThis as { __SENTINEL_PORTAL_TOKEN__?: string }).__SENTINEL_PORTAL_TOKEN__ ?? null;
+const env = import.meta.env as unknown as Record<string, string | boolean | undefined>;
+const isDev = import.meta.env.DEV === true;
+
+const authConfig = readAuthConfig(env);
+const apiBaseUrl = readApiBaseUrl(env, isDev);
+
+const configResult: ConfigResult = apiBaseUrl.ok
+  ? authConfig
+  : {
+      ok: false,
+      problems: [...(authConfig.ok ? [] : authConfig.problems), apiBaseUrl.problem],
+    };
+
+// Only reached when the configuration is good; the misconfigured screen never needs a
+// gateway URL because it never makes a request.
+const baseUrl = apiBaseUrl.ok ? apiBaseUrl.baseUrl : '';
 
 createRoot(container).render(
   <StrictMode>
     <BrowserRouter>
-      <SessionProvider baseUrl={baseUrl} getToken={getToken}>
-        <App />
-      </SessionProvider>
+      {/* The backend is passed as a constructor rather than an instance so the Firebase
+          SDK is only touched once the configuration has been checked — and so a test
+          or a future provider can substitute its own IdentityBackend without this file
+          changing. */}
+      <AuthProvider configResult={configResult} createBackend={createFirebaseIdentityBackend}>
+        <PortalRoot baseUrl={baseUrl} />
+      </AuthProvider>
     </BrowserRouter>
   </StrictMode>,
 );
