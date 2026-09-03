@@ -45,16 +45,31 @@ mixed.
                          └──────────────┘
 ```
 
-**How much of this exists.** This is a design diagram, not an inventory. As of writing:
-the gateway runs; Postgres and its row-level-security model are real and tested; the
-client's platform-neutral logic — state machine, spool, wire codec — is real and tested;
-the Windows capture code and most of `SentinelService` are written and type-check but are
-exercised by nothing, because there is no Windows CI runner. `SentinelAgent` is a
-placeholder `main`, so the endpoint has no PKCE login, no Opus encoder, no uplink client
-and no WebView2 shell yet. The pipeline has its worker orchestration and a NATS consumer
-but is not deployed. Object storage has a filesystem backend and no S3 adapter, and there
-is no installer. The README carries the component-by-component state and is the place to
+**How much of this exists.** This is a design diagram, not an inventory, but every edge
+on it now has code behind it. The gateway runs, issues device certificates from a real
+PEM-backed intermediate CA (`server/gateway/internal/ca`), brokers the agent's token
+exchange server-side (`internal/api/token.go`), writes audio to S3 (`internal/blob/s3.go`,
+defaulting to `ap-south-1`) and publishes `sentinel.call.finalize` from a transactional
+outbox (`internal/outbox`, `db/migrations/0007_finalize_outbox.up.sql`). Postgres and its
+row-level-security model are real and tested, and the pipeline now connects under it as
+`sentinel_pipeline` with concrete storage and object-store implementations rather than
+bare `Protocol` interfaces. `SentinelAgent` is no longer a placeholder: it signs in with
+PKCE, presents a device certificate backed by a non-exportable CNG key, encodes Opus,
+spools under a DPAPI-wrapped key and hosts the widget. `client/installer/` holds a
+complete WiX package.
+
+What has not happened is execution. The Windows capture code and the Windows halves of
+`SentinelService` type-check and are exercised by nothing — there are zero tests under
+`client/**/src/windows/`, no hardware-in-the-loop test, and the `windows-latest` CI job
+that would compile and lint them has been written but has never run. No MSI has been
+built or signed, no container image has been built, and the compose stack in `deploy/` has
+not been stood up. The README carries the component-by-component state and is the place to
 keep it current.
+
+One edge on the diagram is thinner than it looks. The endpoint's OTLP log export is routed
+through the gateway rather than to a collector directly — deliberately, since a desktop
+should hold no collector credentials — but the gateway has no `/v1/telemetry/otlp` relay
+endpoint yet, so those exports currently 404 and are dropped.
 
 Data flows one way through the endpoint: two audio streams are captured, resampled to
 16 kHz mono, encoded, framed with a sequence number and a call-relative timestamp,
@@ -126,6 +141,14 @@ client. Server-side invocation is also what makes the cost controls enforceable 
 per-tenant monthly budgets with alerts at 70% and 90%, a per-call token ceiling, skipping
 analysis for calls under 15 seconds, and a kill switch that drops to tier-1 rules only
 when spend spikes. None of those can be enforced by a client that holds its own key.
+
+The argument holds; the current accounting does not yet add up to the whole bill. There
+is one `cost_paise` column on `analyses`, and
+`server/pipeline/sentinel_pipeline/persistence.py` writes that row before the tier-2 judge
+runs, so judge spend is not persisted anywhere. Per-tenant totals — and therefore the
+budget and ceiling computed from them — are low by the judge's share: roughly the tier-1
+hit rate plus the judge sample percentage, so single-digit percent, but low rather than
+high, which is the wrong direction for a control whose job is to stop spending.
 
 **Model swaps without redeploying 200 desktops.** Providers get replaced, prompts get
 tuned, a model version is deprecated with three months' notice. Server-side, that is a

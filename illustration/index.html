@@ -83,9 +83,6 @@
             <marker id="ah-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
               <path d="M0,0 L10,5 L0,10 z" fill="var(--flow)"/>
             </marker>
-            <marker id="ah-todo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M0,0 L10,5 L0,10 z" fill="var(--tier-b)"/>
-            </marker>
           </defs>
 
           <!-- endpoint -->
@@ -137,8 +134,8 @@
 
           <path class="edge edge--live" data-flow d="M505,166 L420,270" marker-end="url(#ah-flow)"/>
           <path class="edge edge--live" data-flow d="M556,166 L610,270" marker-end="url(#ah-flow)"/>
-          <path class="edge edge--todo" d="M600,166 C 720,190 790,220 822,266" marker-end="url(#ah-todo)"/>
-          <text class="edge-label" x="628" y="212" fill="var(--tier-b)">not wired yet</text>
+          <path class="edge edge--live" data-flow d="M600,166 C 720,190 790,220 822,266" marker-end="url(#ah-flow)"/>
+          <text class="edge-label" x="628" y="212">publish, from the outbox</text>
 
           <!-- pipeline -->
           <rect class="n-box" x="330" y="390" width="590" height="76" rx="8"/>
@@ -155,15 +152,23 @@
       </div>
       <div class="legend">
         <span><i class="live"></i> implemented and tested</span>
-        <span><i class="todo"></i> designed, no publisher yet</span>
+        <span>every edge on this map now has code on both ends</span>
         <span>the gateway owns every credential the endpoint does not have</span>
       </div>
       <figcaption class="fig__note">
-        <b>The one honest gap.</b> When a call ends the gateway sets
-        <code>calls.status = 'transcribing'</code> and stops. The pipeline's JetStream consumer
-        is written and tested against <code>sentinel.call.finalize</code>, but nothing publishes
-        that subject yet — so finalized calls queue in the database rather than in NATS. It is
-        drawn dashed here because a diagram that hides it would be a diagram you cannot deploy from.
+        <b>The edge that used to be dashed.</b> This diagram carried one gap for a long time:
+        the pipeline's JetStream consumer was written and tested against
+        <code>sentinel.call.finalize</code> and nothing published that subject, so finalized
+        calls queued in the database rather than in NATS. It has a producer now, and the
+        interesting part is <em>how</em>. The gateway does not publish from the finalize handler.
+        It writes the message into <code>call_finalize_outbox</code> in the same transaction that
+        finalizes the call (<code>db/migrations/0007_finalize_outbox.up.sql</code>), and a drainer
+        moves rows into JetStream and deletes nothing until the broker acks
+        (<code>server/gateway/internal/outbox/</code>). A publish that failed after the commit
+        would otherwise leave a call captured, stored, billed and never analysed, with no error
+        anywhere and nothing that would notice. The cost is at-least-once delivery, which the
+        consumer is built for. Four fields travel on the bus — call id, tenant id, attempt,
+        timestamp — and nothing about a borrower.
       </figcaption>
     </figure>
   </section>

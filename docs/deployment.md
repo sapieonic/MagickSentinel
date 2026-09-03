@@ -8,6 +8,15 @@ start before anything else.
 Read the section on EDR allowlisting first if you are planning a schedule. It is the
 item most likely to move your dates.
 
+**Where this stands, so you can plan honestly.** The MSI is written — a complete WiX
+package with the tier gate, the service registration, the ACLs and the WebView2 handling
+described below — and it has not yet been built or signed. No installer has been produced
+from this repository, nothing has been installed on a desktop, and the Windows-only
+capture code has never run outside a compiler. Everything below describes how the product
+is designed and packaged to behave, which is the right thing to plan a Phase 0 around; it
+is not a report from a machine. Ask for a signed build and a pilot image before you commit
+to dates that depend on one.
+
 ## Windows support matrix
 
 | Tier | Operating system | How audio is captured | What you get |
@@ -86,15 +95,22 @@ The agent's widget is rendered with WebView2. The runtime ships as part of Windo
 It does not ship with Windows 10, which means your tier B machines are also the machines
 that need the runtime installed.
 
-The intended approach is to bundle the Evergreen bootstrapper in the MSI, which fetches
-and installs the runtime on first run. That requires outbound access to Microsoft's
-distribution endpoints from the desktop, at install time.
+The package as written bundles the Evergreen bootstrapper, which fetches and installs the
+runtime on first run. That requires outbound access to Microsoft's distribution endpoints
+from the desktop, at install time. Two details worth knowing before you test it: the
+installer looks for an existing per-machine runtime first and skips the bootstrapper if
+one is already present, and if the bootstrapper does fail the install is allowed to
+continue rather than rolling back — you get capture without a widget, which is a better
+outcome than a floor with neither, and the missing runtime is reported in the agent's
+heartbeat so it shows up in the fleet view rather than as an agent complaint.
 
 If your floor is air-gapped or has strict egress filtering, the Evergreen bootstrapper
-will not work and a fixed-version runtime has to be bundled instead. Which of these
-Sentinel ships is still an open decision (OPEN-5 in `docs/open-decisions.md`); if your
-deployment cannot reach the internet at install time, say so during Phase 0 so the
-decision is made in your favour rather than discovered during the pilot.
+will not work and a fixed-version runtime has to be bundled instead. That branch has not
+been built. Which of the two Sentinel ships is still an open decision (OPEN-5 in
+`docs/open-decisions.md`) and the current package should be read as the unresolved default
+rather than as the answer; if your deployment cannot reach the internet at install time,
+say so during Phase 0 so the decision is made in your favour rather than discovered during
+the pilot.
 
 ## Windows 10 end of support
 

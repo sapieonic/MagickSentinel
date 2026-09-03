@@ -59,12 +59,14 @@ First-time setup for the two that need it:
 
 ```sh
 cd server/pipeline && python -m venv .venv && .venv/bin/pip install -e '.[dev]'
-cd web && npm install
+cd web && npm ci
 ```
 
-Use `npm install`, not `npm ci`: `web/package-lock.json` predates the `shared` and
-`portal` workspaces, so a clean install refuses to run. Regenerating and committing the
-lockfile is the fix; until then the CI web job detects this and skips with a notice.
+`npm ci` is the right command now. It used to refuse to run at all, because
+`web/package-lock.json` predated the `shared` and `portal` workspaces; the lockfile has
+been regenerated and committed, so a clean install works and the CI web job gates on it
+rather than skipping itself with a notice. Use `npm install` only when you are
+deliberately changing dependencies, and commit the lockfile when you do.
 
 The three `db/test/*.sh` scripts each boot a throwaway PostgreSQL 16 cluster, apply every
 migration, and tear it down. If pgvector is missing they install a stub `vector` type so
@@ -292,7 +294,9 @@ traverse into your checkout. Run under `sudo` from your own user, or set
 columns behave as opaque text; vector search is the only thing that needs the real
 extension.
 
-**`npm ci` fails on the lockfile** — expected, see above. Use `npm install`.
+**`npm ci` fails on the lockfile** — no longer expected; this was a known breakage and
+is fixed. If you see it, your checkout is behind or a dependency change landed without
+its lockfile.
 
 **`SENTINEL_BLOB_DIR is required`** — the gateway refuses to start without object storage
 rather than dropping audio on the floor.

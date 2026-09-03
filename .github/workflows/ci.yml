@@ -72,9 +72,12 @@ jobs:
 
       - name: cargo clippy
         working-directory: client
-        # No `-D warnings` yet: the tree currently has two clippy warnings. Add the
-        # flag once they are cleared and this becomes a real gate.
-        run: cargo clippy --all-targets
+        # A real gate now: the tree is clippy-clean, so `-D warnings` costs nothing
+        # to keep and is the only thing that stops the next warning becoming the
+        # forty-first. Note this pins the gate to whatever `stable` resolves to on
+        # the day, so a new lint in a future release can fail a build that changed
+        # nothing -- fix the lint rather than dropping the flag.
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo fmt --check
         working-directory: client
@@ -180,11 +183,17 @@ jobs:
 
       - name: cargo clippy (MSVC, sees the cfg(windows) code)
         working-directory: client
-        # No `-D warnings`, matching the Linux job's policy: the tree is not
-        # warning-clean and turning this into a gate today would block unrelated
-        # work. Note that the count here will not match the Linux job's, because
-        # this run lints modules Linux clippy never sees. Add the flag on both
-        # jobs in the same change, not one at a time.
+        # No `-D warnings`, deliberately diverging from the Linux job, which does
+        # gate. The asymmetry is the point: Linux clippy is verified clean, so the
+        # flag there costs nothing, whereas this run lints the cfg(windows) modules
+        # Linux clippy never sees -- the COM capture paths, CNG, DPAPI -- and those
+        # have never been linted anywhere, because this job has never run. Gating on
+        # an unknown count would fail the first execution on lint debt rather than on
+        # anything a change introduced.
+        #
+        # Turn this into a gate in its own commit, once one run has reported the
+        # real count and it has been cleared. Until then a warning here is
+        # information, which is more than we had.
         run: cargo clippy --all-targets --target x86_64-pc-windows-msvc
 
       # ------------------------------------------------ the shipped configuration

@@ -4,12 +4,13 @@
     to produce a package whose widget would render blank on every desktop.
 
 .DESCRIPTION
-    Two facts that do not currently line up, both owned by other work streams:
+    Two facts that have to line up, and now do:
 
-      * `web/widget/vite.config.ts` builds a normal vite application: dist/index.html
-        plus dist/assets/*.js and *.css, with `base: './'` so the asset URLs are
-        relative. That is the correct vite configuration for a bundle WebView2 loads
-        from disk.
+      * `web/widget/vite.config.ts` inlines the bundle into a single self-contained
+        dist/index.html (vite-plugin-singlefile, with assetsInlineLimit raised past
+        the bundle size and cssCodeSplit off). It did not always: it emitted
+        dist/index.html plus dist/assets/*.js and *.css, which is the correct shape
+        for a bundle served over HTTP and the wrong one for this package.
       * `client/installer/Sentinel.wxs` packages exactly ONE file from that
         directory -- `<File Name="widget.html" Source="$(var.WebDir)\widget.html">`
         -- and no assets directory. `build.ps1` checks for `widget.html` and nothing
@@ -29,16 +30,18 @@
     fine) reached by way of a packaging detail, and it would be found by an agent on a
     collections floor rather than by us.
 
-    So: assets present and not inlined => throw. The fix belongs upstream and there
-    are two of them, in preference order:
+    So: assets present and not inlined => throw. That check is now a regression
+    guard rather than an outstanding bug -- option (a) below was taken -- and it
+    stays because the failure it catches is invisible until a floor hits it:
 
-      (a) Make the widget build emit one self-contained file. In vite that is
-          `build.assetsInlineLimit` raised past the bundle size, or a single-file
-          plugin, with the output named widget.html. Best: it matches what the WXS
-          already says, and a single file has no relative-path ambiguity under the
-          WebView2 virtual host mapping.
-      (b) Add the assets directory to Sentinel.wxs as its own component, with the
-          component-rule bookkeeping that implies.
+      (a) TAKEN. The widget build emits one self-contained file, so it matches what
+          the WXS already said and a single file has no relative-path ambiguity
+          under the WebView2 virtual host mapping. Anything that reintroduces a
+          separate asset -- a new font, an image past the inline limit, a plugin
+          that emits its own chunk -- trips this script instead of shipping blank.
+      (b) NOT TAKEN. Adding the assets directory to Sentinel.wxs as its own
+          component, with the component-rule bookkeeping and the hashed filenames
+          that implies.
 
     -AllowIncompleteBundle exists for a local or CI smoke test of the packaging
     pipeline itself, and stamps the fact into the staging manifest so it cannot be
