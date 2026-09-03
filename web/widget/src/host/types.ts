@@ -75,9 +75,18 @@ export interface SentinelHost {
 
   /**
    * EXTENSION. Spec 6.7 says history and summaries call the API "using a token the
-   * native layer injects" but does not say how the token arrives. This is the
-   * assumed shape; `resolveTokenProvider` also accepts a token injected onto the
-   * window, so either native implementation works.
+   * native layer injects" but does not say how the token arrives. This is the assumed
+   * shape; `resolveTokenProvider` also accepts a token injected onto the window as
+   * `__SENTINEL_TOKEN__`, so either native implementation works.
+   *
+   * The native side is free to answer null, and will: the widget starts before anyone
+   * has signed in, and it stays running through sign-out. It may also answer a
+   * different token later in the shift, because the agent process rotates the ID token
+   * roughly hourly. `resolveTokenProvider` therefore re-reads per request, bounds every
+   * call so a wedged agent process cannot hang the widget, and treats "no token" as the
+   * signed-out state rather than as an error. The one thing the native side must not do
+   * is return a stale token forever after the gateway starts refusing it — the refresh
+   * path detects an unchanged token and gives up rather than retrying it.
    */
   getToken?(): Promise<string | null>;
   /** EXTENSION. Gateway origin, so the bundle is not built per environment. */

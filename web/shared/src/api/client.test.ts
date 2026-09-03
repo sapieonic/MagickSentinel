@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiClient, ApiError } from './client.js';
+import { ApiClient, ApiError, MISSING_CREDENTIALS } from './client.js';
 
 function jsonResponse(status: number, body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -295,5 +295,278 @@ describe('ApiClient live ticket', () => {
       .catch((e: unknown) => e)) as ApiError;
     expect(error.isTransport).toBe(true);
     expect(error.isForbidden).toBe(false);
+  });
+});
+
+describe('ApiClient credential refresh on 401', () => {
+  /**
+   * Builds a fetch that answers 401 until it is handed `goodToken`, then 200. This is
+   * the shape of the real failure: the token in hand was minted an hour ago, the
+   * gateway is right to refuse it, and the only thing wrong is our copy.
+   */
+  function gatewayExpecting(goodToken: string) {
+    const seen: Array<string | undefined> = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const auth = (init?.headers as Record<string, string> | undefined)?.['Authorization'];
+      seen.push(auth);
+      return auth === `Bearer ${goodToken}`
+        ? jsonResponse(200, { items: [] })
+        : jsonResponse(401, { code: 'unauthorized', message: 'token expired' });
+    });
+    return { seen, fetchMock };
+  }
+
+  it('forces a refresh and retries once when the gateway rejects a stale token', async () => {
+    const { seen, fetchMock } = gatewayExpecting('fresh');
+    const refresh = vi.fn(async () => 'fresh');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: refresh,
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(api.listMyCalls()).resolves.toEqual({ items: [] });
+    expect(seen).toEqual(['Bearer stale', 'Bearer fresh']);
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry when no refresher was supplied', async () => {
+    const { fetchMock } = gatewayExpecting('fresh');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const error = (await api.listMyCalls().catch((e: unknown) => e)) as ApiError;
+    expect(error.status).toBe(401);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a failed refresh as no_credentials, never as another 401', async () => {
+    // The whole point: the caller must be able to tell "sign in again" from
+    // "retry", because retrying a dead session is the 401 loop.
+    const { fetchMock } = gatewayExpecting('never-issued');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: async () => null,
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const error = (await api.getMyStats().catch((e: unknown) => e)) as ApiError;
+    expect(error.code).toBe(MISSING_CREDENTIALS);
+    expect(error.isMissingCredentials).toBe(true);
+    expect(error.isAuthFailure).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a throwing refresher as a failed refresh rather than propagating it', async () => {
+    const { fetchMock } = gatewayExpecting('never-issued');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: () => {
+        throw new Error('identity platform unreachable');
+      },
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const error = (await api.getMyStats().catch((e: unknown) => e)) as ApiError;
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.code).toBe(MISSING_CREDENTIALS);
+  });
+
+  it('folds an empty-string refresh into a failed one', async () => {
+    const { fetchMock } = gatewayExpecting('never-issued');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: async () => '',
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const error = (await api.getMyStats().catch((e: unknown) => e)) as ApiError;
+    expect(error.code).toBe(MISSING_CREDENTIALS);
+  });
+
+  it('gives up rather than retrying when the refresher hands back the rejected token', async () => {
+    const { fetchMock } = gatewayExpecting('never-issued');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: async () => 'stale',
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const error = (await api.getMyStats().catch((e: unknown) => e)) as ApiError;
+    // The original 401 survives: a cache-serving refresher is a bug in the
+    // refresher, and pretending the session is gone would hide it.
+    expect(error.status).toBe(401);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries exactly once, so a gateway that refuses the user does not loop', async () => {
+    // Every token is refused. This is a suspended user row or a tenant mismatch,
+    // not an expiry, and it must surface as a 401 after one retry.
+    const fetchMock = vi.fn(async () => jsonResponse(401, { code: 'unauthorized', message: 'suspended' }));
+    let issued = 0;
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: async () => `fresh-${++issued}`,
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const error = (await api.listMyFlags().catch((e: unknown) => e)) as ApiError;
+    expect(error.status).toBe(401);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(issued).toBe(1);
+  });
+
+  it('coalesces concurrent 401s into a single refresh', async () => {
+    const { fetchMock } = gatewayExpecting('fresh');
+    let refreshes = 0;
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: async () => {
+        refreshes += 1;
+        // Yield twice so all three requests are certain to be waiting on this one.
+        await Promise.resolve();
+        await Promise.resolve();
+        return 'fresh';
+      },
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    await Promise.all([api.listMyCalls(), api.listMyFlags(), api.getMyStats()]);
+    expect(refreshes).toBe(1);
+  });
+
+  it('refreshes again on a later expiry rather than latching after the first', async () => {
+    const { fetchMock } = gatewayExpecting('fresh');
+    let refreshes = 0;
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: async () => {
+        refreshes += 1;
+        return 'fresh';
+      },
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await api.listMyCalls();
+    await api.listMyCalls();
+    // A shift is eight hours long; the in-flight coalescing must not become a
+    // once-per-client latch or the second expiry would go unhandled.
+    expect(refreshes).toBe(2);
+  });
+
+  it('never refreshes for an unauthenticated operation', async () => {
+    const unauthorised = vi.fn(async () => jsonResponse(401, { code: 'unauthorized', message: 'bad token' }));
+    const refresh = vi.fn(async () => 'fresh');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: refresh,
+      fetch: unauthorised as unknown as typeof fetch,
+    });
+    // POST /v1/devices/enroll answers 401 for a bad enrollment token, which no ID
+    // token refresh can fix.
+    const error = (await api
+      .enrollDevice({
+        enrollment_token: 'nope',
+        csr_pem: '',
+        machine_guid: 'guid',
+        hw_fingerprint: 'fp',
+        os_build: '10.0.22631',
+        capture_tier: 'A',
+        agent_version: '0.1.0',
+      })
+      .catch((e: unknown) => e)) as ApiError;
+    expect(error.status).toBe(401);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh on 403, which a new token cannot fix', async () => {
+    const forbidden = vi.fn(async () => jsonResponse(403, { code: 'forbidden', message: 'role not permitted' }));
+    const refresh = vi.fn(async () => 'fresh');
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: refresh,
+      fetch: forbidden as unknown as typeof fetch,
+    });
+    await expect(api.listFlags()).rejects.toMatchObject({ status: 403 });
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('replays the request body on the retry', async () => {
+    const bodies: unknown[] = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const auth = (init?.headers as Record<string, string> | undefined)?.['Authorization'];
+      bodies.push(JSON.parse(String(init?.body)));
+      return auth === 'Bearer fresh'
+        ? jsonResponse(200, { id: 'call-1', started_at: '', capture_tier: 'A', status: 'complete' })
+        : jsonResponse(401, { code: 'unauthorized', message: 'token expired' });
+    });
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => 'stale',
+      refreshToken: async () => 'fresh',
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    await api.confirmMyCall('call-1', { disposition: 'ptp', ptp_amount_paise: 150050 });
+    // A dropped body on the retry would silently confirm the call with no
+    // disposition — worse than failing, because it looks like it worked.
+    expect(bodies).toEqual([
+      { disposition: 'ptp', ptp_amount_paise: 150050 },
+      { disposition: 'ptp', ptp_amount_paise: 150050 },
+    ]);
+  });
+});
+
+describe('ApiClient CORS and origin handling', () => {
+  it('sends no cookies, so the gateway never needs the credentialed CORS mode', async () => {
+    let init: RequestInit | undefined;
+    const spy = vi.fn(async (_url: string | URL | Request, requestInit?: RequestInit) => {
+      init = requestInit;
+      return jsonResponse(200, { items: [] });
+    });
+    await client(spy as unknown as typeof fetch).listMyCalls();
+    expect(init?.credentials).toBe('omit');
+    expect(init?.mode).toBe('cors');
+  });
+
+  it('names the configured gateway in a transport failure so a CORS block is diagnosable', async () => {
+    // A browser cannot tell us "blocked by CORS" — it reports a bare TypeError. The
+    // only useful thing we can add is which origin we were trying to reach.
+    const blocked = vi.fn(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    const api = new ApiClient({
+      baseUrl: 'https://api.sentinel.example/',
+      getToken: () => 'tok',
+      fetch: blocked as unknown as typeof fetch,
+    });
+    const error = (await api.listTeams().catch((e: unknown) => e)) as ApiError;
+    expect(error.isTransport).toBe(true);
+    expect(error.message).toContain('https://api.sentinel.example');
+    expect(error.message).toContain('origin');
+  });
+
+  it('exposes the normalised base URL for error copy', () => {
+    const api = new ApiClient({ baseUrl: 'https://api.example//', getToken: () => 'tok' });
+    expect(api.baseUrl).toBe('https://api.example');
+  });
+
+  it('keeps a missing credential out of the transport bucket', async () => {
+    const never = vi.fn(async () => jsonResponse(200, {}));
+    const api = new ApiClient({
+      baseUrl: 'https://api.example',
+      getToken: () => null,
+      fetch: never as unknown as typeof fetch,
+    });
+    const error = (await api.listMyCalls().catch((e: unknown) => e)) as ApiError;
+    expect(error.isMissingCredentials).toBe(true);
+    // "Sign in" and "check your connection" are different instructions; a signed-out
+    // portal reported as an outage sends the user to the wrong person for help.
+    expect(error.isTransport).toBe(false);
   });
 });

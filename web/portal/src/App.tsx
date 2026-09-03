@@ -9,13 +9,28 @@ import { BankClientView } from './screens/BankClientView.js';
 import { LiveFloor } from './screens/LiveFloor.js';
 import { RuleEditor, TeamScorecards } from './screens/Stubs.js';
 import { defaultRoute, navFor } from './navigation.js';
+import { usePortalAuth } from './auth/AuthProvider.js';
 import { useSession } from './session.js';
 
 export function App() {
   const { session, loading, error, role } = useSession();
+  const { signOut } = usePortalAuth();
 
-  if (loading) return <p className="pt-boot sx-muted">Signing in…</p>;
-  if (error || !session) return <p className="pt-boot sx-error">{error ?? 'Not signed in.'}</p>;
+  // Reached only in the signed-in auth phase, so this is the gateway session
+  // handshake rather than sign-in: the credential is already in hand and
+  // POST /v1/sessions is in flight.
+  if (loading) return <p className="pt-boot sx-muted">Opening your session…</p>;
+  if (error || !session) {
+    return (
+      <div className="pt-boot">
+        <p className="sx-error">{error ?? 'Not signed in.'}</p>
+        {/* The only way out of a session the gateway will not open. Without it the
+            operator is stuck on this screen with a credential they cannot use and no
+            way to try another account. */}
+        <button onClick={() => void signOut()}>Sign out</button>
+      </div>
+    );
+  }
 
 
   return (
@@ -36,6 +51,9 @@ export function App() {
         <span className="pt-who sx-muted">
           {session.user.display_name} · {role}
         </span>
+        <button className="pt-signout" onClick={() => void signOut()}>
+          Sign out
+        </button>
       </header>
 
       <main className="pt-main">
@@ -62,8 +80,18 @@ export function App() {
 }
 
 /**
- * Client-side capability gate. This is a usability guard only — the gateway is the
- * security boundary and re-checks every request against the verified token.
+ * Client-side capability gate.
+ *
+ * **This is not authorisation.** It is a usability guard, and the only reason it is
+ * safe to rely on is that it is not relied upon: the gateway re-checks every request
+ * against the role in the verified ID token (`auth.Require`, and row-level security
+ * underneath it), so a user who edits their way past this component gains nothing but
+ * a screen full of 403s and 404s. Anyone tempted to move a security decision into this
+ * file should move it into `server/gateway/internal/auth` instead.
+ *
+ * The capability comes from `CAPABILITIES`/`can` in `@sentinel/shared`, which mirrors
+ * the Go matrix. There is deliberately no second authorisation model in the portal:
+ * one mirror can drift and be found by a test, two mirrors drift against each other.
  */
 function Guard({ capability, children }: { capability: Capability; children: ReactElement }) {
   const { can } = useSession();
