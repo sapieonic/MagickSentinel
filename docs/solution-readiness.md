@@ -19,11 +19,25 @@ them is worse than leaving them open.
 
 ## The four questions this document started from
 
-**Is there a pipeline that produces the `.exe` on changes?** Yes now, and it has never
-run. `.github/workflows/ci.yml` gained a `windows-latest` job that builds with the MSVC
-toolchain and runs the tests there, and `.github/workflows/release.yml` builds and signs
-the MSI on a tag. Both are authored and unexecuted — there is no Windows runner in the
-development container, so the first real execution will be the first tag.
+**Is there a pipeline that produces the `.exe` on changes?** Yes, and it runs.
+`.github/workflows/ci.yml` gained a `windows-latest` job that builds with the MSVC
+toolchain, runs the suite there in debug and again in release with `sqlcipher` — the
+configuration `build.ps1` ships — produces `SentinelAgent.exe` and `SentinelService.exe`,
+and gates their DLL imports. It is green.
+
+Getting it there cost five rounds and each one was a real defect, which is the argument
+for the job rather than a complaint about it: seven tests that had only ever exercised
+the development key fallback, because they ran on the one platform that does not ship; a
+link error from a static libcrypto whose two system dependencies nothing declared; a
+release-profile gate that correctly refuses a file-backed device key, taking with it the
+tests that depended on one; a `??` in a helper script that throws rather than
+coalescing under `Set-StrictMode`; and the shipping binaries importing
+`vcruntime140.dll`, which is redistributable and absent from a clean Windows 10 image —
+an MSI that installs onto a machine where the service can never start. Every one of
+those was invisible to Linux CI and none of them could have been found by reading.
+
+`.github/workflows/release.yml`, which builds and signs the MSI on a tag, is still
+authored and unexecuted. No MSI has been built and nothing has been signed.
 
 **Is there telemetry, in Grafana, over OpenTelemetry?** Yes, end to end in code. All
 three services emit OTLP and `deploy/observability/` provisions Collector, Tempo,
@@ -54,9 +68,9 @@ anger*. The repository has always been careful about this and the table keeps th
 | `server/gateway` | Runs, and now complete enough to deploy | Never run against the real client, only the shared wire fixture |
 | `server/pipeline` | Connected to Postgres, object storage and NATS | Never run against a live broker; Opus decode untested against real libopus |
 | `client/sentinel-core` | Real and tested | — |
-| `client/sentinel-capture` | Windows COM code type-checks | **Zero tests** under `src/windows/`; no hardware in the loop |
-| `client/sentinel-service` | Substantial, unit-tested | CNG and DPAPI paths have never executed |
-| `client/sentinel-agent` | Enrollment, mTLS, uplink, widget | Same: the Windows halves are unverified |
+| `client/sentinel-capture` | Compiles and links on Windows in CI | **Zero tests** under `src/windows/`; the COM paths still run nowhere |
+| `client/sentinel-service` | Suite passes on Windows, debug and release | CNG and DPAPI still execute nowhere — the tests inject a stub key |
+| `client/sentinel-agent` | Enrollment, mTLS, uplink, widget; builds and links | Same: the `cfg(windows)` halves are compiled, not exercised |
 | `client/installer` | Full WiX package | No MSI has ever been built or signed |
 | `web/` | Three workspaces, real sign-in | No DOM tests; the suite is deliberately pure-logic |
 | `.github/`, `deploy/` | Authored | No image built, no stack stood up, no release produced |
@@ -68,13 +82,20 @@ anger*. The repository has always been careful about this and the table keeps th
 These are ordered by dependency, not by size. Items 1 and 2 are the ones that decide
 whether a floor can run at all.
 
-**1. Nothing has executed on Windows.** This is now the single largest risk in the
-project, and it has grown rather than shrunk, because more Windows-only code exists than
-before: CNG key generation, DPAPI machine-scope unwrapping, the COM capture paths, the
-MSI, and the tier gate. All of it compiles for the target. None of it has run. The
-Windows CI job will tell us something the first time it runs; hardware-in-the-loop
-testing on a real headset will tell us the rest, and there is currently no test at all
-under `client/**/src/windows/`.
+**1. The Windows-only behaviour still executes nowhere.** This remains the single
+largest risk, and it is worth being exact about what the green Windows job did and did
+not buy, because the distinction is easy to lose. It proved the code compiles and
+*links* for MSVC, that the platform-neutral suite passes on Windows in both profiles,
+that both binaries build, and that they import nothing a clean Windows 10 image lacks.
+That is more than the repository had and it is not the same as the Windows-only code
+working.
+
+What still runs nowhere: the COM capture implementations, because there is no test at
+all under `client/**/src/windows/`; CNG key generation and signing, because the
+credential tests deliberately inject a stub key rather than touch the machine keystore;
+and DPAPI machine-scope wrapping. All of it is now compiled, linked and shipped into
+binaries CI produces — none of it has been observed doing its job. Hardware-in-the-loop
+on a real headset, and a machine that actually enrolls, is what closes this.
 
 **2. The client and the gateway have never spoken to each other.** They agree on the
 wire fixture, which is why the codecs cannot drift silently, and that is not the same as

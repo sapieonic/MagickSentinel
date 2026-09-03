@@ -72,13 +72,19 @@ sources for the target rather than only type-checking Rust. Add `--all-targets` 
 the test targets too. This catches signature and feature-flag breakage in code that no
 test exercises; it does not tell you the code works.
 
-There is now a `rust-windows` job in `.github/workflows/ci.yml` that runs the suite on
-`windows-latest` under MSVC and builds the release configuration with
-`--features sentinel-core/sqlcipher`, which is the first thing anywhere that would
-execute the `PRAGMA key` path. **That job has never run.** It is authored and not
-verified, so it does not yet change what the paragraph above says: there are still zero
-tests under `client/**/src/windows/`, and no hardware-in-the-loop test has been executed
-against a real audio endpoint.
+The `rust-windows` job in `.github/workflows/ci.yml` runs the suite on `windows-latest`
+under MSVC, then runs it again in the release configuration with
+`--features sentinel-core/sqlcipher` — the first thing anywhere that executes the
+`PRAGMA key` path — builds `SentinelAgent.exe` and `SentinelService.exe`, and asserts
+they import no DLL a clean Windows 10 image lacks. **It is green.**
+
+Be precise about what that does and does not establish. It establishes that the code
+compiles and *links* for MSVC, that the platform-neutral suite passes on Windows in both
+profiles, and that the shipping binaries build with no stray runtime dependency. It does
+not establish that the Windows-only code works: there are still zero tests under
+`client/**/src/windows/`, the credential tests inject a stub device key rather than
+touching CNG, and no hardware-in-the-loop test has run against a real audio endpoint. A
+hosted runner has no audio endpoint and no softphone, so it never will.
 
 ```
 bash db/test/rls_test.sh
@@ -178,9 +184,11 @@ drop `continue-on-error` from that step once a `cargo fmt` pass has landed.
 clean — `cargo clippy --all-targets` from `client/` reports zero warnings — so the flag
 can be added to the Linux job today, and the comment in `.github/workflows/ci.yml` that
 says the tree "currently has two clippy warnings" is out of date. The MSVC job in the same
-workflow lints the `cfg(windows)` modules that Linux clippy cannot see, and since that job
-has never run, its warning count is unknown. Add the flag to the Linux job first rather
-than to both at once.
+workflow lints the `cfg(windows)` modules that Linux clippy cannot see; that job now runs,
+so its count is observable in the log rather than unknown. The Linux job already gates on
+`-D warnings`. Take the MSVC gate in its own commit, once a run has reported a count and
+it has been cleared, so a first failure there is about a change rather than about
+pre-existing lint debt.
 
 ## What state each component is in
 
@@ -223,11 +231,11 @@ the WAV replay source, VAD, the stateful resampler, container-ID device matching
 classification, foreign-audio suppression) are implemented and tested. The Windows COM
 implementations — tier A process loopback, tier B endpoint loopback, softphone session
 tracking, device-change notification, OS build detection from the registry — are written
-and type-check for the Windows target, but nothing exercises them. A Windows CI job now
-exists in `.github/workflows/ci.yml` and has never run; even when it does, it compiles and
-lints this code rather than exercising a single line of WASAPI, because a hosted runner
-has no audio endpoint and no softphone. There is still no hardware-in-the-loop test, so
-treat these modules as unverified rather than as working.
+and type-check for the Windows target, but nothing exercises them. The Windows CI job in
+`.github/workflows/ci.yml` now runs and is green, which means this code compiles, links
+and ships inside the binaries CI produces — it still does not exercise a single line of
+WASAPI, because a hosted runner has no audio endpoint and no softphone. There is no
+hardware-in-the-loop test, so treat these modules as unverified rather than as working.
 
 **`client/sentinel-service`** — substantial and unit-tested: the service control-manager
 entry point, the named-pipe host and its length-prefixed JSON codec, the agent
@@ -265,10 +273,19 @@ it is stale.
 **`client/installer`** — a full WiX v4 package: `Sentinel.wxs`, `Sentinel.wixproj` and
 `build.ps1`, which builds both binaries for `x86_64-pc-windows-msvc` with
 `--features sentinel-core/sqlcipher`, signs them, builds the MSI and signs that.
-`.github/workflows/release.yml` runs the same order on a tag. **Nothing here has been
-executed.** No PowerShell script in this repository has been run, no MSI has been built,
-nothing has been signed, and no release has been produced. Treat the packaging as
-authored rather than as working.
+`.github/workflows/release.yml` runs the same order on a tag.
+
+**`build.ps1` has still never been executed, no MSI has been built, nothing has been
+signed, and no release has been produced.** Treat the packaging as authored rather than
+as working.
+
+Two narrower things are no longer true, since this section used to claim no PowerShell
+here had ever run. `.github/scripts/assert-no-stray-dll-deps.ps1` runs on every Windows
+CI job, and it earned its place immediately: it caught the shipping binaries importing
+`vcruntime140.dll` before any tag existed. And every `.ps1` in the repository now parses
+— which sounds like nothing until you know that the first execution of that gate failed
+on a `??` that throws instead of coalescing under `Set-StrictMode`, a bug no amount of
+reading had found.
 
 **`server/gateway`** — a working service. It verifies Identity Platform ID tokens
 against Google's JWKS, cross-checks the device certificate's tenant against the token's,

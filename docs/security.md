@@ -34,10 +34,19 @@ a three-part semver tag, refuses a four-part version (the MSI ignores the fourth
 when deciding upgrades, so a four-part version silently breaks fleet upgrades), and
 refuses to publish an unsigned MSI as a release.
 
-None of that has run. No MSI has been built, no binary has been signed, no release has
-been produced, and no PowerShell script in this repository has been executed by anything.
-A reviewer should read this section as authored intent with the mechanics visible for
-inspection, not as a control that has been demonstrated.
+None of the signing has run. No MSI has been built, no binary has been signed, and no
+release has been produced. A reviewer should read the signing chain as authored intent
+with the mechanics visible for inspection, not as a control that has been demonstrated.
+
+One adjacent control *is* demonstrated, and it belongs here because it is a
+supply-chain property rather than a build convenience:
+`.github/scripts/assert-no-stray-dll-deps.ps1` runs on every Windows CI job and fails
+the build when the shipping binaries import a DLL the package does not carry. It has
+already fired in earnest, on `vcruntime140.dll` — a redistributable absent from a clean
+Windows 10 image, which would have produced an MSI that installs onto machines where
+the service can never start. The binaries now link the MSVC runtime and OpenSSL
+statically, so there is no third-party DLL beside the two EV-signed executables for EDR
+to object to or for an attacker to plant.
 
 Two things still to line up: obtaining the EV certificate itself, which involves an
 identity verification process with a lead time of its own, and deciding where signing
