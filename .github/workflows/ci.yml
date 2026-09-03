@@ -242,6 +242,26 @@ jobs:
             Write-Host ("{0}  {1} bytes" -f $exe, (Get-Item $p).Length)
           }
 
+      # The check that makes the sqlcipher build honest, and it belongs on every pull
+      # request rather than only on a tag.
+      #
+      # Sentinel.wxs packages two executables and a widget.html. If either executable
+      # imports a DLL that is not part of Windows, the MSI installs cleanly, registers
+      # the service, and leaves a machine where the binary cannot start — install
+      # reported success, fleet view says covered, nothing ever captured.
+      #
+      # `libsqlite3-sys/bundled-sqlcipher` emits `rustc-link-lib=dylib=libcrypto`, and
+      # whether that becomes a `libcrypto-3-x64.dll` dependency depends only on which
+      # kind of `libcrypto.lib` was on the link line. Both builds succeed identically.
+      # This is the only thing that tells them apart.
+      - name: Assert no stray DLL dependencies
+        shell: pwsh
+        run: |
+          $bin = "client\target\x86_64-pc-windows-msvc\release"
+          .\.github\scripts\assert-no-stray-dll-deps.ps1 `
+            (Join-Path $bin "SentinelAgent.exe") `
+            (Join-Path $bin "SentinelService.exe")
+
       # Unsigned, and therefore not shippable — this is a smoke-test artefact for
       # someone who wants to reproduce a Windows-only bug without a Windows box,
       # not a release. The release workflow is the only thing that produces a

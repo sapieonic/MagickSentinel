@@ -242,8 +242,16 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
+      # completed_successfully, not service_healthy: minio-init is a one-shot that
+      # creates the bucket and the application credential. The gateway's readiness probe
+      # checks the object store, so starting before the bucket exists means a container
+      # that reports unhealthy for its whole start period for a reason that looks like a
+      # gateway fault.
+      minio-init:
+        condition: service_completed_successfully
     environment:
       SENTINEL_ADDR: ":8080"
+      SENTINEL_ENV: ${SENTINEL_ENVIRONMENT:-local}
       # Connects as sentinel_app, which is NOBYPASSRLS. This is the whole tenant
       # isolation design: the application does not filter by tenant, PostgreSQL does,
       # and it can only do that against a role that cannot bypass it. Never point this
@@ -253,17 +261,44 @@ services:
       # Sets the expected issuer and audience for Identity Platform ID tokens. Any
       # string works until there is a real project; it is not a credential.
       SENTINEL_GCP_PROJECT: ${SENTINEL_GCP_PROJECT:-sentinel-local}
-      # Required by main.go until the S3 adapter exists. This is where borrower call
-      # audio is written today.
-      SENTINEL_BLOB_DIR: /var/lib/sentinel/blobs
-      SENTINEL_NATS_URL: nats://${NATS_GATEWAY_USER:?}:${NATS_GATEWAY_PASSWORD:?}@nats:4222
-      # OTEL_EXPORTER_OTLP_ENDPOINT is deliberately ABSENT here. The instrumentation
-      # keeps export off by default so a collector-less deploy still runs, and this
-      # stack has no collector. Layering
-      # deploy/observability/compose.yaml sets it. Setting it here would make every
-      # `up` of the base stack log export failures every few seconds.
-    volumes:
-      - gateway-blobs:/var/lib/sentinel/blobs
+
+      # ---- object storage: MinIO through the real S3 adapter ----
+      # `openObjectStore` prefers S3 when SENTINEL_S3_BUCKET is set and falls back to
+      # the filesystem backend when only SENTINEL_BLOB_DIR is. Using S3 here rather
+      # than the filesystem stand-in is deliberate: the S3 path is what production
+      # runs, and a local stack that exercises the other one is a local stack that
+      # cannot reproduce a blob bug.
+      SENTINEL_S3_ENDPOINT: http://minio:9000
+      SENTINEL_S3_BUCKET: ${SENTINEL_S3_BUCKET:-sentinel-audio}
+      SENTINEL_S3_REGION: ${SENTINEL_S3_REGION:-ap-south-1}
+      SENTINEL_S3_ACCESS_KEY_ID: ${SENTINEL_S3_ACCESS_KEY:?}
+      SENTINEL_S3_SECRET_ACCESS_KEY: ${SENTINEL_S3_SECRET_KEY:?}
+      # SENTINEL_S3_SSE and SENTINEL_S3_KMS_KEY_ID are deliberately unset. MinIO here
+      # has no KMS, and more importantly the key that would encrypt borrower audio at
+      # rest in production has a residency of its own — OPEN-4 — so a default set in a
+      # local compose file would be a decision made in the wrong place. Production must
+      # set them.
+
+      # ---- NATS ----
+      SENTINEL_NATS_SERVERS: nats://nats:4222
+      SENTINEL_NATS_USER: ${NATS_GATEWAY_USER:?}
+      SENTINEL_NATS_PASSWORD: ${NATS_GATEWAY_PASSWORD:?}
+      # Without a NATS URL the gateway logs that finalize messages will queue in
+      # Postgres and carries on, which is the right degradation and not what we want to
+      # be exercising locally.
+
+      # ---- CORS ----
+      # Empty locally. The gateway validates this before use and rejects '*' outright,
+      # because a wildcard on an API that serves borrower call summaries to a browser
+      # is a cross-origin read of every tenant the caller's token can see.
+      SENTINEL_ALLOWED_ORIGINS: ${SENTINEL_ALLOWED_ORIGINS:-}
+
+      # SENTINEL_OTEL_ENABLED and OTEL_EXPORTER_OTLP_ENDPOINT are deliberately ABSENT.
+      # The instrumentation keeps export off by default so a collector-less deploy still
+      # runs, and this stack has no collector. Layering
+      # deploy/observability/compose.yaml sets both. Setting them here would make every
+      # `up` of the base stack log export failures every few seconds, which teaches
+      # people to ignore the logs of the service whose logs matter most.
     ports:
       - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
     # No TLS in this stack: SENTINEL_TLS_CERT is unset, so main.go serves plaintext.
@@ -280,63 +315,113 @@ services:
     read_only: true
 
   # ================================================================== pipeline =====
-  pipeline:
+  #
+  # The image's ENTRYPOINT is the repository's own `sentinel-pipeline` console script
+  # (server/pipeline/sentinel_pipeline/__main__.py), which is what pyproject.toml says a
+  # container entrypoint should call. The default CMD is `consume`; `retention` and
+  # `coverage` below run the same image with a different subcommand.
+  pipeline: &pipeline
     build:
       context: ..
       dockerfile: deploy/containers/pipeline.Dockerfile
       args:
-        # Must include the SDK for the configured SENTINEL_ASR_PROVIDER. Default
-        # `google` matches providers/registry.py's DEFAULT_BATCH_ASR. If OPEN-4's
-        # residency answer is India-only in the strict sense, build with
-        # PIPELINE_EXTRAS=sarvam and set SENTINEL_ASR_PROVIDER=sarvam — the Gemini
+        # Must include the SDK for the configured SENTINEL_ASR_PROVIDER, plus `opus` for
+        # decoding stored segments. Default `google,opus` matches
+        # providers/registry.py's default batch provider.
+        #
+        # If OPEN-4's residency answer is India-only in the strict sense, build with
+        # PIPELINE_EXTRAS=sarvam,opus and set SENTINEL_ASR_PROVIDER=sarvam: the Gemini
         # endpoint is global, so the default sends borrower audio out of India.
-        PIPELINE_EXTRAS: ${PIPELINE_EXTRAS:-google}
+        PIPELINE_EXTRAS: ${PIPELINE_EXTRAS:-google,opus}
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_healthy
-      minio:
-        condition: service_healthy
-    environment:
-      # selftest: validate the ASR provider/language selection, prove every dependency
-      # is reachable and correctly credentialled, then hold. It does NOT process calls,
-      # because nothing in the repository implements worker.py's SegmentSource/Sink
-      # Protocols yet. `consume` is the seam for when one does.
-      SENTINEL_PIPELINE_MODE: ${SENTINEL_PIPELINE_MODE:-selftest}
-      # Local convenience only: creates the SENTINEL stream if it is absent. In a real
-      # deployment the stream's retention and replica count are capacity decisions and
-      # must not be made by whichever worker image starts first.
-      SENTINEL_PIPELINE_CREATE_STREAM: "1"
-      # sentinel_pipeline, also NOBYPASSRLS. The entrypoint refuses to start if the
-      # role it connected as has BYPASSRLS, because such a worker returns every
-      # tenant's rows for every query and nothing reports an error.
-      SENTINEL_DATABASE_URL: postgres://sentinel_pipeline:${SENTINEL_PIPELINE_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}?sslmode=disable
-      SENTINEL_NATS_URL: nats://nats:4222
+      minio-init:
+        condition: service_completed_successfully
+    environment: &pipeline-env
+      # sentinel_pipeline, NOBYPASSRLS. `sentinel-pipeline check` calls
+      # `db.assert_rls_enforced()` and refuses to start if the connecting role can
+      # bypass row-level security, because such a worker returns every tenant's rows for
+      # every query and nothing anywhere reports an error.
+      SENTINEL_PIPELINE_DATABASE_URL: postgres://sentinel_pipeline:${SENTINEL_PIPELINE_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}?sslmode=disable
+
+      SENTINEL_NATS_SERVERS: nats://nats:4222
       SENTINEL_NATS_USER: ${NATS_PIPELINE_USER:?}
       SENTINEL_NATS_PASSWORD: ${NATS_PIPELINE_PASSWORD:?}
+      # No TLS on the local broker, so the client has to be told that plaintext is
+      # intended rather than accidental. Deliberately an explicit opt-in: on a floor
+      # network the credentials above go over the wire on connect, and a client that
+      # silently accepted plaintext would make that invisible.
+      SENTINEL_NATS_ALLOW_INSECURE: "1"
+
       SENTINEL_S3_ENDPOINT: http://minio:9000
       SENTINEL_S3_BUCKET: ${SENTINEL_S3_BUCKET:-sentinel-audio}
       SENTINEL_S3_REGION: ${SENTINEL_S3_REGION:-ap-south-1}
+      # boto3 reads the credential from the standard AWS variables.
       AWS_ACCESS_KEY_ID: ${SENTINEL_S3_ACCESS_KEY:?}
       AWS_SECRET_ACCESS_KEY: ${SENTINEL_S3_SECRET_KEY:?}
-      # The ASR selection. `registry.validate` raises on a language the chosen provider
-      # cannot read, and the entrypoint calls it before touching anything else — which
-      # is the point: the default provider has no Tamil at all, and a Tamil floor
-      # pointed at it would not fail. It would transcribe Tamil audio as something else
+
+      # The ASR selection, and the most important startup gate in the stack.
+      # `registry.validate` raises on a language the chosen provider cannot read, and
+      # `sentinel-pipeline check` runs it before anything else. The reason is in
+      # AGENTS.md: the default batch provider has no Tamil at all, and a Tamil floor
+      # pointed at it would not fail — it would transcribe Tamil audio as something else
       # and hand a bank a clean-looking transcript with no compliance flags on it.
       SENTINEL_ASR_PROVIDER: ${SENTINEL_ASR_PROVIDER:-}
       SENTINEL_ASR_LANGUAGES: ${SENTINEL_ASR_LANGUAGES:-hi-IN,en-IN}
       SENTINEL_ASR_ROUTES: ${SENTINEL_ASR_ROUTES:-}
       SENTINEL_GOOGLE_API_KEY: ${SENTINEL_GOOGLE_API_KEY:-}
       SENTINEL_SARVAM_API_KEY: ${SENTINEL_SARVAM_API_KEY:-}
+      SENTINEL_ANTHROPIC_API_KEY: ${SENTINEL_ANTHROPIC_API_KEY:-}
+      SENTINEL_OPENAI_API_KEY: ${SENTINEL_OPENAI_API_KEY:-}
       SENTINEL_LOG_LEVEL: ${SENTINEL_LOG_LEVEL:-INFO}
-      # OTEL_EXPORTER_OTLP_ENDPOINT deliberately absent; see the gateway service.
+      # SENTINEL_OTEL_ENABLED and OTEL_EXPORTER_OTLP_ENDPOINT deliberately absent; see
+      # the gateway service.
     security_opt:
       - no-new-privileges:true
     read_only: true
     tmpfs:
-      # The liveness file the healthcheck stats. In /tmp specifically so the root
-      # filesystem can stay read-only — see the Dockerfile.
+      # Python writes nothing outside /tmp here (PYTHONDONTWRITEBYTECODE is set in the
+      # image), so the root filesystem can stay read-only. Cheap hardening for a process
+      # that holds provider API keys with real spend attached.
       - /tmp
+
+  # ---------------------------------------------------------------- scheduled jobs
+  #
+  # Two one-shot subcommands of the same image, in the `tools` profile so `up` does not
+  # start them. In a real deployment they are cron entries or Kubernetes CronJobs.
+  #
+  #   docker compose -f deploy/compose.yaml run --rm retention
+  #   docker compose -f deploy/compose.yaml run --rm coverage
+  #
+  # The YAML anchor above shares the whole environment block, because a retention job
+  # configured differently from the consumer is a retention job deleting against
+  # different assumptions than the one that wrote the data.
+  retention:
+    <<: *pipeline
+    profiles: ["tools"]
+    restart: "no"
+    # NO --commit, deliberately. `sentinel-pipeline retention` is a dry run unless told
+    # otherwise, and this file is not the place to say otherwise: the job's failure mode
+    # is deleting the wrong borrower data, its retention periods are OPEN-6 placeholders
+    # that "have never been checked against a real requirement", and the module has no
+    # test coverage at all. Run it, read what it says it would remove, and pass --commit
+    # yourself when you believe it.
+    command: ["retention"]
+
+  coverage:
+    <<: *pipeline
+    profiles: ["tools"]
+    restart: "no"
+    # Reconciles captured calls against the dialer's CDR. Exits non-zero when a tenant's
+    # CDR export was missing, so a cron that ignores stdout still notices — which
+    # matters, because a coverage figure computed from a partial CDR is worse than no
+    # figure: it reads as good coverage.
+    #
+    # Blocked on OPEN-7 in practice: no CDR export format is agreed, so
+    # SENTINEL_CDR_ADAPTER is unset and this reports that there is nothing to reconcile
+    # against.
+    command: ["coverage"]

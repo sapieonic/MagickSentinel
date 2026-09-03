@@ -252,32 +252,57 @@ services:
   #
   # This is where OTEL_EXPORTER_OTLP_ENDPOINT is set and nowhere else, which is what
   # makes "no collector" a supported configuration rather than a broken one.
+  #
+  # PORT 4318, NOT 4317, and protocol http/protobuf. Both emitters speak OTLP over
+  # HTTP: the gateway builds its exporter with `otlptracehttp`
+  # (server/gateway/internal/telemetry/telemetry.go), and the Python side defaults to
+  # `http/protobuf` and only carries the gRPC exporter behind the optional `otlp-grpc`
+  # extra, which the image does not install. Pointing these at 4317 would produce two
+  # services retrying HTTP requests against a gRPC listener.
   gateway:
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      # The gateway's own switch. Its telemetry setup is a no-op unless this is set —
+      # which is the property that makes a collector-less deployment a supported
+      # configuration rather than a broken one.
+      SENTINEL_OTEL_ENABLED: "1"
+      # Plaintext to an in-network collector. Explicit rather than implied: on a real
+      # deployment the collector is reachable from a floor network and this must be off.
+      SENTINEL_OTEL_INSECURE: "1"
+      SENTINEL_OTEL_SAMPLE_RATIO: "1.0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       # The service.name the collector, the datasources and every alert rule are
       # provisioned for. It must be exactly this: `sentinel_gateway`, `gateway` or
-      # `sentinel-gateway-prod` all produce a stack that ingests happily and shows
+      # `sentinel-gateway-prod` all produce a stack that ingests happily and displays
       # nothing, because every query filters on the name.
       OTEL_SERVICE_NAME: sentinel-gateway
       OTEL_RESOURCE_ATTRIBUTES: service.namespace=sentinel,deployment.environment=${SENTINEL_ENVIRONMENT:-local},region=ap-south-1
-      # Traces: sample everything locally. On a production floor this becomes a
-      # parent-based ratio — but note that head sampling and the ingest-lag exemplars
-      # interact badly, because a sampled-out trace produces an exemplar pointing at a
-      # trace that was never stored, and the "View trace" link 404s. Tail sampling in
-      # the collector is the answer there, not a lower head ratio.
-      OTEL_TRACES_SAMPLER: parentbased_always_on
-      OTEL_METRIC_EXPORT_INTERVAL: "15000"
 
   pipeline:
-    environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+    environment: &otel-pipeline-env
+      SENTINEL_OTEL_ENABLED: "1"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_SERVICE_NAME: sentinel-pipeline
       OTEL_RESOURCE_ATTRIBUTES: service.namespace=sentinel,deployment.environment=${SENTINEL_ENVIRONMENT:-local},region=ap-south-1
-      OTEL_TRACES_SAMPLER: parentbased_always_on
-      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+      SENTINEL_OTEL_EXPORT_INTERVAL_MS: "15000"
+
+  # The two scheduled jobs emit under the same service.name as the consumer. They are
+  # the same code doing the same tenant's work, and splitting them into
+  # `sentinel-retention` and `sentinel-coverage` would mean three more absent-telemetry
+  # alerts for services that are supposed to be absent most of the time — a
+  # short-lived job is indistinguishable from a dead one to an `absent()` rule.
+  # They are distinguishable in a query by span name.
+  retention:
+    environment: *otel-pipeline-env
+  coverage:
+    environment: *otel-pipeline-env
+
+  # A note on head sampling, because SENTINEL_OTEL_SAMPLE_RATIO above is 1.0 and will be
+  # lowered for a real floor: head sampling and the ingest-lag exemplars interact badly.
+  # A sampled-out trace still produces an exemplar on the histogram, pointing at a trace
+  # that was never stored, so the "View trace" link on the dashboard 404s — and it does
+  # so exactly on the slow requests someone is investigating. Tail sampling in the
+  # collector is the answer, not a lower head ratio.
 
   # The third emitter, sentinel-agent, is NOT here and cannot be: it runs on an agent's
   # Windows desktop on a collections floor, not in this compose project. Its

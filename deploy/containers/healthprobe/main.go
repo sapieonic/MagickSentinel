@@ -12,12 +12,12 @@
 // and no HTTP client there is nothing to run. The usual workarounds are all worse
 // than this file:
 //
-//   * Switch the base to alpine so busybox wget is available. That adds a shell to a
+//   - Switch the base to alpine so busybox wget is available. That adds a shell to a
 //     production image for the sole benefit of the orchestrator, which is a poor
 //     trade — and the shell is the first thing a security reviewer asks about.
-//   * Drop HEALTHCHECK and rely on the orchestrator's own probe. Fine on Kubernetes,
+//   - Drop HEALTHCHECK and rely on the orchestrator's own probe. Fine on Kubernetes,
 //     useless with `docker compose`, which is the local/dev stack this repository has.
-//   * Have the gateway probe itself with a `-healthcheck` flag. That means editing
+//   - Have the gateway probe itself with a `-healthcheck` flag. That means editing
 //     server/gateway, which this work stream does not own.
 //
 // So: a few hundred lines of standard library, compiled in the same builder stage

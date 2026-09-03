@@ -539,6 +539,18 @@ jobs:
           "msi-sha256=$hash" | Out-File $env:GITHUB_OUTPUT -Append
           Write-Host "SHA-256  $hash  $([IO.Path]::GetFileName($final))"
 
+      # The same check ci.yml runs on every pull request, repeated here against the
+      # artefact that is actually about to be signed and shipped. Cheap, and the
+      # failure it prevents — an MSI that installs cleanly onto machines whose binaries
+      # cannot start — is not recoverable once a deployment wave has gone out.
+      - name: Assert no stray DLL dependencies in the shipped binaries
+        shell: pwsh
+        run: |
+          $bin = "client\target\x86_64-pc-windows-msvc\release"
+          .\.github\scripts\assert-no-stray-dll-deps.ps1 `
+            (Join-Path $bin "SentinelAgent.exe") `
+            (Join-Path $bin "SentinelService.exe")
+
       # ------------------------------------------------------------- provenance/SBOM
       - name: Software bill of materials
         shell: pwsh
@@ -550,21 +562,44 @@ jobs:
           # and reports two components, which is true and useless. The dependency
           # graph is what a security reviewer actually asks for, and Cargo.lock is
           # where it lives.
+          #
+          # The invocation is wrapped because cargo-cyclonedx's flags have moved
+          # between releases and a flag rename should not fail a release on its own.
+          # What must NOT be tolerated is shipping with no SBOM at all, so the
+          # existence check below is a hard gate even though the invocation is not.
           cargo install --locked cargo-cyclonedx
           Push-Location client
           try {
             cargo cyclonedx --format json --all --target x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "cargo cyclonedx --all failed; retrying without the target filter"
+              cargo cyclonedx --format json --all
+            }
+          } catch {
+            Write-Warning "cargo-cyclonedx invocation failed: $_"
           } finally { Pop-Location }
-          Get-ChildItem -Path client -Recurse -Filter "*.cdx.json" |
-            ForEach-Object { Copy-Item $_.FullName (Join-Path $out ("sbom-rust-" + $_.Name)) }
 
-          # The widget bundle's npm graph. `npm sbom` is built in, so there is no extra
-          # tool to trust here.
+          $rustSboms = @(Get-ChildItem -Path client -Recurse -Filter "*.cdx.json" -ErrorAction SilentlyContinue)
+          foreach ($f in $rustSboms) { Copy-Item $f.FullName (Join-Path $out ("sbom-rust-" + $f.Name)) }
+
+          # The widget bundle's npm graph. `npm sbom` is built into npm 10, so there is
+          # no extra tool to trust — which matters for a document whose purpose is
+          # telling a bank's reviewer what is in the package.
           Push-Location web
           try {
             npm sbom --sbom-format cyclonedx --omit dev |
               Set-Content -Path (Join-Path $out "sbom-web-widget.cdx.json") -Encoding utf8
           } finally { Pop-Location }
+
+          # The hard gate. An SBOM is part of what installer/README.md asks to be
+          # recorded per release, and "the tool changed its flags" is a reason to fix
+          # the invocation, not a reason to hand a bank an artefact with no bill of
+          # materials.
+          $produced = @(Get-ChildItem -Path $out -Filter "sbom-*.json" -ErrorAction SilentlyContinue)
+          if ($produced.Count -lt 2) {
+            throw "Expected at least a Rust and an npm SBOM in $out; found $($produced.Count). Fix the SBOM step rather than releasing without one."
+          }
+          $produced | ForEach-Object { Write-Host ("sbom: {0} ({1} bytes)" -f $_.Name, $_.Length) }
 
       - name: Payload manifest (the release record)
         shell: pwsh
