@@ -345,6 +345,124 @@ fn looks_like_certificate_pem(pem: &str) -> bool {
     pem.contains("-----BEGIN CERTIFICATE-----") && pem.contains("-----END CERTIFICATE-----")
 }
 
+/// What [`ensure_enrolled`] did, or refused to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    /// A valid certificate is already on disk, comfortably inside its lifetime.
+    AlreadyEnrolled { device_id: String, not_after: String },
+    /// First enrollment, or a renewal, succeeded.
+    Enrolled { device_id: String, not_after: String, renewed: bool, key_kind: KeyKind },
+    /// This machine has no identity and no token to get one with. The normal state of
+    /// a machine installed without `ENROLLMENTTOKEN`, and the reason capture will not
+    /// start on it.
+    NotEnrolledNoToken,
+    /// The certificate is inside its renewal window and no fresh token has been
+    /// dropped in. Nothing the client can do: minting a token needs the `manage_fleet`
+    /// capability, deliberately, because a device that could re-certify itself forever
+    /// is a device revocation cannot stop. The gateway already knows every device's
+    /// `not_after` from `RegisterDevice`, so the alerting lives there.
+    RenewalBlockedNoToken { not_after: String },
+    /// The exchange was attempted and failed. The previous credential, if there was
+    /// one, is untouched and still valid until it expires.
+    Failed(String),
+}
+
+/// Parse the stored `not_after` into epoch milliseconds.
+///
+/// `None` for anything unparseable, which [`crate::device::needs_renewal`] treats as
+/// "renew" rather than as "valid forever" — the safe direction, because the failure
+/// then costs a renewal attempt rather than a fleet of expired certificates.
+pub fn not_after_ms(not_after: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(not_after.trim(), &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+/// Bring this machine's device credential up to date.
+///
+/// Called by the service at start-up. It is the only orchestration point for
+/// enrollment and renewal, and it is platform-neutral so the decision table is tested
+/// rather than observed once on a VM:
+///
+/// | On disk | Token | Outcome |
+/// |---|---|---|
+/// | nothing | none | [`EnsureOutcome::NotEnrolledNoToken`] |
+/// | nothing | present | enroll |
+/// | current certificate | either | [`EnsureOutcome::AlreadyEnrolled`] |
+/// | inside the 30-day window | none | [`EnsureOutcome::RenewalBlockedNoToken`] |
+/// | inside the 30-day window | present | renew |
+///
+/// Renewal is re-enrollment. There is no renewal endpoint in
+/// `contracts/openapi.yaml` and this does not invent one: it sends the same
+/// `POST /v1/devices/enroll` with a fresh single-use token, and because the CSR is
+/// built against the **same** key
+/// ([`crate::devicekey::KEY_NAME`] is stable) the machine keeps one identity across
+/// renewals. A renewal that fails leaves the old certificate in place — it is still
+/// valid, that is what a 30-day window is for.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_enrolled(
+    dir: &Path,
+    api_base: &str,
+    facts: &MachineFacts,
+    now_ms: i64,
+    token: Option<&str>,
+    key: &dyn DeviceKey,
+    transport: &dyn EnrollTransport,
+    key_wrapper: &dyn spoolkey::KeyWrapper,
+) -> EnsureOutcome {
+    let identity = crate::device::load_identity(dir).ok().flatten();
+    let expiry = identity.as_ref().and_then(|i| not_after_ms(&i.not_after));
+    let token = token.map(str::trim).filter(|t| !t.is_empty());
+
+    let decision = renewal_decision(identity.as_ref(), expiry, now_ms, token.is_some());
+    let renewing = match decision {
+        RenewalDecision::Current => {
+            let id = identity.expect("Current implies an identity");
+            return EnsureOutcome::AlreadyEnrolled {
+                device_id: id.device_id,
+                not_after: id.not_after,
+            };
+        }
+        RenewalDecision::NotEnrolled if token.is_none() => {
+            return EnsureOutcome::NotEnrolledNoToken
+        }
+        RenewalDecision::RenewBlockedNoToken => {
+            let id = identity.expect("RenewBlockedNoToken implies an identity");
+            tracing::warn!(
+                target: crate::telemetry::TARGET,
+                event = "device.renewal_blocked",
+                device_id = %id.device_id,
+                not_after = %id.not_after,
+                "the device certificate is inside its renewal window and no enrollment \
+                 token is available; an operator must mint one"
+            );
+            return EnsureOutcome::RenewalBlockedNoToken { not_after: id.not_after };
+        }
+        RenewalDecision::NotEnrolled => false,
+        RenewalDecision::RenewNow => true,
+    };
+
+    let token = token.expect("both remaining branches require a token");
+    match enroll(api_base, token, facts, key, transport, key_wrapper, dir) {
+        Ok(out) => EnsureOutcome::Enrolled {
+            device_id: out.identity.device_id,
+            not_after: out.identity.not_after,
+            renewed: renewing,
+            key_kind: out.key_kind,
+        },
+        Err(e) => {
+            tracing::error!(
+                target: crate::telemetry::TARGET,
+                event = "enroll.failed",
+                renewing,
+                error = %e,
+                "device enrollment failed"
+            );
+            EnsureOutcome::Failed(e.to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +709,170 @@ mod tests {
         clear_renewal_token(dir.path()).unwrap();
         clear_renewal_token(dir.path()).unwrap();
         assert_eq!(read_renewal_token(dir.path()), None);
+    }
+
+    fn transport_ok() -> FakeTransport {
+        FakeTransport::ok()
+    }
+
+    #[test]
+    fn an_unenrolled_machine_with_no_token_does_nothing_and_says_so() {
+        // The normal state of a machine installed without ENROLLMENTTOKEN, and the
+        // reason capture will not start on it.
+        let dir = tempfile::tempdir().unwrap();
+        let key = SoftwareDeviceKey::generate(dir.path()).unwrap();
+        let t = transport_ok();
+        assert_eq!(
+            ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, None),
+            EnsureOutcome::NotEnrolledNoToken
+        );
+        assert!(t.seen.borrow().is_empty(), "no token means no round trip");
+    }
+
+    /// Argument order shim so the tests read in the order a human thinks about it.
+    fn ensure_enrolled(
+        api_base: &str,
+        facts: &MachineFacts,
+        key: &dyn crate::devicekey::DeviceKey,
+        transport: &dyn EnrollTransport,
+        dir: &Path,
+        now_ms: i64,
+        token: Option<&str>,
+    ) -> EnsureOutcome {
+        super::ensure_enrolled(dir, api_base, facts, now_ms, token, key, transport, &Reversing)
+    }
+
+    #[test]
+    fn a_token_on_an_unenrolled_machine_enrolls_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SoftwareDeviceKey::generate(dir.path()).unwrap();
+        let t = transport_ok();
+        let out = ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, Some("tok"));
+        assert_eq!(
+            out,
+            EnsureOutcome::Enrolled {
+                device_id: "1b4e28ba-2fa1-11d2-883f-0016d3cca427".into(),
+                not_after: "2027-09-03T00:00:00Z".into(),
+                renewed: false,
+                key_kind: KeyKind::Software,
+            }
+        );
+    }
+
+    #[test]
+    fn an_enrolled_machine_with_a_current_certificate_does_not_spend_a_token() {
+        // A start-up that re-enrolled would burn a single-use token on every reboot
+        // and mint a second device row for a machine that already has one.
+        let dir = tempfile::tempdir().unwrap();
+        let key = SoftwareDeviceKey::generate(dir.path()).unwrap();
+        let t = transport_ok();
+        ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, Some("tok"));
+        let seen_before = t.seen.borrow().len();
+
+        // Well inside the certificate's life.
+        let now = not_after_ms("2027-09-03T00:00:00Z").unwrap() - 200 * 24 * 3600 * 1000;
+        let out = ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), now, Some("tok2"));
+        assert!(matches!(out, EnsureOutcome::AlreadyEnrolled { .. }));
+        assert_eq!(t.seen.borrow().len(), seen_before, "nothing was sent");
+    }
+
+    #[test]
+    fn a_certificate_inside_the_renewal_window_renews_against_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SoftwareDeviceKey::generate(dir.path()).unwrap();
+        let t = FakeTransport {
+            response: RefCell::new(vec![
+                Ok(EnrollResponse {
+                    device_id: "d1".into(),
+                    certificate_pem: "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n".into(),
+                    ca_chain_pem: String::new(),
+                    not_after: "2027-09-03T00:00:00Z".into(),
+                }),
+                Ok(EnrollResponse {
+                    device_id: "d1".into(),
+                    certificate_pem: "-----BEGIN CERTIFICATE-----\nB\n-----END CERTIFICATE-----\n".into(),
+                    ca_chain_pem: String::new(),
+                    not_after: "2028-09-03T00:00:00Z".into(),
+                }),
+            ]),
+            seen: RefCell::new(Vec::new()),
+        };
+        ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, Some("tok")).clone();
+
+        // Ten days out: inside the 30-day window.
+        let now = not_after_ms("2027-09-03T00:00:00Z").unwrap() - 10 * 24 * 3600 * 1000;
+        let out = ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), now, Some("tok2"));
+        assert!(matches!(out, EnsureOutcome::Enrolled { renewed: true, .. }), "{out:?}");
+
+        // Same key, so the machine keeps one identity across the renewal.
+        let first = t.seen.borrow()[0].1.csr_pem.clone();
+        let second = t.seen.borrow()[1].1.csr_pem.clone();
+        let point = crate::devicekey::DeviceKey::public_point(&key).unwrap();
+        for csr in [&first, &second] {
+            let der = base64_body(csr);
+            assert!(der.windows(65).any(|w| w == point), "the CSR re-certifies the same key");
+        }
+        // ...and the new certificate replaced the old one on disk.
+        assert!(std::fs::read_to_string(dir.path().join(CERT_FILE)).unwrap().contains("\nB\n"));
+    }
+
+    fn base64_body(pem: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        let body: String = pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        base64::engine::general_purpose::STANDARD.decode(body).unwrap()
+    }
+
+    #[test]
+    fn a_certificate_inside_the_renewal_window_with_no_token_is_reported_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SoftwareDeviceKey::generate(dir.path()).unwrap();
+        let t = transport_ok();
+        ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, Some("tok"));
+        let now = not_after_ms("2027-09-03T00:00:00Z").unwrap() - 10 * 24 * 3600 * 1000;
+        assert_eq!(
+            ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), now, None),
+            EnsureOutcome::RenewalBlockedNoToken { not_after: "2027-09-03T00:00:00Z".into() }
+        );
+    }
+
+    #[test]
+    fn a_failed_renewal_leaves_the_old_certificate_in_place() {
+        // Which is the point of renewing 30 days early: a failure is not an outage.
+        let dir = tempfile::tempdir().unwrap();
+        let key = SoftwareDeviceKey::generate(dir.path()).unwrap();
+        let t = FakeTransport {
+            response: RefCell::new(vec![
+                Ok(EnrollResponse {
+                    device_id: "d1".into(),
+                    certificate_pem: "-----BEGIN CERTIFICATE-----\nORIGINAL\n-----END CERTIFICATE-----\n".into(),
+                    ca_chain_pem: String::new(),
+                    not_after: "2027-09-03T00:00:00Z".into(),
+                }),
+                Err(EnrollError::TokenUnusable),
+            ]),
+            seen: RefCell::new(Vec::new()),
+        };
+        ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), 0, Some("tok"));
+        let now = not_after_ms("2027-09-03T00:00:00Z").unwrap() - 10 * 24 * 3600 * 1000;
+        assert!(matches!(
+            ensure_enrolled("https://api", &facts(), &key, &t, dir.path(), now, Some("spent")),
+            EnsureOutcome::Failed(_)
+        ));
+        assert!(std::fs::read_to_string(dir.path().join(CERT_FILE)).unwrap().contains("ORIGINAL"));
+        assert_eq!(
+            crate::device::load_identity(dir.path()).unwrap().unwrap().not_after,
+            "2027-09-03T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn an_expiry_that_cannot_be_parsed_means_renew_rather_than_trust() {
+        assert_eq!(not_after_ms("2027-09-03T00:00:00Z"), Some(1_819_929_600_000));
+        assert_eq!(not_after_ms("  2027-09-03T00:00:00Z  "), Some(1_819_929_600_000));
+        assert_eq!(not_after_ms("next tuesday"), None);
+        assert_eq!(not_after_ms(""), None);
     }
 }

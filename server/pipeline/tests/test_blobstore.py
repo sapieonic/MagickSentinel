@@ -168,14 +168,16 @@ class _Paginator:
         return [{"CommonPrefixes": [{"Prefix": p} for p in commons]}]
 
 
-def test_s3_reads_writes_and_lists_under_an_optional_bucket_prefix():
+def test_s3_reads_and_deletes_at_the_key_the_gateway_wrote():
+    # Verbatim keys, no bucket prefix — the gateway's writer (internal/blob/s3.go)
+    # puts objects at exactly SegmentKey's output, and a prefix on one side only is
+    # a pipeline that finds no audio and reports it as an ASR outage.
     key = segment_key("t", "2026-08-01", "c", 0, 3)
-    client = FakeS3({f"sentinel/{key}": b"audio"})
-    store = S3BlobStore(bucket="b", prefix="sentinel/", client=client)
+    client = FakeS3({key: b"audio"})
+    store = S3BlobStore(bucket="b", client=client)
 
     assert store.get(key) == b"audio"
     assert store.get(segment_key("t", "2026-08-01", "c", 0, 4)) is None
-    # The prefix is stripped back off, so callers only ever see canonical keys.
     assert store.day_prefixes(tenant_prefix("t")) == ["audio/t/2026-08-01/"]
     assert store.delete_prefix(day_prefix("t", "2026-08-01")) == 1
     assert store.get(key) is None
@@ -207,9 +209,10 @@ def test_s3_deletes_are_batched_to_the_api_limit():
 
 
 def test_the_bucket_selects_s3_and_the_directory_selects_dev(tmp_path, monkeypatch):
+    # The variable names are the gateway's, so one deployment configures both.
     monkeypatch.setattr("sentinel_pipeline.blobstore.S3BlobStore.__post_init__",
                         lambda self: None)
-    s3 = blob_store_from_env({"SENTINEL_BLOB_BUCKET": "b"})
+    s3 = blob_store_from_env({"SENTINEL_S3_BUCKET": "b"})
     assert isinstance(s3, S3BlobStore) and s3.region == "ap-south-1"
     assert isinstance(blob_store_from_env({"SENTINEL_BLOB_DIR": str(tmp_path)}),
                       DirBlobStore)

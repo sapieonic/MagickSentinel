@@ -1,0 +1,296 @@
+# The observability stack: OTel Collector, Tempo, Prometheus, Loki, Grafana.
+#
+# LAYERED ON TOP OF THE APPLICATION STACK, not instead of it:
+#
+#   docker compose -f deploy/compose.yaml -f deploy/observability/compose.yaml up -d
+#
+# Both files declare `name: sentinel` and the `sentinel` network, so compose merges
+# them into one project. That is also how the two overrides at the bottom of this file
+# reach the gateway and the pipeline: compose merges service definitions across -f
+# files, so adding `environment` here adds to what the base file set rather than
+# replacing it.
+#
+# ==================================================================================
+# WHY OTEL EXPORT IS OFF UNLESS THIS FILE IS PRESENT
+#
+# All three emitters keep export off by default, and deploy/compose.yaml deliberately
+# does not set OTEL_EXPORTER_OTLP_ENDPOINT. This file sets it. That means:
+#
+#   * The base stack runs with no collector and logs nothing about it. An exporter
+#     pointed at a collector that is not there retries on a backoff and logs a failure
+#     every few seconds, which trains people to ignore the logs of the two services
+#     whose logs matter.
+#   * A production deployment without a collector — which is a legitimate first
+#     deployment — behaves identically.
+#
+# ==================================================================================
+# RESIDENCY (OPEN-4) — SAID HERE BECAUSE THIS IS THE FILE SOMEONE WILL EDIT
+#
+# Every backend below runs inside the deployment. There is no managed telemetry service
+# and no default region for one, deliberately.
+#
+# OPEN-4 asserts India-only (ap-south-1) and is UNDECIDED; what would settle it is
+# written confirmation from the bank client, not a default in a compose file. Grafana
+# Cloud, Datadog, New Relic and Honeycomb all resolve to a US or EU region if you do not
+# choose one, so "let us just point staging at Grafana Cloud to try it" puts telemetry
+# outside India before anyone has been asked.
+#
+# And this telemetry is not innocuous even after the collector's redaction. Tenant
+# identifiers, per-tenant call volumes, per-tenant model spend and per-tenant
+# compliance-flag rates are all commercially sensitive: they are the figures a BPO's
+# bank client would want, and its competitor would too.
+#
+# If a managed backend is ever added it must be an India-region endpoint, and the
+# choice belongs in the OPEN-4 record.
+#
+# ==================================================================================
+# PRIVACY
+#
+# The collector strips known PII attribute keys, redacts by pattern, and truncates log
+# bodies over 2 KiB — see deploy/observability/otel-collector.yaml, which explains why
+# it does that rather than trusting the emitters. Nothing in this file weakens that.
+# In particular the collector's `debug` exporter is defined and deliberately not wired
+# into any pipeline: it prints every record to the container log, including whatever
+# the redaction was there to remove.
+
+name: sentinel
+
+# No `networks:` block: `name: sentinel` makes this the same compose project as
+# deploy/compose.yaml, and compose's per-project `default` network already joins them.
+# See the networking note in that file for why an explicitly named network here would
+# be silently dropped rather than helpful.
+
+volumes:
+  tempo-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+
+services:
+  # ============================================================ OTel Collector ====
+  otel-collector:
+    # contrib, not core: the `redaction` and `transform` processors the privacy
+    # configuration depends on are only in contrib. Pinned to an exact version rather
+    # than :latest, because processor signal support (which of traces/metrics/logs a
+    # processor accepts) has changed across releases, and a collector that silently
+    # stops applying a redaction processor to the logs pipeline is the worst possible
+    # kind of upgrade regression: everything keeps working.
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    environment:
+      SENTINEL_ENVIRONMENT: ${SENTINEL_ENVIRONMENT:-local}
+    volumes:
+      - ./otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      # OTLP gRPC and HTTP, localhost only. The three services reach the collector over
+      # the compose network by name; these mappings exist so a developer can point a
+      # locally built agent at it. On a real deployment the collector must not be
+      # reachable from a floor network without authentication — an open OTLP receiver
+      # accepts telemetry from anyone, which means anyone can fill the metrics store
+      # with series and evict the ones the alerts read.
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - tempo
+      - prometheus
+      - loki
+    # NO HEALTHCHECK, and this is a limitation rather than an oversight.
+    #
+    # The collector's `health_check` extension listens on 13133, which is the right
+    # thing for an orchestrator that probes from outside — a Kubernetes httpGet probe
+    # against it works and should be used there. Docker's HEALTHCHECK runs *inside* the
+    # container, and this image is distroless: no shell, no wget, no curl, nothing that
+    # can make an HTTP request. Any healthcheck written here would either fail to
+    # execute or, worse, be something like `["CMD", "/otelcol-contrib", "--help"]`,
+    # which reports the container healthy as long as the binary exists — a check that
+    # passes while the collector is dropping every span.
+    #
+    # How a broken collector is actually detected here: the collector scrapes its own
+    # metrics (prometheus/self in otel-collector.yaml) and the
+    # SentinelCollectorExportFailing rule alerts on
+    # otelcol_exporter_send_failed_metric_points. That catches the failure mode a
+    # liveness probe would not — a collector that is up and cannot deliver.
+
+  # ======================================================================= Tempo ==
+  tempo:
+    image: grafana/tempo:2.6.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    # Tempo's image runs as uid 10001 and the named volume is created root-owned, so
+    # without this the WAL directory is not writable and Tempo exits with a permission
+    # error that reads like a config problem.
+    user: "10001:10001"
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    # No published ports. Only Grafana and the collector talk to Tempo, both over the
+    # compose network. Tempo has no authentication of its own; publishing 3200 would
+    # expose every trace, and traces carry tenant identifiers and call ids.
+    expose:
+      - "3200"
+      - "4317"
+
+  # ================================================================== Prometheus ==
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # WITHOUT THIS the collector's remote write gets 404 from /api/v1/write, and the
+      # symptom is every dashboard panel reading "No data" — which on this product's
+      # dashboard is indistinguishable from "no calls are being captured". The
+      # SentinelCollectorExportFailing alert exists to tell the two apart.
+      - "--web.enable-remote-write-receiver"
+      # Two feature flags, both of which fail silently when absent, which is why they
+      # are in one line with one explanation each:
+      #
+      #   exemplar-storage        Exemplars are the metric -> trace hop. Without it
+      #                           Prometheus accepts the remote writes and discards the
+      #                           exemplars, and the "View trace" affordance on the
+      #                           ingest-lag panel does nothing at all.
+      #   expand-external-labels  prometheus.yml sets `environment: ${SENTINEL_ENVIRONMENT}`
+      #                           in external_labels. Without this flag Prometheus does
+      #                           NOT expand it — every alert is stamped with the
+      #                           literal string "${SENTINEL_ENVIRONMENT}", which is
+      #                           legible enough to be embarrassing and not legible
+      #                           enough to tell staging from production at 3am.
+      - "--enable-feature=exemplar-storage,expand-external-labels"
+      # 30 days. Long enough to compare this month's spend against last month's and to
+      # investigate a coverage complaint from three weeks ago. Not a compliance
+      # retention period: these are operational metrics with no borrower content, and
+      # OPEN-6's audio and transcript periods are a separate question that must not be
+      # answered by copying this number.
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    user: "65534:65534"
+    ports:
+      # Localhost only: Prometheus's expression browser has no authentication, and the
+      # series it holds include per-tenant model spend.
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ======================================================================== Loki ==
+  loki:
+    image: grafana/loki:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    user: "10001:10001"
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    expose:
+      - "3100"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ===================================================================== Grafana ==
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?set GRAFANA_ADMIN_USER in deploy/.env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/.env}
+      # Anonymous access OFF. It is tempting for a wall display on a floor, and it is
+      # wrong here: this dashboard shows per-tenant call volumes, per-tenant model spend
+      # and per-tenant compliance coverage. On a multi-tenant deployment an anonymous
+      # viewer sees every BPO's numbers, and Grafana has no row-level security to fall
+      # back on the way PostgreSQL does. If a wall display is wanted, give it a
+      # read-only account scoped to one tenant's dashboard.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # No outbound calls from a component that has seen every metric in a system
+      # handling borrower data, from a deployment whose residency question is open.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # No GF_FEATURE_TOGGLES_ENABLE. Everything the datasources file relies on —
+      # exemplars, tracesToLogsV2, tracesToMetrics, Loki derived fields — is generally
+      # available in Grafana 11 and needs no toggle. Enabling a toggle "just in case"
+      # is how a stack ends up depending on an experimental feature that is renamed in
+      # the next minor.
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ================================================== turning export ON, per service
+  #
+  # These two blocks MERGE with the service definitions in deploy/compose.yaml — they
+  # do not replace them. Adding `environment` here adds keys; everything else about the
+  # gateway and pipeline services comes from the base file.
+  #
+  # This is where OTEL_EXPORTER_OTLP_ENDPOINT is set and nowhere else, which is what
+  # makes "no collector" a supported configuration rather than a broken one.
+  gateway:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      # The service.name the collector, the datasources and every alert rule are
+      # provisioned for. It must be exactly this: `sentinel_gateway`, `gateway` or
+      # `sentinel-gateway-prod` all produce a stack that ingests happily and shows
+      # nothing, because every query filters on the name.
+      OTEL_SERVICE_NAME: sentinel-gateway
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=sentinel,deployment.environment=${SENTINEL_ENVIRONMENT:-local},region=ap-south-1
+      # Traces: sample everything locally. On a production floor this becomes a
+      # parent-based ratio — but note that head sampling and the ingest-lag exemplars
+      # interact badly, because a sampled-out trace produces an exemplar pointing at a
+      # trace that was never stored, and the "View trace" link 404s. Tail sampling in
+      # the collector is the answer there, not a lower head ratio.
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+
+  pipeline:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_SERVICE_NAME: sentinel-pipeline
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=sentinel,deployment.environment=${SENTINEL_ENVIRONMENT:-local},region=ap-south-1
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+
+  # The third emitter, sentinel-agent, is NOT here and cannot be: it runs on an agent's
+  # Windows desktop on a collections floor, not in this compose project. Its
+  # OTEL_EXPORTER_OTLP_ENDPOINT comes from tenant policy or machine configuration and
+  # must point at a collector the floor can actually reach.
+  #
+  # Two things to settle before turning agent export on for a real floor, neither of
+  # which is a compose concern and both of which are easy to discover too late:
+  #
+  #   * The collector endpoint has to be reachable from the desktop, which means it is
+  #     reachable from the floor network, which means it needs authentication and TLS.
+  #     An open OTLP receiver accepts telemetry from anyone on that network.
+  #   * Agent telemetry is per-device and there are hundreds of devices. `device_id` as
+  #     a metric label is bounded by the fleet size and is fine; anything per-call is
+  #     not. The metric contract in otel-collector.yaml keeps the agent's metrics to
+  #     tenant and device dimensions for exactly this reason.

@@ -230,11 +230,14 @@ mod tests {
         let p256 = [0x06u8, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
         let at = spki.windows(id_ec.len()).position(|w| w == id_ec).expect("id-ecPublicKey");
         assert_eq!(&spki[at + id_ec.len()..at + id_ec.len() + p256.len()], &p256);
-        // The point is carried whole, with a zero unused-bit count in front.
-        let bit_string_at = spki.len() - 67;
-        assert_eq!(spki[bit_string_at - 2], der::tag::BIT_STRING);
-        assert_eq!(spki[bit_string_at], 0x00);
-        assert_eq!(&spki[bit_string_at + 1..], &point[..]);
+        // The point is carried whole, in a BIT STRING with a zero unused-bit count.
+        // The tail of the SPKI is therefore: 0x03, 0x42 (66 bytes), 0x00, then 65
+        // bytes of point.
+        let point_at = spki.len() - 65;
+        assert_eq!(spki[point_at - 3], der::tag::BIT_STRING);
+        assert_eq!(spki[point_at - 2], 66, "one unused-bit byte plus 65 of point");
+        assert_eq!(spki[point_at - 1], 0x00, "no unused bits");
+        assert_eq!(&spki[point_at..], &point[..]);
     }
 
     #[test]
@@ -246,8 +249,10 @@ mod tests {
         assert_eq!(der_sig[0], der::tag::SEQUENCE);
         // r: INTEGER 0x2A
         assert_eq!(&der_sig[2..5], &[0x02, 0x01, 0x2A]);
-        // s: INTEGER 00 FF 00 .. (padded, leading zero for the sign bit)
-        assert_eq!(&der_sig[5..8], &[0x02, 0x20, 0x00]);
+        // s: the magnitude is 0xFF followed by 31 zero bytes, so its top bit is set
+        // and DER pads it to 33 content bytes — 0x21 — with the leading zero that
+        // stops it decoding as a negative number.
+        assert_eq!(&der_sig[5..9], &[0x02, 0x21, 0x00, 0xFF]);
     }
 
     #[test]

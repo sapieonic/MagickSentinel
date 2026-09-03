@@ -1,0 +1,614 @@
+{
+  "uid": "sentinel-capture-health",
+  "title": "Sentinel — capture health",
+  "description": "The four signals that matter for this product, arranged around its dangerous failure mode: looking healthy while capturing nothing. Read the top row first — it is the only row that answers 'is anything wrong right now'. Every panel carries a description explaining what a bad value means and what to do about it; hover the (i). Metric names are the contract documented in deploy/observability/otel-collector.yaml, emitted by sentinel-gateway, sentinel-pipeline and sentinel-agent. A panel reading 'No data' on this dashboard is itself an alert: see the sentinel.silence rules.",
+  "tags": ["sentinel", "capture", "compliance"],
+  "timezone": "Asia/Kolkata",
+  "editable": false,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+        "query": { "query": "label_values(sentinel_devices_reporting, tenant_id)", "refId": "tenants" },
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "description": "Every signal in this product is per tenant. A fleet-wide average hides the one tenant that has stopped capturing, and one tenant is one bank client's portfolio — so the default is All and the panels break out by tenant rather than summing."
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "custom",
+        "query": "sentinel-gateway,sentinel-pipeline,sentinel-agent",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "description": "The three services that emit telemetry. Hard-coded rather than discovered: a list built from what is currently reporting cannot show you the one that has stopped."
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Spool evictions",
+        "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+        "enable": true,
+        "iconColor": "red",
+        "expr": "increase(sentinel_spool_evicted_segments_total{tenant_id=~\"$tenant\"}[5m]) > 0",
+        "titleFormat": "Audio permanently lost",
+        "textFormat": "Segments evicted from an endpoint spool for tenant {{tenant_id}}"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Is anything wrong right now",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "SILENT — signed in, dialer active, not capturing",
+      "description": "THE PANEL THIS DASHBOARD EXISTS FOR. Devices whose heartbeat says the user is signed in and the dialer session is active, and whose capture_state is none of IN_CALL/ARMED/WRAP/FINALIZE. Every one of these machines reports healthy every thirty seconds, appears green in the portal's fleet view, and is recording nothing. Anything above zero for more than a few minutes is an incident: the BPO is currently telling its bank client that these calls are monitored. Likely causes in order: pinned headset absent, the softphone process name in tenant policy does not match what is running (OPEN-8, still no worked example), capture in BLOCKED, or a tier C machine the installer should have refused.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum(sentinel_devices_reporting{tenant_id=~\"$tenant\", signed_in=\"true\", dialer_session_active=\"true\", capture_state!~\"IN_CALL|ARMED|WRAP|FINALIZE\"})",
+          "legendFormat": "silent devices",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [{ "type": "special", "options": { "match": "null", "result": { "text": "no data", "color": "red" } } }],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Devices actively capturing",
+      "description": "Devices in a capture state. Read alongside the silent panel: a healthy floor has this number tracking the number of agents on shift. A drop here with no corresponding rise in the silent panel means devices have gone offline entirely, which is a different problem and a more visible one.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum(sentinel_devices_reporting{tenant_id=~\"$tenant\", capture_state=~\"IN_CALL|ARMED|WRAP|FINALIZE\"})",
+          "legendFormat": "capturing",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Segments ingested / min",
+      "description": "Audio segments durably written by the gateway, per minute, across the selected tenants. Zero while agents are signed in is the SentinelIngestStopped condition. This is the one number that proves audio is actually arriving rather than merely being reported as arriving.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum(rate(sentinel_ingest_segments_total{tenant_id=~\"$tenant\"}[5m])) * 60",
+          "legendFormat": "segments/min",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Worst tenant coverage",
+      "description": "The lowest capture coverage across the selected tenants: captured calls over the dialer's own record of calls. This is the number that demonstrates the '100% of calls are monitored' claim the purchase rests on, and it is the metric that turns tamper detection from an arms race into a management conversation. NOTE: it will read 'No data' until a dialer CDR source exists — OPEN-7 is undecided, coverage.py implements the arithmetic behind a CdrSource nothing implements, and nothing populates coverage_daily. 'No data' here means the reconciliation is not running, not that coverage is fine.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "min(sentinel_coverage_ratio{tenant_id=~\"$tenant\"})",
+          "legendFormat": "worst coverage",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 2,
+          "mappings": [{ "type": "special", "options": { "match": "null", "result": { "text": "no CDR (OPEN-7)", "color": "text" } } }],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.9 },
+              { "color": "green", "value": 0.98 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 200,
+      "title": "Signal 1 — ingest lag per tenant",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Ingest lag p95 by tenant",
+      "description": "Time between an audio frame being captured on the endpoint and the gateway durably writing it. The first thing to move when anything between the desktop and the database is unwell. Sustained lag is not merely latency: the endpoint spool holds everything unacked, and it evicts oldest-first at 2 GB or 72 hours, so lag that persists becomes permanently lost audio. Exemplars are on — click a spike to open the trace of one slow ingest write.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (tenant_id, le) (rate(sentinel_ingest_lag_seconds_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "p95 — {{tenant_id}}",
+          "exemplar": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (tenant_id, le) (rate(sentinel_ingest_lag_seconds_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "p50 — {{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 120 },
+              { "color": "red", "value": 900 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Segments ingested per second by tenant",
+      "description": "Volume, so lag can be read in context. Lag rising while volume rises is a capacity problem; lag rising while volume falls is a delivery problem, and the second is the one that costs audio. A tenant's line dropping to zero during a shift is SentinelIngestStopped.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum by (tenant_id) (rate(sentinel_ingest_segments_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 300,
+      "title": "Signal 2 — endpoint spool depth and eviction",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Deepest spool per tenant (unacked segments)",
+      "description": "The endpoint deletes a segment only after the server acks it — never before, never on call.end, never on shutdown. So spool depth is exactly the amount of recorded audio that exists in only one place, on one desktop. A rising line is the uplink failing to keep pace with capture; a falling line is a machine recovering. The number that matters is the trend, not the level: a deep spool that is draining is fine.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "max by (tenant_id) (sentinel_spool_depth_segments{tenant_id=~\"$tenant\"})",
+          "legendFormat": "deepest — {{tenant_id}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum by (tenant_id) (sentinel_spool_depth_segments{tenant_id=~\"$tenant\"})",
+          "legendFormat": "fleet total — {{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 500 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Largest spool on disk vs the 2 GB cap",
+      "description": "SpoolLimits caps the spool at 2 GB or 72 hours, whichever comes first. The red threshold is the cap. Crossing it does not fail — it evicts, oldest-first, which means the audio destroyed is the audio that has been waiting longest to be delivered. This panel is where you find out you have hours rather than minutes.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "max by (tenant_id) (sentinel_spool_size_bytes{tenant_id=~\"$tenant\"})",
+          "legendFormat": "{{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1717986918 },
+              { "color": "red", "value": 2147483648 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Segments EVICTED — permanently lost audio",
+      "description": "Anything above zero on this panel is recorded borrower audio that no longer exists anywhere. The endpoint held the only copy, because the server never acked it, and the 2 GB / 72 h cap has now destroyed it. There is no threshold below which this is acceptable and no later recovery. spool.rs emits the eviction event deliberately — 'a compliance product that quietly drops audio is worse than one that admits it did' — and this panel is the admission. The affected calls will appear as a coverage gap.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum by (tenant_id) (increase(sentinel_spool_evicted_segments_total{tenant_id=~\"$tenant\"}[10m]))",
+          "legendFormat": "{{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 80, "showPoints": "never" },
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 400,
+      "title": "Signal 3 — per-tenant model spend against budget",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Monthly model budget consumed",
+      "description": "Rolling 30-day model spend over the tenant's monthly budget. Model spend is the dominant variable cost and it is attributed per tenant. Thresholds at 70% and 90% are the alert points from spec 13; at 100% the kill switch in cost.py stops paid analysis for that tenant. What the customer sees when that happens: deterministic tier-1 compliance rules keep running on 100% of calls, because they are free — but the tier-2 LLM judge and the per-call analysis stop, so flags stop being reviewed and summaries stop appearing. The product degrades in the direction it was designed to, and it still degrades.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum by (tenant_id) (increase(sentinel_model_spend_paise_total{tenant_id=~\"$tenant\"}[30d])) / max by (tenant_id) (sentinel_tenant_budget_paise{tenant_id=~\"$tenant\"} > 0)",
+          "legendFormat": "{{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "dashed" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "orange", "value": 0.9 },
+              { "color": "red", "value": 1.0 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Spend rate by tenant and model (paise/hour)",
+      "description": "Paise, not rupees, and deliberately so: money is an integer number of paise end to end in this product, and rupees exist only at the point of display. Broken out by model because a provider switch or a prompt change shows up here as a step, and because attributing spend to the invocation is why the model call happens on the server rather than on the endpoint. A sudden 5x against the six-hour baseline is SentinelModelSpendSpike — check the DLQ depth before assuming it is volume, since JetStream redelivers up to four times.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum by (tenant_id, model) (rate(sentinel_model_spend_paise_total{tenant_id=~\"$tenant\"}[15m])) * 3600",
+          "legendFormat": "{{tenant_id}} / {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 20, "showPoints": "never", "stacking": { "mode": "normal" } },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 500,
+      "title": "Signal 4 — coverage against the dialer CDR",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Capture coverage by tenant",
+      "description": "Captured calls over the dialer's record of calls. The 98% line is the target; below 90% is critical. Reasons a line drops, in the order they usually turn out to be the cause: a machine with no pinned headset present, an agent signed out mid-shift, an EDR quarantine, a tier C machine that should have been blocked at install, and last, deliberate tampering. The product's response is detect-and-report, not enforcement — a coverage gap is a supervisor conversation. BLOCKED ON OPEN-7: no dialer CDR export format is agreed and nothing implements CdrSource, so this panel is empty today. Empty means unmeasured, not good.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sentinel_coverage_ratio{tenant_id=~\"$tenant\"}",
+          "legendFormat": "{{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "dashed" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.9 },
+              { "color": "green", "value": 0.98 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Dialer calls vs captured calls",
+      "description": "The two numbers the coverage ratio is made of, shown separately because the ratio alone cannot distinguish 'we captured fewer' from 'they dialled more'. A widening gap on a steady dialer line is a capture problem; both lines moving together at a lower ratio is usually a reconciliation-matching problem — coverage.py matches on (agent_id, started_at) when the account reference is absent, and clock skew between the dialer and the endpoint moves that match.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum by (tenant_id) (sentinel_coverage_dialer_calls{tenant_id=~\"$tenant\"})",
+          "legendFormat": "dialer — {{tenant_id}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sentinel-prometheus" },
+          "expr": "sum by (tenant_id) (sentinel_coverage_captured_calls{tenant_id=~\"$tenant\"})",
+          "legendFormat": "captured — {{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 600,
+      "title": "Correlation — logs for the window above",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "logs",
+      "title": "Warnings and errors from the three services",
+      "description": "Scoped to the dashboard's time range, so selecting a spike above filters this. Each line's trace_id is a link into Tempo (see the Loki datasource's derivedFields), which closes the log → trace → metric loop. These lines carry no borrower content: the collector strips known PII attribute keys, redacts by pattern, and truncates any log body over 2 KiB on the grounds that a message that long is carrying data rather than describing an event. If you see borrower content here, that is an emitter bug and a DPDP incident — report it rather than working around it.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 43 },
+      "datasource": { "type": "loki", "uid": "sentinel-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "sentinel-loki" },
+          "expr": "{service_name=~\"$service\"} | detected_level =~ \"warn|error|fatal\"",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
+    }
+  ]
+}

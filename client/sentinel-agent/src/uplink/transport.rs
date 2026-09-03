@@ -67,10 +67,26 @@ pub struct ConnectParams {
     pub client_cert: Option<ClientCertificate>,
 }
 
-#[derive(Debug, Clone)]
+/// The device's mTLS credential, as the transport needs it.
+///
+/// A rustls `CertifiedKey` rather than a pair of PEM buffers, because on Windows there
+/// is no private key to put in a buffer: it is a non-exportable CNG key and the only
+/// thing this process can do with it is ask it to sign. `sentinel_agent::device` builds
+/// this from the enrolled certificate and a signer that delegates to `NCryptSignHash`,
+/// and the same shape carries the development software key without a second code path.
+#[derive(Clone)]
 pub struct ClientCertificate {
-    pub chain_pem: Vec<u8>,
-    pub key_pem: Vec<u8>,
+    pub certified_key: std::sync::Arc<rustls::sign::CertifiedKey>,
+}
+
+impl std::fmt::Debug for ClientCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ConnectParams` is `Debug` and lands in error paths; the certificate bytes
+        // do not belong in a log line and the key must never be formattable at all.
+        f.debug_struct("ClientCertificate")
+            .field("chain_len", &self.certified_key.cert.len())
+            .finish()
+    }
 }
 
 /// Reject a plaintext WebSocket to anything that is not loopback.
@@ -180,21 +196,19 @@ fn build_mtls_config(cert: &ClientCertificate) -> Result<rustls::ClientConfig, T
         let _ = roots.add(c);
     }
 
-    let chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert.chain_pem.as_slice())
-            .collect::<Result<_, _>>()
-            .map_err(|e| TransportError::Connect(format!("device certificate: {e}")))?;
-    if chain.is_empty() {
+    if cert.certified_key.cert.is_empty() {
         return Err(TransportError::Connect("device certificate chain is empty".into()));
     }
-    let key = rustls_pemfile::private_key(&mut cert.key_pem.as_slice())
-        .map_err(|e| TransportError::Connect(format!("device key: {e}")))?
-        .ok_or_else(|| TransportError::Connect("no private key in the device key file".into()))?;
 
-    rustls::ClientConfig::builder()
+    // `with_client_cert_resolver` and not `with_client_auth_cert`: the latter takes a
+    // `PrivateKeyDer`, and the whole point of the device key is that no such thing
+    // exists for it. The resolver hands rustls a `CertifiedKey` whose signer is backed
+    // by CNG.
+    Ok(rustls::ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_client_auth_cert(chain, key)
-        .map_err(|e| TransportError::Connect(format!("mTLS configuration: {e}")))
+        .with_client_cert_resolver(crate::device::single_identity_resolver(
+            cert.certified_key.clone(),
+        )))
 }
 
 fn rustls_native_certs() -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TransportError>

@@ -50,7 +50,12 @@ from .persistence import (
     PostgresSink,
     list_tenants,
 )
-from .providers.registry import build_batch_asr, settings_from_env, warnings_for
+from .providers.registry import (
+    ProviderConfigError,
+    build_batch_asr,
+    settings_from_env,
+    warnings_for,
+)
 from .retention import RetentionJob
 from .segments import SegmentCodec, StoredSegmentSource
 from .worker import Finalizer, Outcome
@@ -152,8 +157,8 @@ def _model_provider(env: Mapping[str, str], slot: str, schema_name: str) -> obje
 
         key = env.get("SENTINEL_ANTHROPIC_API_KEY")
         if not key:
-            raise RuntimeError(f"SENTINEL_{slot}_PROVIDER=anthropic needs "
-                               f"SENTINEL_ANTHROPIC_API_KEY")
+            raise ProviderConfigError(f"SENTINEL_{slot}_PROVIDER=anthropic needs "
+                                      f"SENTINEL_ANTHROPIC_API_KEY")
         return AnthropicProvider(api_key=key, schema_name=schema_name,
                                  **_model_kwargs(env, slot))
     if name == "openai":
@@ -161,8 +166,8 @@ def _model_provider(env: Mapping[str, str], slot: str, schema_name: str) -> obje
 
         key = env.get("SENTINEL_OPENAI_API_KEY")
         if not key:
-            raise RuntimeError(f"SENTINEL_{slot}_PROVIDER=openai needs "
-                               f"SENTINEL_OPENAI_API_KEY")
+            raise ProviderConfigError(f"SENTINEL_{slot}_PROVIDER=openai needs "
+                                      f"SENTINEL_OPENAI_API_KEY")
         return OpenAIProvider(api_key=key, schema_name=schema_name,
                               **_model_kwargs(env, slot))
     if name == "fake":
@@ -172,7 +177,7 @@ def _model_provider(env: Mapping[str, str], slot: str, schema_name: str) -> obje
         # deployment that reaches this line is storing invented analyses.
         log.warning("using the deterministic fake %s provider", slot.lower())
         return FakeAnalysisProvider() if schema_name == "analysis.json" else FakeJudgeProvider()
-    raise RuntimeError(
+    raise ProviderConfigError(
         f"unknown SENTINEL_{slot}_PROVIDER={name!r}; expected anthropic, openai, "
         f"fake or none"
     )

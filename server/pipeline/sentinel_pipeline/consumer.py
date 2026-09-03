@@ -123,8 +123,12 @@ class ConsumerConfig:
     #: Named so a broker operator can tell which service is connected.
     client_name: str = "sentinel-pipeline"
     connect_timeout_s: int = 10
-    #: Reconnect forever. A pipeline that gives up on the broker stops producing
-    #: compliance records silently, and the calls keep arriving regardless.
+    #: Reconnect forever by default. A pipeline that gives up on the broker stops
+    #: producing compliance records while the calls keep arriving, so waiting is the
+    #: better failure. Note that this also applies to the *initial* connect: the
+    #: consumer blocks until the broker answers rather than exiting. Under an
+    #: orchestrator that would rather see a crash loop than a quiet wait, set
+    #: SENTINEL_NATS_MAX_RECONNECT_ATTEMPTS to a finite number.
     max_reconnect_attempts: int = -1
     #: Explicit permission to talk to a non-loopback broker with no credentials.
     allow_insecure: bool = False
@@ -168,6 +172,8 @@ class ConsumerConfig:
             tls_key_file=env.get("SENTINEL_NATS_CLIENT_KEY") or None,
             tls_hostname=env.get("SENTINEL_NATS_TLS_HOSTNAME") or None,
             connect_timeout_s=int(env.get("SENTINEL_NATS_CONNECT_TIMEOUT", "10")),
+            max_reconnect_attempts=int(
+                env.get("SENTINEL_NATS_MAX_RECONNECT_ATTEMPTS", "-1")),
             allow_insecure=_flag(env.get("SENTINEL_NATS_ALLOW_INSECURE")),
         )
         config.validate()
@@ -264,6 +270,12 @@ async def run(config: ConsumerConfig, handle: Callable[[dict], Awaitable[None]])
     from nats.js.api import DeliverPolicy
 
     config.validate()
+    # Logged before the attempt, because with the default reconnect policy this call
+    # waits for the broker indefinitely: without a line here, a consumer pointed at
+    # the wrong endpoint is silent rather than obviously stuck.
+    log.info("connecting to nats", extra={"servers": ",".join(config.server_list),
+                                          "tls": config.tls,
+                                          "authenticated": config.authenticated})
     nc = await nats.connect(**config.connect_options())
     js = nc.jetstream()
     log.info("consumer connected", extra={"durable": config.durable,

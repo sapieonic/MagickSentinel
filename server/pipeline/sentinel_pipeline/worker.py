@@ -172,7 +172,11 @@ class Finalizer:
                                 call_id=ctx.call_id, channel=int(channel)) as fetch_span:
                 fetch_started = time.perf_counter()
                 audio = self.segments.channel_audio(ctx.call_id, channel)
-                fetch_span.set(segments=len(audio) if audio else 0)
+                # How much audio came back, as milliseconds rather than bytes:
+                # 16 kHz mono PCM16 is 32 bytes per millisecond, and "this channel
+                # returned four minutes when the call ran twelve" is a diagnosis
+                # where a byte count is a puzzle.
+                fetch_span.set(audio_ms=len(audio) // 32 if audio else 0)
                 telemetry.record_stage("segments.fetch", _elapsed_ms(fetch_started),
                                        status="ok" if audio else "empty",
                                        tenant_id=ctx.tenant_id, channel=int(channel))

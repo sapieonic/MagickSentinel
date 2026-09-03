@@ -1,0 +1,138 @@
+# Grafana datasources, provisioned as code.
+#
+# The point of this file is not that the three datasources exist. It is the wiring
+# between them: every `tracesToLogsV2`, `derivedFields` and `exemplarTraceIdDestinations`
+# block below is one direction of a correlation, and without them an operator has three
+# separate tools that happen to be in the same browser tab.
+#
+# The three journeys they enable, and the question each one answers:
+#
+#   metric -> trace   A spike on the ingest-lag panel. Click the exemplar, land on the
+#                     trace of one slow ingest write. Answers "what was actually slow".
+#                     (exemplarTraceIdDestinations on Prometheus.)
+#   trace  -> log     From that trace, jump to the gateway's logs for the same service
+#                     and time window. Answers "what did it say while it was slow".
+#                     (tracesToLogsV2 on Tempo.)
+#   log    -> trace   From a log line, jump to its trace. Answers "what else happened
+#                     in this request". (derivedFields on Loki.)
+#   trace  -> metric  From a trace, jump to the rate/error/duration for its operation.
+#                     Answers "is this one slow request or all of them".
+#                     (tracesToMetrics on Tempo.)
+#
+# `uid` is fixed on each datasource rather than generated. The dashboard JSON in
+# ../dashboards/ references these uids, and a generated uid would mean a provisioned
+# dashboard pointing at a datasource that does not exist — which renders as a panel
+# saying "No data", indistinguishable on this product's dashboard from "no calls are
+# being captured".
+#
+# All three point inside the deployment. No managed backend, no non-India region: see
+# the residency note in ../../otel-collector.yaml. OPEN-4 is undecided and a telemetry
+# backend chosen by default is a residency answer given by accident.
+
+apiVersion: 1
+
+datasources:
+  # ================================================================= Prometheus ===
+  - name: Prometheus
+    uid: sentinel-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      # Must match prometheus.yml's global scrape_interval, or Grafana's automatic step
+      # calculation produces gaps on short ranges that look like missing data.
+      timeInterval: 15s
+      # The metric -> trace hop. Prometheus stores an exemplar (a trace id) alongside a
+      # histogram bucket sample; this tells Grafana which datasource to open it in.
+      # Needs --enable-feature=exemplar-storage on Prometheus, which compose passes.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: sentinel-tempo
+          urlDisplayLabel: "View trace"
+
+  # ====================================================================== Tempo ===
+  - name: Tempo
+    uid: sentinel-tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      # ---- trace -> log ----
+      tracesToLogsV2:
+        datasourceUid: sentinel-loki
+        # Match on service and the surrounding window rather than on trace_id alone.
+        # Logs emitted outside a span carry no trace_id, and those are frequently the
+        # interesting ones: a panic recovered by httpx.Recover, a connection failure
+        # before the span was started.
+        spanStartTimeShift: '-2m'
+        spanEndTimeShift: '2m'
+        filterByTraceID: false
+        filterBySpanID: false
+        tags:
+          - key: 'service.name'
+            value: 'service_name'
+        # `service_name` on the right because that is the Loki label the OTLP ingest
+        # path produces from the `service.name` resource attribute — Loki normalises
+        # dots to underscores in label names. Getting this wrong yields an empty log
+        # panel with no error, so it is worth stating why the two differ.
+
+      # ---- trace -> metric ----
+      tracesToMetrics:
+        datasourceUid: sentinel-prometheus
+        spanStartTimeShift: '-5m'
+        spanEndTimeShift: '5m'
+        tags:
+          - key: 'service.name'
+            value: 'service_name'
+        queries:
+          - name: 'Ingest lag p95 for this tenant'
+            query: |
+              histogram_quantile(0.95, sum by (le) (rate(sentinel_ingest_lag_seconds_bucket{$$__tags}[5m])))
+
+      # The service graph and node graph both come from Tempo's metrics generator,
+      # which is deliberately OFF (see ../../tempo.yaml: it would create a time series
+      # per span name, and this product's span names include per-call operations).
+      # Declared false rather than omitted so that a blank service-graph tab reads as a
+      # decision rather than as a broken install.
+      serviceMap:
+        datasourceUid: sentinel-prometheus
+      nodeGraph:
+        enabled: false
+      streamingEnabled:
+        search: true
+
+  # ======================================================================= Loki ===
+  - name: Loki
+    uid: sentinel-loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      # ---- log -> trace ----
+      derivedFields:
+        # Loki's OTLP ingest puts trace_id and span_id into structured metadata, so
+        # they are real fields on the record rather than substrings of the body.
+        # `matcherType: label` reads them from there; a regex over the line would only
+        # work for emitters that happen to print the id into the message.
+        - name: TraceID
+          matcherType: label
+          matcherRegex: trace_id
+          url: '$${__value.raw}'
+          datasourceUid: sentinel-tempo
+          urlDisplayLabel: 'View trace'
+        # Fallback for anything that logs the id in the body instead — the Rust agent's
+        # tracing-subscriber JSON layer, for example, if it is configured before the
+        # OTel bridge is wired in. Harmless when the label path already matched.
+        - name: TraceIDInBody
+          matcherType: regex
+          matcherRegex: '"trace_id"\s*:\s*"([a-f0-9]{32})"'
+          url: '$${__value.raw}'
+          datasourceUid: sentinel-tempo
+          urlDisplayLabel: 'View trace (from body)'
+      # OTLP ingest is the only writer, so the query path should assume the v3 API.
+      maxLines: 2000

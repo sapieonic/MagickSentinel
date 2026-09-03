@@ -1,0 +1,113 @@
+# Loki: log storage, receiving OTLP directly from the collector.
+#
+# WHY OTLP INGEST RATHER THAN PROMTAIL OR THE COLLECTOR'S `loki` EXPORTER.
+#
+# The older path was: collector -> `loki` exporter -> Loki's push API, with the
+# exporter deciding which OTel attributes became Loki *labels*. That decision is the
+# one that goes wrong, and it goes wrong in a way that takes the whole log store down:
+# every distinct value of a label creates a new stream, so promoting `call_id` — which
+# a well-meaning configuration will do, because it is the most useful thing to filter
+# on — creates one stream per call. A floor doing ten thousand calls a day produces ten
+# thousand streams a day.
+#
+# Loki 3's native OTLP endpoint (/otlp/v1/logs) inverts the default: resource
+# attributes become labels, everything else becomes structured metadata, which is
+# queryable without being indexed. `call_id` is then filterable and costs nothing.
+# That is why the collector uses `otlphttp` to /otlp rather than the `loki` exporter.
+#
+# RESIDENCY (OPEN-4): filesystem storage inside the deployment. Log records reach here
+# after the collector's redaction, so they should carry no borrower content — but
+# "should" is doing work in that sentence, which is exactly why nothing points at a
+# managed log service with a non-India default region. See the header of
+# deploy/observability/otel-collector.yaml.
+
+auth_enabled: false
+# Single-tenant. Loki's multi-tenancy is an X-Scope-OrgID header, and it is NOT the
+# place to enforce Sentinel's tenant isolation: that lives in PostgreSQL row-level
+# security, and putting a second, weaker copy of it here would invite someone to treat
+# a Loki tenant header as a security boundary. `tenant_id` is a structured-metadata
+# field on the log record, filterable in a query, and not a trust boundary.
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # OTLP ingest, on.
+  allow_structured_metadata: true
+
+  otlp_config:
+    resource_attributes:
+      # Exactly these become Loki labels, and nothing else. The list is short on
+      # purpose — every label is an index dimension and every distinct combination is a
+      # stream. These three are bounded: three services, a handful of environments, one
+      # region.
+      attributes_config:
+        - action: index_label
+          attributes:
+            - service.name
+            - deployment.environment
+            - region
+    # Everything else — call_id, tenant_id, device_id, trace_id, span_id — arrives as
+    # structured metadata. Queryable with `| tenant_id="..."`, not indexed, unbounded
+    # cardinality costs nothing.
+
+  # 31 days. Deliberately NOT tied to OPEN-6's audio (30) or transcript (365)
+  # placeholders: those are borrower-data retention periods and this is operational
+  # log retention. Application logs must carry no borrower content at all — spec 12.10
+  # and 15 — so if these two numbers ever need to agree, something has gone wrong
+  # upstream of this file.
+  retention_period: 744h
+
+  # A single log line larger than this is carrying data rather than describing an
+  # event. The collector already truncates bodies at 2 KiB (transform/log_bodies); this
+  # is the backstop for a path that bypasses the collector.
+  max_line_size: 65536
+  max_line_size_truncate: true
+
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+
+compactor:
+  working_directory: /loki/compactor
+  # Retention is only actually enforced when the compactor is told to do it. Without
+  # these two, `retention_period` is a number in a config file and the disk fills.
+  retention_enabled: true
+  delete_request_store: filesystem
+
+# The Loki ruler is off. Alerting lives in Prometheus (see rules/sentinel.rules.yml),
+# in one place, so that "which system alerts on what" has one answer. A log-based alert
+# would also be alerting on the presence of an error message, and this product's
+# failures are characterised by the absence of signals rather than the presence of
+# errors.
+ruler:
+  alertmanager_url: ""
+
+analytics:
+  # No usage reporting to Grafana Labs. It is anonymous and it is still an outbound
+  # connection from a component that has seen every log line in a system handling
+  # borrower data, from a deployment whose residency question (OPEN-4) is open.
+  reporting_enabled: false

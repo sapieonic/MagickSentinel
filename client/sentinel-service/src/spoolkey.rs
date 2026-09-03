@@ -51,6 +51,7 @@ const KEY_BYTES: usize = 32;
 ///
 /// Visible to anyone inspecting the blob, so it names the product and nothing else — no
 /// tenant, no device id, no user.
+#[cfg(windows)]
 const BLOB_DESCRIPTION: &str = "MagickVoice Sentinel spool key";
 
 #[derive(Debug, thiserror::Error)]

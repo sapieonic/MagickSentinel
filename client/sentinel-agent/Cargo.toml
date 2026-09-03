@@ -67,3 +67,7 @@ windows = { version = "0.58", features = [
 tempfile.workspace = true
 ulid.workspace = true
 hound.workspace = true
+# Verifying, in a test, that a signature made through the `rustls::sign::Signer` the
+# device credential installs really does verify against the enrolled public key. Only
+# a dev-dependency: the agent itself never touches key material directly.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

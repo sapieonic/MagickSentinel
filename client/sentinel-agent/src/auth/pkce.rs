@@ -90,6 +90,40 @@ pub struct OidcConfig {
     pub scopes: Vec<String>,
 }
 
+impl OidcConfig {
+    /// Build the config from the machine-scoped local config the installer wrote.
+    ///
+    /// This is the whole of what moved when the endpoints stopped being hard-coded in
+    /// `SentinelAgent`'s `main`. The authorize endpoint, the client id and the Identity
+    /// Platform tenant come from `LocalConfig::oidc`, written per tenant by the
+    /// installer; the token endpoint defaults to the gateway's
+    /// `{api_base}/v1/oauth/token`, whose wire contract —
+    /// `application/x-www-form-urlencoded` in, JSON out as
+    /// [`crate::api`] parses it — is unchanged and not this function's business.
+    ///
+    /// OPEN-2 is deliberately not resolved here. Nothing in this mapping names a
+    /// provider: the RFC 8252 + PKCE flow is identical against Identity Platform and
+    /// against Entra ID, and `identity_platform_tenant` is `Option` precisely so a
+    /// provider with no tenant parameter simply leaves it unset.
+    pub fn from_local(local: &sentinel_core::config::LocalConfig) -> Self {
+        OidcConfig {
+            authorize_endpoint: local.oidc.authorize_endpoint.trim().to_string(),
+            token_endpoint: local.token_endpoint(),
+            client_id: local.oidc.client_id.trim().to_string(),
+            // The installer's `TENANTHINT` is the fallback: it is the same value, and
+            // an installation that filled in one of the two and not the other should
+            // sign in rather than fail on a field that is present under another name.
+            tenant_id: local
+                .oidc
+                .identity_platform_tenant
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| local.tenant_hint.clone().filter(|t| !t.trim().is_empty())),
+            scopes: local.oidc.scopes.clone(),
+        }
+    }
+}
+
 /// One in-flight sign-in attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthAttempt {
@@ -282,6 +316,67 @@ pub fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use sentinel_core::config::LocalConfig;
+
+    #[test]
+    fn the_oidc_config_comes_from_local_config_rather_than_from_constants() {
+        let mut local = LocalConfig {
+            api_base_url: "https://api.acme-bpo.example.com/".into(),
+            tenant_hint: Some("tenant-from-installer".into()),
+            ..LocalConfig::default()
+        };
+        local.oidc.authorize_endpoint = "https://idp.acme.example.com/o/oauth2/v2/auth".into();
+        local.oidc.client_id = "acme-desktop".into();
+        local.oidc.identity_platform_tenant = Some("ip-tenant-acme".into());
+
+        let cfg = OidcConfig::from_local(&local);
+        assert_eq!(cfg.authorize_endpoint, "https://idp.acme.example.com/o/oauth2/v2/auth");
+        assert_eq!(cfg.client_id, "acme-desktop");
+        assert_eq!(cfg.tenant_id.as_deref(), Some("ip-tenant-acme"));
+        // The token endpoint's URL moved into config; its contract did not.
+        assert_eq!(cfg.token_endpoint, "https://api.acme-bpo.example.com/v1/oauth/token");
+        assert_eq!(cfg.scopes, vec!["openid", "email", "profile"]);
+    }
+
+    #[test]
+    fn the_installers_tenant_hint_is_the_fallback_for_the_identity_platform_tenant() {
+        // Two properties carrying the same value is a deployment reality; failing on
+        // the one that was left blank would be a support ticket, not a safeguard.
+        let mut local = LocalConfig {
+            tenant_hint: Some("tenant-from-installer".into()),
+            ..LocalConfig::default()
+        };
+        assert_eq!(
+            OidcConfig::from_local(&local).tenant_id.as_deref(),
+            Some("tenant-from-installer")
+        );
+        local.oidc.identity_platform_tenant = Some("  ".into());
+        assert_eq!(
+            OidcConfig::from_local(&local).tenant_id.as_deref(),
+            Some("tenant-from-installer"),
+            "a blank tenant is not a tenant"
+        );
+        local.tenant_hint = None;
+        local.oidc.identity_platform_tenant = None;
+        assert_eq!(
+            OidcConfig::from_local(&local).tenant_id, None,
+            "a provider with no tenant concept sends no tenantId at all"
+        );
+    }
+
+    #[test]
+    fn a_configured_token_endpoint_overrides_the_gateways() {
+        let mut local = LocalConfig {
+            api_base_url: "https://api.example.com".into(),
+            ..LocalConfig::default()
+        };
+        local.oidc.token_endpoint = Some("https://idp.example.com/oauth2/v2/token".into());
+        assert_eq!(
+            OidcConfig::from_local(&local).token_endpoint,
+            "https://idp.example.com/oauth2/v2/token"
+        );
+    }
+
     use super::*;
 
     /// Deterministic entropy: each call yields a distinct, reproducible block.

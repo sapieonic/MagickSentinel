@@ -23,6 +23,7 @@ use sentinel_core::config::Policy;
 use sentinel_core::events::ClientEvent;
 use sentinel_core::protocol::CaptureTier;
 use sentinel_core::state::{BlockReason, CallState};
+use sentinel_service::telemetry;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -85,6 +86,11 @@ pub struct Agent {
     /// Set once `4403` or a 403 heartbeat has been seen; terminal until an operator
     /// acts, per wire.md.
     revoked: bool,
+    /// Capture state as of the previous tick, so a change can be reported once rather
+    /// than every 20 ms.
+    last_reported_state: Option<CallState>,
+    /// Whether the last tick believed a user was signed in, same reason.
+    last_reported_signed_in: Option<bool>,
 }
 
 impl Agent {
@@ -115,6 +121,8 @@ impl Agent {
             pinned_device_present: false,
             pending_events: Vec::new(),
             revoked: false,
+            last_reported_state: None,
+            last_reported_signed_in: None,
         }
     }
 
@@ -123,6 +131,17 @@ impl Agent {
     pub fn with_signout_deadline(mut self, d: Duration) -> Self {
         self.signout_deadline = d;
         self
+    }
+
+    /// Attach a client event to the next heartbeat.
+    ///
+    /// The way anything outside the capture pipeline gets a machine-state fact in front
+    /// of an operator. `main` uses it for the two start-up failures that block capture
+    /// without the pipeline ever existing to report them — no spool key, and no device
+    /// credential — because a machine that silently never records is the product's
+    /// worst failure mode and the heartbeat is where it has to show up.
+    pub fn record_event(&mut self, event: ClientEvent) {
+        self.pending_events.push(event);
     }
 
     pub fn identity_status(&self, now_ms: u64) -> IdentityStatus {
@@ -214,9 +233,14 @@ impl Agent {
             self.pending_events.extend(p.take_events());
         }
         result.capture_state = Some(self.capture_state());
+        self.report_capture_state(now_ms, status);
+        self.report_sign_in_state();
 
-        // 3. Uplink.
-        {
+        // 3. Uplink. Not while revoked: wire.md makes `4403` terminal until an
+        //    operator acts, and a client that kept reconnecting would spend a revoked
+        //    floor's uplink on handshakes the gateway is going to refuse. The spool is
+        //    left alone — the audio stays, and it uploads if the device is reinstated.
+        if !self.revoked {
             let mut uplink = self.uplink.lock().unwrap();
             let outcome = uplink.pump(now_ms);
             result.segments_sent = outcome.sent;
@@ -279,6 +303,21 @@ impl Agent {
             pinned_device_present: self.pinned_device_present,
         };
         let events = std::mem::take(&mut self.pending_events);
+        // Spool depth is sampled here rather than on every tick: it changes constantly
+        // during a call and what matters is the trend, which the heartbeat cadence
+        // already captures. Eviction, which is data loss, is reported the moment it
+        // happens instead.
+        tracing::info!(
+            target: telemetry::TARGET,
+            event = telemetry::event::SPOOL_DEPTH,
+            spool_depth = stats.segments,
+            spool_bytes = stats.bytes,
+            capture_state = %inputs.capture_state,
+            "spool depth sampled"
+        );
+        for ev in &events {
+            report_client_event(ev);
+        }
         let body = heartbeat::build(&inputs, &events, now_ms, time::OffsetDateTime::now_utc());
         match self.api.heartbeat(&token, &body) {
             Ok(_) => {
@@ -287,6 +326,15 @@ impl Agent {
             }
             Err(ApiError::Forbidden) => {
                 // Revoked. Terminal until an operator acts.
+                if !self.revoked {
+                    tracing::error!(
+                        target: telemetry::TARGET,
+                        event = telemetry::event::DEVICE_REVOKED,
+                        source = "heartbeat_403",
+                        "the gateway refused this device; capture stops and the uplink \
+                         stops reconnecting until an operator reinstates it"
+                    );
+                }
                 self.revoked = true;
                 self.gate.set_device_revoked(true);
                 false
@@ -338,6 +386,96 @@ impl Agent {
         self.auth.last_signout_steps()
     }
 
+    /// Report a capture state change once, with the reason when it is a block.
+    ///
+    /// This is the instrumentation that matters most on an endpoint. The product's
+    /// dangerous failure is not a crash — a crash is visible — it is a machine that
+    /// reports itself healthy, has a signed-in user and a live dialer session, and
+    /// records nothing. The server-side alert for that needs the client to keep saying
+    /// what it is doing and, when it is not recording, **why**.
+    fn report_capture_state(&mut self, now_ms: u64, status: IdentityStatus) {
+        let state = self.capture_state();
+        if self.last_reported_state == Some(state) {
+            return;
+        }
+        let previous = self.last_reported_state;
+        self.last_reported_state = Some(state);
+
+        let armed = matches!(state, CallState::Armed | CallState::InCall | CallState::Wrap);
+        let was_armed = matches!(
+            previous,
+            Some(CallState::Armed | CallState::InCall | CallState::Wrap)
+        );
+
+        let event = if state == CallState::Blocked {
+            telemetry::event::CAPTURE_BLOCKED
+        } else if armed && !was_armed {
+            telemetry::event::CAPTURE_ARMED
+        } else if was_armed && !armed {
+            telemetry::event::CAPTURE_DISARMED
+        } else {
+            // Idle to Finalize and back: real, uninteresting, and not worth a record
+            // per call transition on 200 desktops.
+            return;
+        };
+
+        // `reason` is the whole point of the blocked case. `IdentityStatus` knows about
+        // sign-out, revocation and the grace clock; the pinned device is the one cause
+        // it cannot see, so it is checked separately.
+        let reason = if state == CallState::Blocked {
+            Some(match status.block_reason() {
+                Some(BlockReason::SignedOut) => "signed_out",
+                Some(BlockReason::PinnedDeviceMissing) => "pinned_device_missing",
+                Some(BlockReason::OfflineGraceExpired) => "offline_grace_expired",
+                Some(BlockReason::DeviceRevoked) => "device_revoked",
+                Some(BlockReason::Shutdown) => "shutdown",
+                None if !self.pinned_device_present => "pinned_device_missing",
+                None if self.pipeline.is_none() => "no_capture_pipeline",
+                None => "unknown",
+            })
+        } else {
+            None
+        };
+
+        tracing::info!(
+            target: telemetry::TARGET,
+            event,
+            capture_state = state.as_str(),
+            previous_state = previous.map(CallState::as_str).unwrap_or("none"),
+            reason = reason.unwrap_or(""),
+            dialer_session_active = self.dialer_session_active,
+            pinned_device_present = self.pinned_device_present,
+            signed_in = self.auth.state().is_signed_in(),
+            capture_tier = self.info.tier.map(tier_name).unwrap_or_else(|| "none".into()),
+            uptime_ms = now_ms,
+            "capture state changed"
+        );
+    }
+
+    /// Report a change in sign-in state once.
+    ///
+    /// Read from `AuthService` on the tick rather than emitted from `on_signed_in` and
+    /// `sign_out`, because those are not the only ways the state changes: a refresh
+    /// that fails past the token's lifetime signs the session out from inside the auth
+    /// service, and that is precisely the case an operator needs to see — an agent
+    /// sitting at a locked widget for a whole shift because the IdP stopped answering.
+    fn report_sign_in_state(&mut self) {
+        let signed_in = self.auth.state().is_signed_in();
+        if self.last_reported_signed_in == Some(signed_in) {
+            return;
+        }
+        self.last_reported_signed_in = Some(signed_in);
+        // No UID. The server already knows who signed in, from the bearer token it
+        // verified; putting one in a telemetry backend would be gratuitous as well as
+        // forbidden (spec 12.10).
+        tracing::info!(
+            target: telemetry::TARGET,
+            event = telemetry::event::SIGN_IN_STATE,
+            signed_in,
+            "sign-in state changed"
+        );
+    }
+
     fn widget_state(&self, now_ms: u64) -> WidgetState {
         let status = self.gate.status(now_ms);
         let capture_state = self.capture_state();
@@ -359,6 +497,36 @@ impl Agent {
             recording: matches!(capture_state, CallState::InCall | CallState::Wrap),
             spool_depth: self.uplink.lock().unwrap().stats().segments,
         }
+    }
+}
+
+/// Mirror a client event into telemetry.
+///
+/// The same events the heartbeat carries, so a floor that has telemetry on and a floor
+/// that does not both surface them — the heartbeat stays the authoritative signal and
+/// this is the one an operator can graph. Eviction is separated out because it is data
+/// loss and deserves its own name and its own severity.
+fn report_client_event(ev: &ClientEvent) {
+    use sentinel_core::events::EventKind;
+    match ev.kind {
+        EventKind::SpoolEviction => tracing::error!(
+            target: telemetry::TARGET,
+            event = telemetry::event::SPOOL_EVICTED,
+            // The count is the number of segments of borrower audio that will never
+            // reach the server. It is the reason this event exists.
+            evicted = ev.count.unwrap_or(0),
+            "the spool evicted audio that was never acknowledged"
+        ),
+        other => tracing::warn!(
+            target: telemetry::TARGET,
+            event = "client.event",
+            // `detail` is machine state by construction — `sentinel_core::events`
+            // states the rule and the enum shape enforces it.
+            kind = ?other,
+            count = ev.count.unwrap_or(0),
+            detail = ev.detail.as_deref().unwrap_or(""),
+            "client event"
+        ),
     }
 }
 

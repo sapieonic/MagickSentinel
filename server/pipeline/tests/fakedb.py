@@ -89,11 +89,14 @@ class FakeDatabase:
         return self
 
     def respond(self, sql: str, params: tuple | None) -> FakeCursor:
+        # Matched against the whitespace-collapsed SQL so a test's fragment can span
+        # the line breaks the real statements are formatted with.
+        squashed = " ".join(sql.split())
         for fragment, exc in self.raise_on.items():
-            if fragment in sql:
+            if fragment in squashed:
                 raise exc
         for handler in self.handlers:
-            if handler.match in sql and handler.results:
+            if handler.match in squashed and handler.results:
                 return handler.results.pop(0)
         # An unscripted statement is a write in nearly every case; report one row
         # affected so an upsert's rowcount reads as success.

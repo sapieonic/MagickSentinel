@@ -180,10 +180,16 @@ class S3BlobStore:
 
     ``client`` injects a pre-built client so tests exercise this class without
     credentials or a network.
+
+    There is deliberately no bucket prefix. The gateway's writer
+    (``internal/blob/s3.go``) puts objects at the key ``SegmentKey`` returns and
+    nothing else, and the comment there spells out why: a layer that rewrote,
+    prefixed or flattened keys would break the day-prefix retention delete. A prefix
+    configured on only one of the two services is also the exact silent mismatch the
+    key-format test at the top of this module exists to prevent.
     """
 
     bucket: str
-    prefix: str = ""
     region: str | None = None
     endpoint_url: str | None = None
     client: object = None
@@ -199,12 +205,9 @@ class S3BlobStore:
                 "s3", region_name=self.region, endpoint_url=self.endpoint_url
             )
 
-    def _key(self, key: str) -> str:
-        return f"{self.prefix}{key}" if self.prefix else key
-
     def get(self, key: str) -> bytes | None:
         try:
-            resp = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
+            resp = self.client.get_object(Bucket=self.bucket, Key=key)
         except Exception as exc:  # noqa: BLE001 - botocore's exceptions are dynamic
             # Only a genuine absence is None. Anything else — a permissions error, a
             # throttle — must propagate, because treating it as "no audio" would mark
@@ -215,7 +218,7 @@ class S3BlobStore:
         return resp["Body"].read()
 
     def delete(self, key: str) -> None:
-        self.client.delete_object(Bucket=self.bucket, Key=self._key(key))
+        self.client.delete_object(Bucket=self.bucket, Key=key)
 
     def delete_prefix(self, prefix: str) -> int:
         removed = 0
@@ -241,7 +244,7 @@ class S3BlobStore:
 
     def _list_keys(self, prefix: str) -> Iterable[str]:
         paginator = self.client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._key(prefix)):
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents") or []:
                 yield obj["Key"]
 
@@ -250,12 +253,10 @@ class S3BlobStore:
         # thousand days rather than one per object.
         paginator = self.client.get_paginator("list_objects_v2")
         out: list[str] = []
-        strip = len(self.prefix)
-        for page in paginator.paginate(
-            Bucket=self.bucket, Prefix=self._key(prefix), Delimiter="/"
-        ):
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix,
+                                       Delimiter="/"):
             for common in page.get("CommonPrefixes") or []:
-                out.append(common["Prefix"][strip:] if strip else common["Prefix"])
+                out.append(common["Prefix"])
         return sorted(out)
 
 
@@ -268,35 +269,39 @@ def _is_not_found(exc: Exception) -> bool:
 #: Where the ASR default already put the region question. OPEN-4 is not settled, and
 #: the OpenAPI document annotates production as ap-south-1, so that is the default
 #: here rather than boto3's (which is "whatever the environment happens to say").
+#: Same value and same reasoning as ``blob.DefaultRegion`` on the gateway side.
 DEFAULT_REGION = "ap-south-1"
 
 
 def blob_store_from_env(env: dict[str, str] | None = None) -> BlobStore:
-    """Build the object store the same way the gateway chooses one.
+    """Build the object store the way the gateway chooses one, from the same names.
 
-    ``SENTINEL_BLOB_BUCKET``     S3 bucket; selects the S3 backend.
-    ``SENTINEL_BLOB_PREFIX``     optional key prefix inside the bucket, "" by default.
-    ``SENTINEL_S3_REGION``       AWS region, ``ap-south-1`` by default (OPEN-4).
-    ``SENTINEL_S3_ENDPOINT_URL`` MinIO or another S3-compatible endpoint.
-    ``SENTINEL_BLOB_DIR``        local directory; selects the development backend.
+    ``SENTINEL_S3_BUCKET``    S3 bucket; selects the S3 backend.
+    ``SENTINEL_S3_REGION``    AWS region, ``ap-south-1`` by default (OPEN-4).
+    ``SENTINEL_S3_ENDPOINT``  MinIO or another S3-compatible endpoint.
+    ``SENTINEL_BLOB_DIR``     local directory; selects the development backend.
+
+    The variable names are the gateway's, deliberately: the writer and the reader
+    have to be pointed at the same bucket, and two services with two spellings of
+    the same setting is how they end up pointed at different ones — which does not
+    fail, it just finds no audio.
 
     Refuses to guess when neither is set. ``main.go`` takes the same line for the
     same reason: a pipeline pointed at nothing transcribes nothing and reports it as
     an ASR problem.
     """
     env = dict(os.environ if env is None else env)
-    bucket = env.get("SENTINEL_BLOB_BUCKET")
+    bucket = env.get("SENTINEL_S3_BUCKET")
     if bucket:
         return S3BlobStore(
             bucket=bucket,
-            prefix=env.get("SENTINEL_BLOB_PREFIX", ""),
             region=env.get("SENTINEL_S3_REGION") or DEFAULT_REGION,
-            endpoint_url=env.get("SENTINEL_S3_ENDPOINT_URL") or None,
+            endpoint_url=env.get("SENTINEL_S3_ENDPOINT") or None,
         )
     directory = env.get("SENTINEL_BLOB_DIR")
     if directory:
         return DirBlobStore(root=directory)
     raise RuntimeError(
-        "no object storage configured: set SENTINEL_BLOB_BUCKET for S3 or "
+        "no object storage configured: set SENTINEL_S3_BUCKET for S3 or "
         "SENTINEL_BLOB_DIR for a local directory"
     )

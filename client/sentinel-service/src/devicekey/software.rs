@@ -38,7 +38,11 @@
 
 use super::{DeviceKey, DeviceKeyError, KeyKind, Result};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+// The PKCS#8 impls live on `SecretKey`, not on `SigningKey`: `ecdsa`'s own PKCS#8
+// support is a separate feature and this way the file format is the standard
+// `elliptic-curve` one that OpenSSL and Go both read.
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use p256::SecretKey;
 use std::path::{Path, PathBuf};
 
 /// File the key is stored in, inside the device credential directory.
@@ -111,10 +115,11 @@ impl SoftwareDeviceKey {
         let path = dir.join(KEY_FILE);
         Self::warn_loudly(&path);
 
-        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
-        let pem = key
-            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
-            .map_err(|e| DeviceKeyError::Malformed(e.to_string()))?;
+        let secret = SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let pem = secret
+            .to_pkcs8_pem(LineEnding::LF)
+            .map_err(|e: p256::pkcs8::Error| DeviceKeyError::Malformed(e.to_string()))?;
+        let key = SigningKey::from(&secret);
         std::fs::create_dir_all(dir)?;
         // Write-then-rename, for the same reason `device::save_identity` does it: a
         // torn key file would make the machine look unenrolled and mint a second
@@ -135,9 +140,9 @@ impl SoftwareDeviceKey {
             Err(e) => return Err(DeviceKeyError::Io(e)),
         };
         Self::warn_loudly(path);
-        let key = SigningKey::from_pkcs8_pem(&pem)
-            .map_err(|e| DeviceKeyError::Malformed(e.to_string()))?;
-        Ok(SoftwareDeviceKey { key, path: path.to_path_buf() })
+        let secret = SecretKey::from_pkcs8_pem(&pem)
+            .map_err(|e: p256::pkcs8::Error| DeviceKeyError::Malformed(e.to_string()))?;
+        Ok(SoftwareDeviceKey { key: SigningKey::from(&secret), path: path.to_path_buf() })
     }
 
     /// The file the key lives in, for diagnostics.

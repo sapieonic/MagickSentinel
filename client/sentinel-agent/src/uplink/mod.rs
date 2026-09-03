@@ -20,6 +20,7 @@ use sentinel_core::protocol::{
     Channel, ControlMessage, MediaRecord, SEGMENTS_PER_MESSAGE,
 };
 use sentinel_core::spool::{SegmentRow, Spool, SpoolStats};
+use sentinel_service::telemetry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 pub use transport::{Incoming, Transport, TransportError};
@@ -89,6 +90,17 @@ pub struct Uplink {
     /// spend its uplink re-sending the same seconds tens of times. Cleared on
     /// reconnect, which is exactly when a re-send *is* wanted.
     sent_through: BTreeMap<(String, Channel), u32>,
+    /// Clock reading of the most recent send on each `(call_id, channel)`.
+    ///
+    /// Only used to report ack lag in telemetry: on an ack, `now - sent_at` is the
+    /// round trip from the last thing we put on the wire for that channel to the
+    /// gateway's acknowledgement of it. That is an approximation — the ack may be for
+    /// an earlier sequence than the last one sent — and it is the right one, because
+    /// what an operator wants from this number is "how far behind the server is",
+    /// which is exactly the gap between the newest thing sent and the newest thing
+    /// confirmed. Per-segment timing would cost a map entry per segment on a link that
+    /// is already the constrained resource.
+    sent_at_ms: BTreeMap<(String, Channel), u64>,
     /// Calls whose `call.start` was a *replay* on this connection and whose `resume`
     /// has not arrived yet.
     ///
@@ -101,6 +113,10 @@ pub struct Uplink {
     awaiting_resume: BTreeMap<String, u64>,
     events: Vec<ClientEvent>,
     policy_version: i64,
+    /// Successful connects since the process started. Zero distinguishes the first
+    /// connect from a reconnect, which is the difference between "the agent started"
+    /// and "the floor's internet dropped again".
+    connects: u64,
     /// How long each `pump` blocks waiting for a message. Only the integration tests
     /// change it: they drive thousands of passes over a loopback socket, where the
     /// production 50 ms slice would spend all its time waiting for a server that
@@ -122,9 +138,11 @@ impl Uplink {
             known_calls,
             resume_points: BTreeMap::new(),
             sent_through: BTreeMap::new(),
+            sent_at_ms: BTreeMap::new(),
             awaiting_resume: BTreeMap::new(),
             events: Vec::new(),
             policy_version: 0,
+            connects: 0,
             recv_slice: RECV_SLICE,
         }
     }
@@ -194,20 +212,39 @@ impl Uplink {
             if now_ms < self.next_attempt_ms {
                 return outcome;
             }
+            let reconnect = self.connects > 0;
             match self.factory.connect() {
                 Ok(t) => {
-                    tracing::info!("ingest connected");
+                    self.connects += 1;
+                    tracing::info!(
+                        target: telemetry::TARGET,
+                        event = telemetry::event::UPLINK_CONNECTED,
+                        reconnect,
+                        connects = self.connects,
+                        spool_depth = self.spool.stats().unwrap_or_default().segments,
+                        "ingest connected"
+                    );
                     self.transport = Some(t);
                     self.started_this_connection.clear();
                     self.ended_this_connection.clear();
                     self.resume_points.clear();
                     self.sent_through.clear();
+                    self.sent_at_ms.clear();
                     self.awaiting_resume.clear();
                 }
                 Err(e) => {
                     let delay = self.backoff.next_delay();
                     self.next_attempt_ms = now_ms.saturating_add(delay.as_millis() as u64);
-                    tracing::warn!(error = %e, retry_in_ms = delay.as_millis() as u64, "ingest connect failed");
+                    // The error text is ours, from the transport; it carries a host and
+                    // a TLS or socket reason and no call content.
+                    tracing::warn!(
+                        target: telemetry::TARGET,
+                        event = telemetry::event::UPLINK_CONNECT_FAILED,
+                        error = %e,
+                        retry_in_ms = delay.as_millis() as u64,
+                        spool_depth = self.spool.stats().unwrap_or_default().segments,
+                        "ingest connect failed"
+                    );
                     return outcome;
                 }
             }
@@ -297,7 +334,8 @@ impl Uplink {
                     tracing::error!(seq = row.seq, "segment too large to encode; skipped");
                     continue;
                 }
-                self.sent_through.insert(key, row.seq);
+                self.sent_through.insert(key.clone(), row.seq);
+                self.sent_at_ms.insert(key, now_ms);
                 in_batch += 1;
                 outcome.sent += 1;
                 if in_batch == SEGMENTS_PER_MESSAGE {
@@ -339,7 +377,13 @@ impl Uplink {
                             // Terminal until an operator acts: revoked device, tenant
                             // mismatch, or a role that may not ingest.
                             outcome.device_revoked = true;
-                            tracing::error!("ingest refused: device revoked or not permitted");
+                            tracing::error!(
+                                target: telemetry::TARGET,
+                                event = telemetry::event::DEVICE_REVOKED,
+                                close_code = transport::close::FORBIDDEN as u64,
+                                source = "ingest_close",
+                                "ingest refused: device revoked or not permitted"
+                            );
                         }
                         Some(transport::close::TOKEN_INVALID) => {
                             outcome.token_rejected = true;
@@ -366,11 +410,28 @@ impl Uplink {
         match msg {
             ControlMessage::Ack { call_id, channel, through_seq } => {
                 let Ok(ch) = Channel::from_u8(channel) else { return };
+                let lag_ms = self
+                    .sent_at_ms
+                    .get(&(call_id.clone(), ch))
+                    .map(|sent| now_ms.saturating_sub(*sent));
                 match self.spool.ack(&call_id, ch, through_seq) {
                     Ok(deleted) => {
                         outcome.acked += deleted;
                         outcome.verified = true;
                         self.backoff.reset();
+                        if let Some(lag_ms) = lag_ms {
+                            // No call_id: it is a ULID the client minted, but it is
+                            // still a per-call identifier, and a telemetry backend is
+                            // not where per-call identifiers belong.
+                            tracing::debug!(
+                                target: telemetry::TARGET,
+                                event = telemetry::event::UPLINK_ACK_LAG,
+                                lag_ms,
+                                channel = ch.as_u8() as u64,
+                                deleted = deleted as u64,
+                                "ingest acknowledged"
+                            );
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "ack could not be applied"),
                 }
@@ -480,7 +541,14 @@ impl Uplink {
         }
         let delay = self.backoff.next_delay();
         self.next_attempt_ms = now_ms.saturating_add(delay.as_millis() as u64);
-        tracing::warn!(reason = why, retry_in_ms = delay.as_millis() as u64, "ingest disconnected");
+        tracing::warn!(
+            target: telemetry::TARGET,
+            event = telemetry::event::UPLINK_DISCONNECTED,
+            reason = why,
+            retry_in_ms = delay.as_millis() as u64,
+            spool_depth = self.spool.stats().unwrap_or_default().segments,
+            "ingest disconnected"
+        );
         self.events
             .push(ClientEvent::new(EventKind::CaptureError, now_ms).with_detail("uplink_reconnect".into()));
     }

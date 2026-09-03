@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
@@ -377,6 +377,23 @@ class PostgresCallRepository:
         Recomputed per call from ``analyses.cost_paise`` rather than kept in a
         counter: a counter drifts when a call is re-run, and a budget that drifts
         upward stops analysis for a tenant that has not actually spent the money.
+
+        The month boundary is the database's (UTC), not the tenant's. For a floor in
+        IST that moves the reset by five and a half hours once a month, which is not
+        worth a per-tenant ``AT TIME ZONE`` on a query that runs on every call.
+
+        **Known understatement: tier-2 judge spend is not in this figure.** The
+        schema has one cost column, ``analyses.cost_paise``, and ``worker.py``
+        writes the analysis row before the judge runs, so a judged call's judge
+        tokens are counted against the in-memory budget for that call and then
+        forgotten. The effect is that the monthly total the budget compares against
+        the cap is low by the judge's share — roughly the tier-1 hit rate plus the
+        judge sample percentage, so single-digit percent, but low rather than high,
+        which is the wrong direction for a spend control. Judge spend *is* visible
+        per tenant and per model in the ``sentinel.model.spend`` metric
+        (:mod:`sentinel_pipeline.telemetry`), which is the honest workaround until
+        there is somewhere to persist it: either a cost column on ``flags`` or a
+        per-call spend ledger. Both are schema changes and neither is this change.
         """
         with self.db.as_system(tenant_id) as conn:
             row = conn.execute(_BUDGET_SQL, (tenant_id,)).fetchone()

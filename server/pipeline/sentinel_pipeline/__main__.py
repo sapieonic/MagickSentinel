@@ -27,8 +27,10 @@ import os
 import sys
 from datetime import date
 
+from .cdr import CdrUnavailable
 from .consumer import NatsConfigError
 from .db import DatabaseConfigError
+from .providers.registry import ProviderConfigError
 from .service import (
     build_finalize_service,
     configure_logging,
@@ -104,7 +106,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_coverage(env, day=date.fromisoformat(args.day) if args.day else None)
         if args.command == "check":
             return _check(env)
-    except (DatabaseConfigError, NatsConfigError) as exc:
+    except (DatabaseConfigError, NatsConfigError, ProviderConfigError,
+            CdrUnavailable) as exc:
         # Configuration errors are for a human reading a deploy log, not a stack
         # trace: they name the variable that is wrong.
         log.error("configuration error", extra={"detail": str(exc)})

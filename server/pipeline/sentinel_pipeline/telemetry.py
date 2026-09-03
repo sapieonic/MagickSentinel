@@ -56,7 +56,7 @@ SERVICE_NAME = "sentinel-pipeline"
 SPAN_ATTRIBUTES = frozenset({
     "tenant_id", "call_id", "channel", "stage", "provider", "model", "rule_id",
     "status", "degraded", "reason", "job", "day", "attempt", "subject", "dry_run",
-    "segments", "findings", "language",
+    "segments", "audio_ms", "findings", "language",
 })
 
 #: Keys permitted on metrics. Every one of these is bounded: a handful of stages, a
@@ -64,7 +64,7 @@ SPAN_ATTRIBUTES = frozenset({
 #: customer. Nothing per-call, ever.
 METRIC_ATTRIBUTES = frozenset({
     "tenant_id", "stage", "provider", "model", "rule_id", "status", "verdict",
-    "channel", "job", "reason", "dry_run",
+    "channel", "job", "reason", "table", "dry_run",
 })
 
 _warned_keys: set[str] = set()
@@ -421,7 +421,7 @@ def record_retention(*, objects: int, rows: int, table: str, **attributes) -> No
     if objects:
         _instruments.retention_objects.add(objects, attrs)
     if rows:
-        _instruments.retention_rows.add(rows, {**attrs, "status": table})
+        _instruments.retention_rows.add(rows, {**attrs, "table": table})
 
 
 def record_coverage(pct: float, **attributes) -> None:
