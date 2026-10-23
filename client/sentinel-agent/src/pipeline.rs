@@ -87,6 +87,17 @@ pub struct Pipeline {
     /// Highest sequence produced per channel in the current call, for `call.end`.
     last_seq: BTreeMap<Channel, u32>,
     account_ref: Option<String>,
+    /// Transitions from session events whose side effects have not run yet.
+    ///
+    /// `on_session_state` updates the detector immediately, and once the debounce
+    /// window has passed — the normal case, because the agent has been capturing
+    /// since login — `SessionState { active: true }` returns `Armed` right there.
+    /// The next `step` does not emit `Armed` again, so the encoder restart that
+    /// `Armed` is supposed to trigger would be skipped and the call's first
+    /// segment would not be sequence 0. The gateway then stores the audio and
+    /// never acks the channel. These are applied at the top of `step`, before
+    /// any read.
+    pending: Vec<Transition>,
 }
 
 struct CurrentCall {
@@ -121,6 +132,7 @@ impl Pipeline {
             events: Vec::new(),
             last_seq: BTreeMap::new(),
             account_ref: None,
+            pending: Vec::new(),
         })
     }
 
@@ -200,7 +212,37 @@ impl Pipeline {
     /// not call audio.
     pub fn on_session_state(&mut self, active: bool) -> Option<Transition> {
         self.suppressor.set_session_active(self.clock_ms, active);
-        Some(self.detector.feed(self.clock_ms, DetectorInput::SessionState { active }))
+        let transition = self.detector.feed(self.clock_ms, DetectorInput::SessionState { active });
+        self.defer(transition)
+    }
+
+    /// Remember a transition whose side effects have to run before the next encode.
+    ///
+    /// Applying `Armed` inside the session callback would restart the encoder, but
+    /// `restart` returns `Result` and this callback does not. Deferring until the
+    /// top of `step` keeps that `?`, and runs the restart before `read_channel`
+    /// numbers another second of audio that does not belong to the new call.
+    fn defer(&mut self, transition: Transition) -> Option<Transition> {
+        if transition == Transition::None {
+            return None;
+        }
+        self.pending.push(transition.clone());
+        Some(transition)
+    }
+
+    fn drain_pending(
+        &mut self,
+        uplink: &mut Uplink,
+        result: &mut StepResult,
+    ) -> anyhow::Result<()> {
+        let pending = std::mem::take(&mut self.pending);
+        for transition in pending {
+            self.apply_transition(&transition, uplink, result)?;
+            if transition != Transition::None {
+                result.transition = Some(transition);
+            }
+        }
+        Ok(())
     }
 
     /// The signed-in user changed. Closes the current record rather than letting one
@@ -229,6 +271,10 @@ impl Pipeline {
         uplink: &mut Uplink,
     ) -> anyhow::Result<StepResult> {
         let mut result = StepResult::default();
+        // Before any read, including the early return when both channels are
+        // quiet: an `Armed` that arrived from the session watcher has to restart
+        // both encoders or this call's first segment is not sequence 0.
+        self.drain_pending(uplink, &mut result)?;
 
         let far_read = self.read_channel(source, Channel::Far)?;
         let near_read = self.read_channel(source, Channel::Near)?;
@@ -656,6 +702,95 @@ mod tests {
         }
         assert_eq!(p.state(), CallState::Idle);
         assert_eq!(up.stats().segments, 0);
+    }
+
+    #[test]
+    fn back_to_back_calls_start_each_channel_at_sequence_zero() {
+        // Idle capture before the softphone session goes active advances both
+        // encoders, and `bound_preroll` throws those segments away without
+        // rewinding the sequence. Arming after the debounce window — what
+        // production does, because the agent has already been running — has to
+        // restart each channel at 0. So does the next call. A channel whose
+        // first segment is not seq 0 is stored by the gateway and never acked.
+        let audio = [
+            silence(3_000),
+            speech(2_000),
+            silence(14_000),
+            silence(3_000),
+            speech(2_000),
+            silence(14_000),
+        ]
+        .concat();
+        let mut src = source(audio.clone(), audio);
+        let mut p =
+            Pipeline::new(&policy(), CaptureTier::A, "dev-1".into(), "uid-a".into()).unwrap();
+        p.open(&mut src, &policy()).unwrap();
+        let mut up = uplink();
+
+        while p.clock_ms() < 2_500 {
+            p.step(&mut src, &mut up).unwrap();
+        }
+        assert_eq!(p.state(), CallState::Idle);
+        assert_eq!(p.on_session_state(true), Some(Transition::Armed));
+
+        let mut calls: Vec<String> = Vec::new();
+        let mut session_dropped = false;
+        let mut rearmed = false;
+        let mut end_clock: Option<u64> = None;
+        for _ in 0..2_500 {
+            if !session_dropped && p.clock_ms() >= 5_200 && p.state() == CallState::InCall {
+                p.on_session_state(false);
+                session_dropped = true;
+            }
+            if end_clock.is_none() && session_dropped && p.state() == CallState::Idle {
+                end_clock = Some(p.clock_ms());
+            }
+            if let Some(ended_at) = end_clock {
+                if !rearmed && p.clock_ms() >= ended_at + 2_100 && p.state() == CallState::Idle {
+                    assert_eq!(p.on_session_state(true), Some(Transition::Armed));
+                    rearmed = true;
+                }
+            }
+            let r = p.step(&mut src, &mut up).unwrap();
+            if let Some(Transition::CallStarted) = r.transition {
+                calls.push(r.call_id.clone().expect("a started call has an id"));
+            }
+            if calls.len() == 2 {
+                let rows = up.spool_take_pending(&calls[1], 1000);
+                let far = rows.iter().filter(|row| row.channel == Channel::Far).count();
+                let near = rows.iter().filter(|row| row.channel == Channel::Near).count();
+                if far > 0 && near > 0 {
+                    break;
+                }
+            }
+        }
+
+        assert!(rearmed, "the second session must arm after the debounce window");
+        assert_eq!(calls.len(), 2, "two back-to-back calls, got {calls:?}");
+        for call_id in &calls {
+            let rows = up.spool_take_pending(call_id, 1000);
+            for channel in [Channel::Far, Channel::Near] {
+                let seqs: Vec<u32> = rows
+                    .iter()
+                    .filter(|row| row.channel == channel)
+                    .map(|row| row.seq)
+                    .collect();
+                assert!(
+                    !seqs.is_empty(),
+                    "channel {channel:?} of {call_id} produced no segments"
+                );
+                assert_eq!(
+                    seqs[0], 0,
+                    "channel {channel:?} of {call_id} must start at 0, got {seqs:?}"
+                );
+                for (i, seq) in seqs.iter().enumerate() {
+                    assert_eq!(
+                        *seq, i as u32,
+                        "gap in channel {channel:?} of {call_id}: {seqs:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -50,6 +50,17 @@ class SarvamASR:
 
     def transcribe(self, audio: bytes, *, sample_rate: int,
                    language_hint: str | None = None) -> ASRResult:
+        if not audio:
+            # A channel with no PCM is not a quiet line — a quiet line is a WAV
+            # of zeros, and that is valid audio. An empty body is a header-only
+            # WAV, which Sarvam rejects with 400. Do not send it.
+            return ASRResult(
+                text="",
+                words=[],
+                language=language_hint or "und",
+                provider=self.name,
+                provider_version=self.version,
+            )
         # The API takes a WAV container, not raw PCM.
         files = {"file": ("call.wav", io.BytesIO(_wav_header(len(audio), sample_rate) + audio),
                           "audio/wav")}

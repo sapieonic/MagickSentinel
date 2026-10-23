@@ -137,6 +137,48 @@ func TestDuplicateSegmentsAreDroppedSilently(t *testing.T) {
 	}
 }
 
+func TestAChannelThatDoesNotStartAtZeroIsStoredButNotAcked(t *testing.T) {
+	// The wire contract starts each (call, channel) at seq 0. A channel that
+	// never presents 0 is stored — ingest is idempotent and does not close the
+	// stream — but the cumulative ack stays withheld until seq 0 arrives.
+	// Acking without that would tell the client to delete audio the gateway
+	// cannot place.
+	sink := newSink()
+	s := newSession(sink)
+	if _, err := s.OnCallStart(callStart(), t0); err != nil {
+		t.Fatal(err)
+	}
+	for _, seq := range []uint32{5, 6, 7} {
+		out, err := s.OnMedia(media(wire.ChannelFar, seq), t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out.Acks) != 0 {
+			t.Fatalf("seq %d must not be acked before seq 0: %+v", seq, out.Acks)
+		}
+		if len(out.Errors) != 0 {
+			t.Fatalf("a non-zero start is stored, not a call.error: %+v", out.Errors)
+		}
+	}
+	if len(sink.segments) != 3 {
+		t.Fatalf("stored %d segments, want 3", len(sink.segments))
+	}
+	out := s.Tick(t0.Add(3 * time.Second))
+	if len(out.Acks) != 0 {
+		t.Fatalf("time passing must not ack a channel that never saw seq 0: %+v", out.Acks)
+	}
+
+	for _, seq := range []uint32{0, 1, 2, 3, 4} {
+		if _, err := s.OnMedia(media(wire.ChannelFar, seq), t0.Add(4*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out = s.Tick(t0.Add(7 * time.Second))
+	if len(out.Acks) != 1 || out.Acks[0].ThroughSeq != 7 || out.Acks[0].Channel != wire.ChannelFar {
+		t.Fatalf("seq 0 must release the parked run, got %+v", out.Acks)
+	}
+}
+
 func TestAcksAreCumulativeAndHeldBackByGaps(t *testing.T) {
 	sink := newSink()
 	s := newSession(sink)

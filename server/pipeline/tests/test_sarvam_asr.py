@@ -70,6 +70,17 @@ def silence(seconds: float) -> bytes:
 # --------------------------------------------------------------------- request shape
 
 
+def test_empty_audio_makes_no_request():
+    # An empty channel must not become a header-only WAV. Sarvam answers that
+    # with 400, and the call then has no transcript even though the key is fine.
+    session = FakeSession()
+    result = SarvamASR(api_key="k", session=session).transcribe(b"", sample_rate=SAMPLE_RATE)
+
+    assert session.calls == []
+    assert result.text == ""
+    assert result.words == []
+
+
 def test_uses_a_current_model_identifier():
     # saarika:* is gone from the API's model enum entirely, so the previous default
     # would have been rejected on every call rather than degrading quietly.

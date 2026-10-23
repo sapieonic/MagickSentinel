@@ -263,6 +263,28 @@ def test_a_missing_agent_channel_still_leaves_the_borrower_channel_transcribed(c
     assert any("no audio on the agent channel" in n for n in outcome.notes)
 
 
+def test_empty_channel_bytes_are_not_sent_to_asr_and_fail_the_call(ctx):
+    # ``b""`` is what a decode of zero packets looks like. It is falsy, so it
+    # must take the same path as a missing channel: no provider request, and a
+    # failed call rather than a complete one with no transcript.
+    @dataclass
+    class EmptyBytes:
+        def channel_audio(self, call_id: str, channel_: Channel) -> bytes | None:
+            return b""
+
+    asr = RecordingASR()
+    f, sink = build(asr=asr, segments=EmptyBytes())
+
+    outcome = f.finalize(ctx(), TenantBudget("t", 10_000_000))
+
+    assert asr.requests == []
+    assert outcome.transcript is None
+    assert outcome.status == "failed"
+    assert sink.statuses == ["failed"]
+    assert len(outcome.notes) == 2
+    assert all("no audio" in note for note in outcome.notes)
+
+
 def test_both_channels_missing_fails_the_call_and_saves_nothing(ctx):
     f, sink = build(asr=FakeASR(text=CLEAN),
                     segments=FakeSegments(have_far=False, have_near=False))
