@@ -311,9 +311,23 @@ impl Uplink {
             }
 
             let point = self.resume_point_for(&call_id);
+            // The page has to start after sequences this connection has already
+            // handed to the socket, and after the resume point. Otherwise the
+            // oldest unacked rows fill SEGMENTS_PER_PASS, every one of them is
+            // skipped below, and the tail of the call — and the other channel —
+            // never uploads. The gateway then never sees seq 0 on a channel that
+            // was stranded, and never acks it.
+            let far_after = after_seq(
+                self.sent_through.get(&(call_id.clone(), Channel::Far)).copied(),
+                point.from_seq(Channel::Far),
+            );
+            let near_after = after_seq(
+                self.sent_through.get(&(call_id.clone(), Channel::Near)).copied(),
+                point.from_seq(Channel::Near),
+            );
             let pending = self
                 .spool
-                .take_pending(&call_id, SEGMENTS_PER_PASS)
+                .take_pending_after(&call_id, SEGMENTS_PER_PASS, far_after, near_after)
                 .unwrap_or_default();
 
             let mut batch: Vec<u8> = Vec::new();
@@ -552,6 +566,22 @@ impl Uplink {
         self.events
             .push(ClientEvent::new(EventKind::CaptureError, now_ms).with_detail("uplink_reconnect".into()));
     }
+}
+
+/// Exclusive lower bound for one channel's upload page.
+///
+/// `sent` is the highest sequence already handed to the socket on this
+/// connection. `resume_from` is the first sequence the resume plan will accept;
+/// sequences below it must not occupy the page either. `-1` includes sequence 0.
+fn after_seq(sent: Option<u32>, resume_from: u32) -> i64 {
+    let mut after: i64 = -1;
+    if let Some(hi) = sent {
+        after = i64::from(hi);
+    }
+    if resume_from > 0 {
+        after = after.max(i64::from(resume_from) - 1);
+    }
+    after
 }
 
 /// A ULID's 16 binary bytes, for the media record header.
@@ -811,6 +841,83 @@ mod tests {
         r.wire.0.lock().unwrap().sent_binary.clear();
         r.uplink.pump(200_200);
         assert!(sent_records(&r.wire).is_empty(), "no duplicate sends within a connection");
+    }
+
+    #[test]
+    fn an_unacked_prefix_does_not_stop_the_rest_of_the_call_uploading() {
+        // The gateway withholds the cumulative ack until it has seen seq 0, so a
+        // channel can sit unacked. The next pass must still reach the tail and
+        // the other channel; stopping at the first page strands the call.
+        let mut r = rig();
+        r.uplink.begin_call(CALL, &call_start(), 0).unwrap();
+        for seq in 0..50 {
+            r.uplink.push_segment(&segment(Channel::Far, seq)).unwrap();
+        }
+        for seq in 0..5 {
+            r.uplink.push_segment(&segment(Channel::Near, seq)).unwrap();
+        }
+        let out = r.uplink.pump(0);
+        assert_eq!(out.sent, 40);
+        let first = sent_records(&r.wire);
+        assert!(first.iter().all(|rec| rec.channel == Channel::Far));
+        assert_eq!(
+            first.iter().map(|rec| rec.seq).collect::<Vec<_>>(),
+            (0..40).collect::<Vec<_>>()
+        );
+
+        r.wire.0.lock().unwrap().sent_binary.clear();
+        let out = r.uplink.pump(10);
+        let second = sent_records(&r.wire);
+        let far: Vec<u32> = second
+            .iter()
+            .filter(|rec| rec.channel == Channel::Far)
+            .map(|rec| rec.seq)
+            .collect();
+        let near: Vec<u32> = second
+            .iter()
+            .filter(|rec| rec.channel == Channel::Near)
+            .map(|rec| rec.seq)
+            .collect();
+        assert_eq!(far, (40..50).collect::<Vec<_>>());
+        assert_eq!(near, (0..5).collect::<Vec<_>>());
+        assert_eq!(out.sent, 15);
+    }
+
+    #[test]
+    fn a_reconnect_mid_call_replays_the_unacked_tail_not_just_the_first_window() {
+        let mut r = rig();
+        r.uplink.begin_call(CALL, &call_start(), 0).unwrap();
+        for seq in 0..80 {
+            r.uplink.push_segment(&segment(Channel::Far, seq)).unwrap();
+        }
+        r.uplink.pump(0);
+        r.wire.0.lock().unwrap().inbox.push_back(Incoming::Text(
+            serde_json::json!({"t":"ack","call_id":CALL,"channel":0,"through_seq":10}).to_string(),
+        ));
+        r.wire
+            .0
+            .lock()
+            .unwrap()
+            .inbox
+            .push_back(Incoming::Closed { code: Some(1011) });
+        // Send runs before read, so this pass also hands the next window to the
+        // socket and then learns the link is gone. Those bytes are not durable.
+        r.uplink.pump(10);
+        r.wire.0.lock().unwrap().sent_binary.clear();
+        r.wire.0.lock().unwrap().sent_text.clear();
+        r.wire.0.lock().unwrap().inbox.push_back(Incoming::Text(
+            serde_json::json!({"t":"resume","call_id":CALL,"acked":{"0":50}}).to_string(),
+        ));
+        let out = r.uplink.pump(200_000);
+        assert!(out.connected);
+        assert!(
+            sent_records(&r.wire).is_empty(),
+            "media waits for the resume reply rather than restarting at seq 0"
+        );
+
+        r.uplink.pump(200_100);
+        let seqs: Vec<u32> = sent_records(&r.wire).iter().map(|x| x.seq).collect();
+        assert_eq!(seqs, (51..80).collect::<Vec<_>>(), "replay from the server ack + 1");
     }
 
     #[test]

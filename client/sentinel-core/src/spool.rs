@@ -246,15 +246,42 @@ impl Spool {
 
     /// Unacked segments for a call, in `(channel, seq)` order, up to `limit`.
     pub fn take_pending(&self, call_id: &str, limit: usize) -> Result<Vec<SegmentRow>, SpoolError> {
+        self.take_pending_after(call_id, limit, -1, -1)
+    }
+
+    /// Unacked segments strictly after a per-channel sequence, up to `limit`.
+    ///
+    /// `far_after` and `near_after` are exclusive. `-1` includes sequence 0. The
+    /// uplink passes the highest sequence it has already handed to the socket on
+    /// this connection, and one below the resume point, so a page of
+    /// `SEGMENTS_PER_PASS` rows starts at audio that still needs to be sent.
+    /// Without that floor the oldest unacked rows fill the page, every one of
+    /// them is skipped, and the rest of the call — and the other channel — never
+    /// leaves the spool.
+    pub fn take_pending_after(
+        &self,
+        call_id: &str,
+        limit: usize,
+        far_after: i64,
+        near_after: i64,
+    ) -> Result<Vec<SegmentRow>, SpoolError> {
         let mut stmt = self.conn.prepare(
             "SELECT s.call_id, s.channel, s.seq, s.timestamp_ms, s.flags, s.payload, s.created_ms
              FROM segments s
              LEFT JOIN acks a ON a.call_id = s.call_id AND a.channel = s.channel
-             WHERE s.call_id = ?1 AND s.seq > COALESCE(a.through_seq, -1)
+             WHERE s.call_id = ?1
+               AND s.seq > COALESCE(a.through_seq, -1)
+               AND (
+                 (s.channel = 0 AND s.seq > ?2) OR
+                 (s.channel = 1 AND s.seq > ?3)
+               )
              ORDER BY s.channel, s.seq
-             LIMIT ?2",
+             LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![call_id, limit as i64], Self::map_row)?;
+        let rows = stmt.query_map(
+            params![call_id, far_after, near_after, limit as i64],
+            Self::map_row,
+        )?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -443,6 +470,28 @@ mod tests {
         assert_eq!(deleted, 5, "cumulative ack clears 0..=4");
         assert_eq!(s.stats().unwrap().segments, 5);
         assert_eq!(s.take_pending("call-1", 100).unwrap()[0].seq, 5);
+    }
+
+    #[test]
+    fn take_pending_after_skips_sequences_already_in_flight() {
+        let mut s = spool(SpoolLimits::default());
+        for i in 0..10 {
+            s.push(&seg("call-1", Channel::Far, i, 50, 0)).unwrap();
+            s.push(&seg("call-1", Channel::Near, i, 50, i as u64)).unwrap();
+        }
+        let pending = s.take_pending_after("call-1", 100, 4, -1).unwrap();
+        let far: Vec<u32> = pending
+            .iter()
+            .filter(|p| p.channel == Channel::Far)
+            .map(|p| p.seq)
+            .collect();
+        let near: Vec<u32> = pending
+            .iter()
+            .filter(|p| p.channel == Channel::Near)
+            .map(|p| p.seq)
+            .collect();
+        assert_eq!(far, (5..10).collect::<Vec<_>>());
+        assert_eq!(near, (0..10).collect::<Vec<_>>());
     }
 
     #[test]
